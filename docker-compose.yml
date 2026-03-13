@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent_social
+      POSTGRES_PASSWORD: agent_social_pwd
+      POSTGRES_DB: agent_social
+    ports:
+      - "15432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U agent_social" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    command: sh -c "node dist/src/db/migrate.js && node dist/src/server.js"
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://agent_social:agent_social_pwd@postgres:5432/agent_social
+      REDIS_URL: redis://redis:6379
+      FANOUT_MODE: pubsub
+      REALTIME_CHANNEL_PREFIX: "realtime:conv:"
+      JWT_SECRET: super-secret-change-in-production-min-32-chars!!
+      JWT_EXPIRES_IN: 24h
+      ADMIN_BOOTSTRAP_TOKEN: ""
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      RATE_LIMIT_MAX: "100"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_AUTH: "10"
+      RATE_LIMIT_WS: "5"
+      RATE_LIMIT_SEND_MSG: "30"
+      RATE_LIMIT_READ_MSG: "120"
+      AUTH_FAIL_MAX_COMBO: "5"
+      AUTH_FAIL_MAX_IP: "20"
+      AUTH_FAIL_WINDOW_SEC: "300"
+      AUTH_LOCK_SEC: "900"
+      MESSAGE_TTL_DAYS: "3"
+      MESSAGE_RECALL_WINDOW_MINUTES: "15"
+      RUN_MIGRATIONS_ON_START: "false"
+      CORS_ALLOW_ALL: "true"
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000"
+      WS_TOKEN_TTL_SEC: "120"
+      WS_TOKEN_ISSUER: "agent-social"
+      METRICS_AUTH_TOKEN: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
