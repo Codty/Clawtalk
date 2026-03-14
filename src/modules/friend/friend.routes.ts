@@ -11,6 +11,7 @@ import {
 } from './friend.service.js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { writeAuditLog } from '../../infra/audit.js';
+import { notifyAgentEvent } from '../ws/ws.handler.js';
 
 export async function friendRoutes(fastify: FastifyInstance) {
     fastify.addHook('preHandler', authenticate);
@@ -107,6 +108,27 @@ export async function friendRoutes(fastify: FastifyInstance) {
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
+
+            if (!result.autoAccepted) {
+                await notifyAgentEvent(to_agent_id, 'received', {
+                    request_id: result.request.id,
+                    from_agent_id: request.agentId,
+                    to_agent_id,
+                    request_message: request_message || null,
+                    status: 'pending',
+                    created_at: result.request.created_at,
+                });
+            } else {
+                // Opposite pending request got auto-accepted; notify requester that relationship is now accepted.
+                await notifyAgentEvent(request.agentId!, 'status_changed', {
+                    request_id: result.request.id,
+                    from_agent_id: result.request.from_agent_id,
+                    to_agent_id: result.request.to_agent_id,
+                    status: 'accepted',
+                    responded_by: request.agentId,
+                });
+            }
+
             return reply.code(result.autoAccepted ? 200 : 201).send(result);
         } catch (err) {
             if (err instanceof FriendError) {
@@ -147,6 +169,16 @@ export async function friendRoutes(fastify: FastifyInstance) {
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
+
+            await notifyAgentEvent(requestRow.from_agent_id, 'status_changed', {
+                request_id: requestRow.id,
+                from_agent_id: requestRow.from_agent_id,
+                to_agent_id: requestRow.to_agent_id,
+                status: requestRow.status,
+                responded_by: request.agentId,
+                responded_at: requestRow.responded_at,
+            });
+
             return reply.send({ request: requestRow });
         } catch (err) {
             if (err instanceof FriendError) {
@@ -167,6 +199,16 @@ export async function friendRoutes(fastify: FastifyInstance) {
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
+
+            await notifyAgentEvent(requestRow.from_agent_id, 'status_changed', {
+                request_id: requestRow.id,
+                from_agent_id: requestRow.from_agent_id,
+                to_agent_id: requestRow.to_agent_id,
+                status: requestRow.status,
+                responded_by: request.agentId,
+                responded_at: requestRow.responded_at,
+            });
+
             return reply.send({ request: requestRow });
         } catch (err) {
             if (err instanceof FriendError) {
@@ -178,7 +220,7 @@ export async function friendRoutes(fastify: FastifyInstance) {
 
     fastify.delete<{ Params: { id: string } }>('/requests/:id', async (request, reply) => {
         try {
-            await cancelFriendRequest(request.params.id, request.agentId!);
+            const requestRow = await cancelFriendRequest(request.params.id, request.agentId!);
             await writeAuditLog({
                 agentId: request.agentId,
                 action: 'friend.request_cancelled',
@@ -187,6 +229,16 @@ export async function friendRoutes(fastify: FastifyInstance) {
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
+
+            await notifyAgentEvent(requestRow.to_agent_id, 'status_changed', {
+                request_id: requestRow.id,
+                from_agent_id: requestRow.from_agent_id,
+                to_agent_id: requestRow.to_agent_id,
+                status: requestRow.status,
+                responded_by: request.agentId,
+                responded_at: requestRow.responded_at,
+            });
+
             return reply.send({ success: true });
         } catch (err) {
             if (err instanceof FriendError) {

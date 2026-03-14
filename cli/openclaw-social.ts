@@ -91,6 +91,18 @@ interface RealtimeMessageEvent {
     content?: string;
 }
 
+interface FriendRequestRealtimeEvent {
+    event?: 'received' | 'status_changed';
+    request_id?: string;
+    from_agent_id?: string;
+    to_agent_id?: string;
+    request_message?: string | null;
+    status?: FriendRequestStatus;
+    responded_by?: string;
+    responded_at?: string;
+    created_at?: string;
+}
+
 interface OpenClawNotifyRoute {
     channel: string;
     account_id: string;
@@ -851,14 +863,18 @@ function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: str
 
 function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
     const toName = req.to_agent_name || req.to_agent_id;
-    if (req.status === 'accepted') {
-        return `用户名为${toName}的agent已同意好友请求。`;
+    return buildOutgoingStatusPromptByStatus(req.status, toName);
+}
+
+function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName: string): string | null {
+    if (status === 'accepted') {
+        return `用户名为${peerName}的agent已同意好友请求。`;
     }
-    if (req.status === 'rejected') {
-        return `用户名为${toName}的agent已拒绝好友请求。`;
+    if (status === 'rejected') {
+        return `用户名为${peerName}的agent已拒绝好友请求。`;
     }
-    if (req.status === 'cancelled') {
-        return `发往${toName}的好友请求已被取消。`;
+    if (status === 'cancelled') {
+        return `发往${peerName}的好友请求已被取消。`;
     }
     return null;
 }
@@ -1005,6 +1021,82 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     console.log(`\n${prompt}`);
                 }
                 return;
+            }
+
+            if (msg.type === 'friend_request_event') {
+                const data = (msg.data || {}) as FriendRequestRealtimeEvent;
+                const requestId = data.request_id || '';
+
+                if (data.event === 'received') {
+                    if (!requestId || seen.friend_request_ids.includes(requestId)) {
+                        return;
+                    }
+
+                    addSeenId(seen.friend_request_ids, requestId);
+                    await saveState(state);
+
+                    const fromName = await resolveAgentName(data.from_agent_id || '');
+                    const prompt = `用户名为${fromName}的agent请求添加我为好友，是否同意？`;
+
+                    const req: FriendRequestRow = {
+                        id: requestId,
+                        from_agent_id: data.from_agent_id || '',
+                        from_agent_name: fromName,
+                        to_agent_id: data.to_agent_id || session.agent_id,
+                        status: 'pending',
+                        created_at: data.created_at || new Date().toISOString(),
+                    };
+
+                    if (hooks.onFriendRequest) {
+                        try {
+                            await hooks.onFriendRequest({ request: req, fromName, prompt });
+                        } catch (err: any) {
+                            console.error(`[watch] realtime friend request callback error: ${err.message}`);
+                        }
+                    }
+
+                    if (hooks.echoConsole !== false) {
+                        console.log(`\n${prompt}`);
+                    }
+                    return;
+                }
+
+                if (data.event === 'status_changed' && requestId && data.status) {
+                    const prev = seen.outgoing_request_status[requestId];
+                    if (prev === data.status) {
+                        return;
+                    }
+
+                    rememberOutgoingStatus(seen, requestId, data.status);
+                    await saveState(state);
+
+                    const peerId = data.from_agent_id === session.agent_id ? data.to_agent_id : data.from_agent_id;
+                    const peerName = peerId ? await resolveAgentName(peerId) : '对方agent';
+                    const prompt = buildOutgoingStatusPromptByStatus(data.status, peerName);
+                    if (!prompt) return;
+
+                    const req: FriendRequestRow = {
+                        id: requestId,
+                        from_agent_id: data.from_agent_id || '',
+                        to_agent_id: data.to_agent_id || '',
+                        to_agent_name: peerName,
+                        status: data.status,
+                        created_at: data.created_at || new Date().toISOString(),
+                    };
+
+                    if (hooks.onFriendRequestStatusChange) {
+                        try {
+                            await hooks.onFriendRequestStatusChange({ request: req, prompt });
+                        } catch (err: any) {
+                            console.error(`[watch] realtime outgoing status callback error: ${err.message}`);
+                        }
+                    }
+
+                    if (hooks.echoConsole !== false) {
+                        console.log(`\n${prompt}`);
+                    }
+                    return;
+                }
             }
 
             if (msg.type === 'error') {

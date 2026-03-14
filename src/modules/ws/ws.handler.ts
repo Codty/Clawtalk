@@ -14,6 +14,7 @@ const agentConnections = new Map<string, Set<WebSocket>>();
 // Per-connection dedup LRU: Set of recent message IDs
 const connectionDedup = new WeakMap<WebSocket, Set<string>>();
 const DEDUP_MAX_SIZE = 1000;
+const WS_AGENT_EVENTS_CHANNEL = 'agent:events';
 
 export function getAgentConnections(): Map<string, Set<WebSocket>> {
     return agentConnections;
@@ -104,15 +105,48 @@ export function addAgentToConversation(conversationId: string, agentId: string) 
     }
 }
 
-// Token rotation pub/sub
-let tokenRotationSubscribed = false;
+function emitToAgentConnections(agentId: string, payload: any): void {
+    const connections = agentConnections.get(agentId);
+    if (!connections) return;
+    const encoded = JSON.stringify(payload);
+    for (const ws of connections) {
+        ws.send(encoded);
+    }
+}
 
-function subscribeToTokenRotation() {
-    if (tokenRotationSubscribed) return;
-    tokenRotationSubscribed = true;
+export async function notifyAgentEvent(agentId: string, event: string, data: any): Promise<void> {
+    const payload = {
+        type: 'friend_request_event',
+        data: {
+            event,
+            ...data,
+        },
+    };
+
+    try {
+        await redis.publish(WS_AGENT_EVENTS_CHANNEL, JSON.stringify({
+            agent_id: agentId,
+            payload,
+        }));
+    } catch (err) {
+        // Fallback local delivery if redis publish fails.
+        console.error('[WS] Failed to publish agent event, fallback to local emit:', err);
+        emitToAgentConnections(agentId, payload);
+    }
+}
+
+// Control channels pub/sub
+let controlChannelsSubscribed = false;
+
+function subscribeControlChannels() {
+    if (controlChannelsSubscribed) return;
+    controlChannelsSubscribed = true;
 
     redisSub.subscribe('agent:token_rotated', (err) => {
         if (err) console.error('[WS] Failed to subscribe to token rotation channel:', err);
+    });
+    redisSub.subscribe(WS_AGENT_EVENTS_CHANNEL, (err) => {
+        if (err) console.error('[WS] Failed to subscribe to agent events channel:', err);
     });
 
     redisSub.on('message', (channel: string, message: string) => {
@@ -120,12 +154,23 @@ function subscribeToTokenRotation() {
             const agentId = message;
             console.log(`[WS] Token rotated for agent ${agentId}, force-disconnecting`);
             disconnectAgent(agentId, 'Token rotated — please re-authenticate');
+            return;
+        }
+
+        if (channel === WS_AGENT_EVENTS_CHANNEL) {
+            try {
+                const parsed = JSON.parse(message) as { agent_id?: string; payload?: any };
+                if (!parsed.agent_id || !parsed.payload) return;
+                emitToAgentConnections(parsed.agent_id, parsed.payload);
+            } catch {
+                // ignore malformed event
+            }
         }
     });
 }
 
 export async function registerWsRoutes(fastify: FastifyInstance) {
-    subscribeToTokenRotation();
+    subscribeControlChannels();
 
     fastify.get('/ws', { websocket: true }, async (socket, request) => {
         if (await isWsRateLimited(request.ip)) {

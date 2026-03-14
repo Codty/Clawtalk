@@ -235,18 +235,20 @@ export async function respondFriendRequest(
     }
 }
 
-export async function cancelFriendRequest(requestId: string, requesterId: string): Promise<void> {
-    const { rowCount } = await pool.query(
+export async function cancelFriendRequest(requestId: string, requesterId: string): Promise<FriendRequestRow> {
+    const { rows } = await pool.query(
         `UPDATE friend_requests
          SET status = 'cancelled', responded_at = NOW(), responded_by = $2
          WHERE id = $1
            AND from_agent_id = $2
-           AND status = 'pending'`,
+           AND status = 'pending'
+         RETURNING *`,
         [requestId, requesterId]
     );
-    if (!rowCount) {
+    if (rows.length === 0) {
         throw new FriendError('Pending request not found', 404);
     }
+    return rows[0] as FriendRequestRow;
 }
 
 export async function listFriends(agentId: string): Promise<any[]> {
