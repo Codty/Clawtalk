@@ -628,6 +628,92 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
     console.log(`message_id: ${sent.id}`);
 }
 
+function removeSessionState(state: LocalState, agentName: string): void {
+    delete state.sessions[agentName];
+    delete state.seen[agentName];
+    if (state.current_agent === agentName) {
+        const remaining = Object.keys(state.sessions);
+        state.current_agent = remaining[0];
+    }
+}
+
+async function stopDaemonsForAgent(agentName: string): Promise<number> {
+    const registry = await loadDaemonRegistry();
+    const targetModes: Array<'watch' | 'bridge'> = ['watch', 'bridge'];
+    let stopped = 0;
+
+    for (const mode of targetModes) {
+        const key = daemonKey(agentName, mode);
+        const entry = registry.entries[key];
+        if (!entry) continue;
+        try {
+            process.kill(entry.pid, 'SIGTERM');
+        } catch {
+            // Process may already be gone.
+        }
+        delete registry.entries[key];
+        stopped += 1;
+    }
+
+    if (stopped > 0) {
+        await saveDaemonRegistry(registry);
+    }
+    return stopped;
+}
+
+function parseLogoutOptions(args: string[]): { localOnly: boolean; all: boolean } {
+    let localOnly = false;
+    let all = false;
+
+    for (const arg of args) {
+        if (arg === '--local-only') {
+            localOnly = true;
+            continue;
+        }
+        if (arg === '--all') {
+            all = true;
+            continue;
+        }
+        throw new Error(`Unknown option for logout: ${arg}`);
+    }
+
+    return { localOnly, all };
+}
+
+async function commandLogout(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const { localOnly, all } = parseLogoutOptions(args);
+    const targetAgents = all
+        ? Object.keys(state.sessions)
+        : [getSessionOrThrow(state, asAgent).agent_name];
+
+    if (targetAgents.length === 0) {
+        console.log('当前没有已登录的本地会话。');
+        return;
+    }
+
+    for (const agentName of targetAgents) {
+        const session = state.sessions[agentName];
+        if (!session) continue;
+
+        if (!localOnly) {
+            try {
+                // Rotate token and discard the new token to invalidate current credentials.
+                await api('POST', '/api/v1/auth/rotate-token', undefined, session.token);
+            } catch (err: any) {
+                console.warn(
+                    `[logout] ${agentName} 远端token失效操作失败，继续执行本地退出：${String(err?.message || err)}`
+                );
+            }
+        }
+
+        const stopped = await stopDaemonsForAgent(agentName);
+        removeSessionState(state, agentName);
+        console.log(`已退出 ${agentName}${localOnly ? '（仅本地）' : ''}，并停止 ${stopped} 个daemon。`);
+    }
+
+    await saveState(state);
+}
+
 async function commandSwitch(args: string[], state: LocalState): Promise<void> {
     const [agentName] = args;
     if (!agentName) {
@@ -1980,6 +2066,7 @@ openclaw-social - AgentSocial workflow helper for OpenClaw
 
 Usage:
   npx tsx cli/openclaw-social.ts onboard <agent_name> <password>
+  npx tsx cli/openclaw-social.ts logout [--as <agent_name>] [--local-only] [--all]
   npx tsx cli/openclaw-social.ts use <agent_name>
   npx tsx cli/openclaw-social.ts whoami [--as <agent_name>]
 
@@ -2028,6 +2115,9 @@ async function main() {
         switch (command) {
             case 'onboard':
                 await commandOnboard(rest, state);
+                break;
+            case 'logout':
+                await commandLogout(rest, state, asAgent);
                 break;
             case 'use':
                 await commandSwitch(rest, state);
