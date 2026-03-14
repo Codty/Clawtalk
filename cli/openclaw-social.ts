@@ -1,21 +1,30 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import WebSocket from 'ws';
 
-const BASE_URL = process.env.AGENT_SOCIAL_URL || 'http://localhost:3000';
-const WS_URL = BASE_URL.replace(/^http/, 'ws');
+const DEFAULT_BASE_URL = 'http://localhost:3000';
 const STATE_DIR = path.join(os.homedir(), '.agent-social');
 const STATE_FILE = path.join(STATE_DIR, 'openclaw-social-state.json');
+const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
+const DAEMON_FILE = path.join(STATE_DIR, 'openclaw-social-daemons.json');
+const DAEMON_LOG_DIR = path.join(STATE_DIR, 'logs');
 const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
 const WATCH_POLL_INTERVAL_MS = 5000;
 const MAX_SEEN_IDS = 300;
 
+let runtimeBaseUrl = DEFAULT_BASE_URL;
+let runtimeWsUrl = DEFAULT_BASE_URL.replace(/^http/, 'ws');
+
 const execFileAsync = promisify(execFile);
+
+type FriendRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
+type DeliveryMode = 'receive_only' | 'manual_review' | 'auto_execute';
 
 interface AgentSession {
     agent_name: string;
@@ -26,6 +35,12 @@ interface AgentSession {
 interface SeenState {
     friend_request_ids: string[];
     message_ids: string[];
+    outgoing_request_status: Record<string, FriendRequestStatus>;
+    outgoing_request_order: string[];
+}
+
+interface AgentPolicy {
+    mode: DeliveryMode;
 }
 
 interface OpenClawBinding {
@@ -42,6 +57,11 @@ interface LocalState {
     sessions: Record<string, AgentSession>;
     seen: Record<string, SeenState>;
     bindings: Record<string, OpenClawBinding>;
+    policies: Record<string, AgentPolicy>;
+}
+
+interface CliConfig {
+    base_url?: string;
 }
 
 interface FriendRequestRow {
@@ -49,7 +69,8 @@ interface FriendRequestRow {
     from_agent_id: string;
     from_agent_name?: string;
     to_agent_id: string;
-    status: 'pending' | 'accepted' | 'rejected' | 'cancelled';
+    to_agent_name?: string;
+    status: FriendRequestStatus;
     created_at: string;
 }
 
@@ -77,17 +98,131 @@ interface OpenClawNotifyRoute {
     dry_run: boolean;
 }
 
+interface DaemonEntry {
+    pid: number;
+    agent_name: string;
+    mode: 'watch' | 'bridge';
+    started_at: string;
+    cwd: string;
+    log_file: string;
+}
+
+interface DaemonRegistry {
+    entries: Record<string, DaemonEntry>;
+}
+
 interface WatchHooks {
     onFriendRequest?: (ctx: { request: FriendRequestRow; fromName: string; prompt: string }) => Promise<void>;
+    onFriendRequestStatusChange?: (ctx: { request: FriendRequestRow; prompt: string }) => Promise<void>;
     onNewMessage?: (ctx: { event: RealtimeMessageEvent; senderName: string; prompt: string }) => Promise<void>;
     echoConsole?: boolean;
+}
+
+function normalizeBaseUrl(value: string): string {
+    const trimmed = value.trim().replace(/\/+$/, '');
+    if (!trimmed) throw new Error('base_url cannot be empty');
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('base_url must start with http:// or https://');
+    }
+    return parsed.toString().replace(/\/+$/, '');
+}
+
+function setRuntimeBaseUrl(baseUrl: string): void {
+    runtimeBaseUrl = normalizeBaseUrl(baseUrl);
+    runtimeWsUrl = runtimeBaseUrl.replace(/^http/, 'ws');
+}
+
+function defaultConfig(): CliConfig {
+    return {};
+}
+
+async function loadConfig(): Promise<CliConfig> {
+    try {
+        const content = await fs.readFile(CONFIG_FILE, 'utf-8');
+        const parsed = JSON.parse(content) as CliConfig;
+        return {
+            base_url: parsed.base_url,
+        };
+    } catch {
+        return defaultConfig();
+    }
+}
+
+async function saveConfig(config: CliConfig): Promise<void> {
+    await fs.mkdir(STATE_DIR, { recursive: true });
+    await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+function resolveBaseUrl(config: CliConfig): string {
+    if (process.env.AGENT_SOCIAL_URL) {
+        return normalizeBaseUrl(process.env.AGENT_SOCIAL_URL);
+    }
+    if (config.base_url) {
+        return normalizeBaseUrl(config.base_url);
+    }
+    return DEFAULT_BASE_URL;
+}
+
+function defaultPolicy(): AgentPolicy {
+    return { mode: 'receive_only' };
+}
+
+function daemonKey(agentName: string, mode: 'watch' | 'bridge'): string {
+    return `${agentName}:${mode}`;
+}
+
+function defaultDaemonRegistry(): DaemonRegistry {
+    return { entries: {} };
+}
+
+async function loadDaemonRegistry(): Promise<DaemonRegistry> {
+    try {
+        const content = await fs.readFile(DAEMON_FILE, 'utf-8');
+        const parsed = JSON.parse(content) as DaemonRegistry;
+        return {
+            entries: parsed.entries || {},
+        };
+    } catch {
+        return defaultDaemonRegistry();
+    }
+}
+
+async function saveDaemonRegistry(registry: DaemonRegistry): Promise<void> {
+    await fs.mkdir(STATE_DIR, { recursive: true });
+    await fs.writeFile(DAEMON_FILE, JSON.stringify(registry, null, 2));
+}
+
+function isProcessRunning(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function pruneStoppedDaemons(registry: DaemonRegistry): boolean {
+    let changed = false;
+    for (const [key, entry] of Object.entries(registry.entries)) {
+        if (!isProcessRunning(entry.pid)) {
+            delete registry.entries[key];
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+function getPolicy(state: LocalState, agentName: string): AgentPolicy {
+    return state.policies[agentName] || defaultPolicy();
 }
 
 async function api(method: string, route: string, body?: any, token?: string): Promise<any> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
 
-    const res = await fetch(`${BASE_URL}${route}`, {
+    const res = await fetch(`${runtimeBaseUrl}${route}`, {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -114,6 +249,7 @@ function defaultState(): LocalState {
         sessions: {},
         seen: {},
         bindings: {},
+        policies: {},
     };
 }
 
@@ -126,6 +262,7 @@ async function loadState(): Promise<LocalState> {
             sessions: parsed.sessions || {},
             seen: parsed.seen || {},
             bindings: parsed.bindings || {},
+            policies: parsed.policies || {},
         };
     } catch {
         return defaultState();
@@ -142,8 +279,18 @@ function ensureSeenState(state: LocalState, agentName: string): SeenState {
         state.seen[agentName] = {
             friend_request_ids: [],
             message_ids: [],
+            outgoing_request_status: {},
+            outgoing_request_order: [],
         };
     }
+
+    if (!state.seen[agentName].outgoing_request_status) {
+        state.seen[agentName].outgoing_request_status = {};
+    }
+    if (!state.seen[agentName].outgoing_request_order) {
+        state.seen[agentName].outgoing_request_order = [];
+    }
+
     return state.seen[agentName];
 }
 
@@ -153,6 +300,20 @@ function addSeenId(ids: string[], id: string): void {
     ids.push(id);
     while (ids.length > MAX_SEEN_IDS) {
         ids.shift();
+    }
+}
+
+function rememberOutgoingStatus(seen: SeenState, requestId: string, status: FriendRequestStatus): void {
+    if (!seen.outgoing_request_status[requestId]) {
+        seen.outgoing_request_order.push(requestId);
+    }
+    seen.outgoing_request_status[requestId] = status;
+
+    while (seen.outgoing_request_order.length > MAX_SEEN_IDS) {
+        const oldest = seen.outgoing_request_order.shift();
+        if (oldest) {
+            delete seen.outgoing_request_status[oldest];
+        }
     }
 }
 
@@ -256,9 +417,13 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
     state.sessions[session.agent_name] = session;
     state.current_agent = session.agent_name;
     ensureSeenState(state, session.agent_name);
+    if (!state.policies[session.agent_name]) {
+        state.policies[session.agent_name] = defaultPolicy();
+    }
     await saveState(state);
 
     console.log(`已完成登录：${session.agent_name}`);
+    console.log(`当前消息隔离模式：${state.policies[session.agent_name].mode}`);
     console.log('如果需要我添加好友，请给我对方agent的用户名或账号。');
 }
 
@@ -290,9 +455,26 @@ async function commandAddFriend(args: string[], state: LocalState, asAgent?: str
     console.log(`请求ID: ${result.request.id}`);
 }
 
-async function listIncomingPending(token: string): Promise<FriendRequestRow[]> {
-    const result = await api('GET', '/api/v1/friends/requests?direction=incoming&status=pending', undefined, token);
+async function listFriendRequests(
+    token: string,
+    direction: 'incoming' | 'outgoing',
+    status: FriendRequestStatus | 'all'
+): Promise<FriendRequestRow[]> {
+    const result = await api(
+        'GET',
+        `/api/v1/friends/requests?direction=${direction}&status=${status}`,
+        undefined,
+        token
+    );
     return result.requests || [];
+}
+
+async function listIncomingPending(token: string): Promise<FriendRequestRow[]> {
+    return listFriendRequests(token, 'incoming', 'pending');
+}
+
+async function listOutgoingAll(token: string): Promise<FriendRequestRow[]> {
+    return listFriendRequests(token, 'outgoing', 'all');
 }
 
 async function commandIncoming(state: LocalState, asAgent?: string): Promise<void> {
@@ -399,7 +581,8 @@ async function commandWhoami(state: LocalState, asAgent?: string): Promise<void>
     console.log(JSON.stringify({
         current_agent: session.agent_name,
         agent_id: session.agent_id,
-        base_url: BASE_URL,
+        base_url: runtimeBaseUrl,
+        policy: getPolicy(state, session.agent_name),
         binding: state.bindings[session.agent_name] || null,
     }, null, 2));
 }
@@ -453,7 +636,7 @@ function parseBindOptions(args: string[]): {
     const openclawAgentId = positionals[0];
     if (!openclawAgentId) {
         throw new Error(
-            'Usage: openclaw-social bind-openclaw <openclaw_agent_id> [--channel discord] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]'
+            'Usage: openclaw-social bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]'
         );
     }
 
@@ -595,7 +778,7 @@ async function resolveOpenClawRouteFromSessions(openclawAgentId: string, channel
     if (!best) {
         throw new Error(
             `No recent OpenClaw ${channel} session route found for agent "${openclawAgentId}". ` +
-            'Chat with that OpenClaw agent once in Discord, then retry, or bind with --account and --target.'
+            `Chat with this OpenClaw agent once in channel "${channel}", then retry, or bind with --account and --target.`
         );
     }
 
@@ -656,8 +839,33 @@ async function sendOpenClawNotification(route: OpenClawNotifyRoute, message: str
     }
 }
 
+function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: string): string {
+    if (mode === 'receive_only') {
+        return `${senderName}跟我说“${content}”。当前处于仅接收模式，我不会直接执行对方请求。请指示是否需要回复。`;
+    }
+    if (mode === 'manual_review') {
+        return `${senderName}跟我说“${content}”，我需要自由回复吗还是等待您下指令？`;
+    }
+    return `${senderName}跟我说“${content}”。当前为 auto_execute 模式，请确认是否继续按自动策略处理。`;
+}
+
+function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
+    const toName = req.to_agent_name || req.to_agent_id;
+    if (req.status === 'accepted') {
+        return `用户名为${toName}的agent已同意好友请求。`;
+    }
+    if (req.status === 'rejected') {
+        return `用户名为${toName}的agent已拒绝好友请求。`;
+    }
+    if (req.status === 'cancelled') {
+        return `发往${toName}的好友请求已被取消。`;
+    }
+    return null;
+}
+
 async function runWatcher(state: LocalState, session: AgentSession, hooks: WatchHooks): Promise<void> {
     const seen = ensureSeenState(state, session.agent_name);
+    const policy = getPolicy(state, session.agent_name);
     const idToName = new Map<string, string>();
 
     async function resolveAgentName(agentId: string): Promise<string> {
@@ -673,7 +881,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
-    async function pollFriendRequests() {
+    async function pollIncomingFriendRequests() {
         try {
             const requests = await listIncomingPending(session.token);
             let changed = false;
@@ -703,7 +911,51 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 await saveState(state);
             }
         } catch (err: any) {
-            console.error(`[watch] poll friend requests failed: ${err.message}`);
+            console.error(`[watch] poll incoming friend requests failed: ${err.message}`);
+        }
+    }
+
+    async function pollOutgoingRequestStatus() {
+        try {
+            const requests = await listOutgoingAll(session.token);
+            let changed = false;
+
+            for (const req of requests) {
+                const prev = seen.outgoing_request_status[req.id];
+                const curr = req.status;
+
+                if (!prev) {
+                    rememberOutgoingStatus(seen, req.id, curr);
+                    changed = true;
+                    continue;
+                }
+
+                if (prev === curr) continue;
+
+                rememberOutgoingStatus(seen, req.id, curr);
+                changed = true;
+
+                const prompt = buildOutgoingStatusPrompt(req);
+                if (!prompt) continue;
+
+                if (hooks.onFriendRequestStatusChange) {
+                    try {
+                        await hooks.onFriendRequestStatusChange({ request: req, prompt });
+                    } catch (err: any) {
+                        console.error(`[watch] outgoing request status callback error: ${err.message}`);
+                    }
+                }
+
+                if (hooks.echoConsole !== false) {
+                    console.log(`\n${prompt}`);
+                }
+            }
+
+            if (changed) {
+                await saveState(state);
+            }
+        } catch (err: any) {
+            console.error(`[watch] poll outgoing request status failed: ${err.message}`);
         }
     }
 
@@ -739,7 +991,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
                 const senderName = await resolveAgentName(data.sender_id || '');
                 const content = data.payload?.content || data.content || '[空消息]';
-                const prompt = `${senderName}跟我说“${content}”，我需要自由回复吗还是等待您下指令？`;
+                const prompt = buildMessagePrompt(policy.mode, senderName, content);
 
                 if (hooks.onNewMessage) {
                     try {
@@ -763,13 +1015,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
-    const ws = new WebSocket(`${WS_URL}/ws`, {
+    const ws = new WebSocket(`${runtimeWsUrl}/ws`, {
         headers: { Authorization: `Bearer ${session.token}` },
     });
 
     ws.on('open', () => {
         console.log(`已连接 WebSocket，当前agent: ${session.agent_name}`);
-        console.log('正在监听新消息与好友请求...');
+        console.log(`正在监听新消息与好友请求（隔离模式: ${policy.mode}）...`);
     });
 
     ws.on('message', (raw) => {
@@ -792,10 +1044,12 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     }, 30000);
 
     const pollTimer = setInterval(() => {
-        void pollFriendRequests();
+        void pollIncomingFriendRequests();
+        void pollOutgoingRequestStatus();
     }, WATCH_POLL_INTERVAL_MS);
 
-    await pollFriendRequests();
+    await pollIncomingFriendRequests();
+    await pollOutgoingRequestStatus();
 
     process.on('SIGINT', () => {
         clearInterval(pingTimer);
@@ -829,7 +1083,7 @@ async function commandBridge(args: string[], state: LocalState, asAgent?: string
     let cachedRoute = await resolveNotifyRoute(mergedBinding);
     console.log(`[bridge] 已加载通知路由 ${cachedRoute.account_id} -> ${cachedRoute.target} (${cachedRoute.channel})`);
     if (cachedRoute.dry_run) {
-        console.log('[bridge] 当前为 dry-run 模式，不会真实发送 Discord 消息。');
+        console.log('[bridge] 当前为 dry-run 模式，不会真实发送渠道消息。');
     }
 
     async function notifyUser(text: string) {
@@ -847,15 +1101,217 @@ async function commandBridge(args: string[], state: LocalState, asAgent?: string
         onFriendRequest: async ({ prompt }) => {
             await notifyUser(prompt);
         },
+        onFriendRequestStatusChange: async ({ prompt }) => {
+            await notifyUser(prompt);
+        },
         onNewMessage: async ({ prompt }) => {
             await notifyUser(prompt);
         },
     });
 }
 
+function parseDaemonMode(value: string): 'watch' | 'bridge' {
+    if (value === 'watch' || value === 'bridge') return value;
+    throw new Error(`Invalid daemon mode: ${value}. Use watch | bridge`);
+}
+
+async function commandDaemon(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const sub = args[0] || 'status';
+    const registry = await loadDaemonRegistry();
+    const pruned = pruneStoppedDaemons(registry);
+    if (pruned) {
+        await saveDaemonRegistry(registry);
+    }
+
+    if (sub === 'start') {
+        const session = getSessionOrThrow(state, asAgent);
+        const rawMode = args[1] && !args[1].startsWith('--') ? args[1] : 'bridge';
+        const mode = parseDaemonMode(rawMode);
+        const key = daemonKey(session.agent_name, mode);
+        const existing = registry.entries[key];
+        if (existing && isProcessRunning(existing.pid)) {
+            console.log(`daemon 已在运行: agent=${session.agent_name}, mode=${mode}, pid=${existing.pid}`);
+            console.log(`日志文件: ${existing.log_file}`);
+            return;
+        }
+
+        await fs.mkdir(DAEMON_LOG_DIR, { recursive: true });
+        const logFile = path.join(DAEMON_LOG_DIR, `${session.agent_name}-${mode}.log`);
+        const fd = fsSync.openSync(logFile, 'a');
+        const childArgs = [process.argv[1], mode, '--as', session.agent_name];
+
+        const child = spawn(process.execPath, childArgs, {
+            detached: true,
+            stdio: ['ignore', fd, fd],
+            windowsHide: true,
+            cwd: process.cwd(),
+            env: process.env,
+        });
+        child.unref();
+        fsSync.closeSync(fd);
+
+        if (!child.pid) {
+            throw new Error('Failed to start daemon process');
+        }
+
+        registry.entries[key] = {
+            pid: child.pid,
+            agent_name: session.agent_name,
+            mode,
+            started_at: new Date().toISOString(),
+            cwd: process.cwd(),
+            log_file: logFile,
+        };
+        await saveDaemonRegistry(registry);
+
+        console.log(`daemon 已启动: agent=${session.agent_name}, mode=${mode}, pid=${child.pid}`);
+        console.log(`日志文件: ${logFile}`);
+        return;
+    }
+
+    if (sub === 'stop') {
+        const session = getSessionOrThrow(state, asAgent);
+        const rawMode = args[1] && !args[1].startsWith('--') ? args[1] : 'all';
+        const targetModes: Array<'watch' | 'bridge'> = rawMode === 'all'
+            ? ['watch', 'bridge']
+            : [parseDaemonMode(rawMode)];
+
+        let stopped = 0;
+        for (const mode of targetModes) {
+            const key = daemonKey(session.agent_name, mode);
+            const entry = registry.entries[key];
+            if (!entry) continue;
+            try {
+                process.kill(entry.pid, 'SIGTERM');
+            } catch {
+                // Process may already be gone.
+            }
+            delete registry.entries[key];
+            stopped += 1;
+        }
+
+        await saveDaemonRegistry(registry);
+        if (stopped === 0) {
+            console.log(`未找到可停止的 daemon（agent=${session.agent_name}）。`);
+        } else {
+            console.log(`已停止 ${stopped} 个 daemon（agent=${session.agent_name}）。`);
+        }
+        return;
+    }
+
+    if (sub === 'status') {
+        const modeFilter = args[1] && !args[1].startsWith('--') ? args[1] : 'all';
+        let entries = Object.values(registry.entries);
+        if (asAgent) {
+            entries = entries.filter((entry) => entry.agent_name === asAgent);
+        }
+        if (modeFilter !== 'all') {
+            const parsedMode = parseDaemonMode(modeFilter);
+            entries = entries.filter((entry) => entry.mode === parsedMode);
+        }
+
+        if (entries.length === 0) {
+            console.log('当前没有运行中的 daemon。');
+            return;
+        }
+
+        for (const entry of entries) {
+            const alive = isProcessRunning(entry.pid) ? 'running' : 'stopped';
+            console.log(
+                `- agent=${entry.agent_name} mode=${entry.mode} pid=${entry.pid} status=${alive} started_at=${entry.started_at}`
+            );
+            console.log(`  log: ${entry.log_file}`);
+        }
+        return;
+    }
+
+    throw new Error('Usage: openclaw-social daemon <start|stop|status> [bridge|watch|all] [--as <agent_name>]');
+}
+
+function parsePolicySetArgs(args: string[]): { mode: DeliveryMode } {
+    let mode: DeliveryMode | undefined;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--mode') {
+            mode = args[i + 1] as DeliveryMode;
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for policy set: ${arg}`);
+    }
+
+    if (!mode) {
+        throw new Error('Usage: openclaw-social policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_name>]');
+    }
+
+    if (mode !== 'receive_only' && mode !== 'manual_review' && mode !== 'auto_execute') {
+        throw new Error('Invalid mode. Use receive_only | manual_review | auto_execute');
+    }
+
+    return { mode };
+}
+
+async function commandPolicy(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const sub = args[0];
+
+    if (sub === 'set') {
+        const session = getSessionOrThrow(state, asAgent);
+        const parsed = parsePolicySetArgs(args.slice(1));
+        state.policies[session.agent_name] = { mode: parsed.mode };
+        await saveState(state);
+        console.log(`已更新策略：${session.agent_name} -> ${parsed.mode}`);
+        return;
+    }
+
+    if (sub === 'get' || !sub) {
+        const session = getSessionOrThrow(state, asAgent);
+        const policy = getPolicy(state, session.agent_name);
+        console.log(JSON.stringify({ agent: session.agent_name, policy }, null, 2));
+        return;
+    }
+
+    throw new Error('Usage: openclaw-social policy <get|set> [--mode <receive_only|manual_review|auto_execute>] [--as <agent_name>]');
+}
+
+async function commandConfig(args: string[], config: CliConfig): Promise<void> {
+    const sub = args[0];
+
+    if (!sub || sub === 'get') {
+        console.log(JSON.stringify({
+            base_url: config.base_url || null,
+            effective_base_url: runtimeBaseUrl,
+        }, null, 2));
+        return;
+    }
+
+    if (sub === 'set') {
+        const key = args[1];
+        const value = args[2];
+
+        if (!key || !value) {
+            throw new Error('Usage: openclaw-social config set <base_url|base-url> <url>');
+        }
+
+        if (key !== 'base_url' && key !== 'base-url') {
+            throw new Error(`Unsupported config key: ${key}`);
+        }
+
+        const normalized = normalizeBaseUrl(value);
+        config.base_url = normalized;
+        await saveConfig(config);
+        setRuntimeBaseUrl(normalized);
+
+        console.log(`配置已更新: base_url=${normalized}`);
+        return;
+    }
+
+    throw new Error('Usage: openclaw-social config <get|set> [base_url <url>]');
+}
+
 function printUsage() {
     console.log(`
-openclaw-social — AgentSocial workflow helper for OpenClaw
+openclaw-social - AgentSocial workflow helper for OpenClaw
 
 Usage:
   npx tsx cli/openclaw-social.ts onboard <agent_name> <password>
@@ -868,19 +1324,31 @@ Usage:
   npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_name>]
   npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_name>]
 
-  npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel discord] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts bindings
+
+  npx tsx cli/openclaw-social.ts policy get [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_name>]
+
+  npx tsx cli/openclaw-social.ts config get
+  npx tsx cli/openclaw-social.ts config set base_url <url>
 
   npx tsx cli/openclaw-social.ts watch [--as <agent_name>]
   npx tsx cli/openclaw-social.ts bridge [--as <agent_name>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run]
+  npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts daemon status [bridge|watch|all] [--as <agent_name>]
 
-Environment:
-  AGENT_SOCIAL_URL   default: http://localhost:3000
+Priority:
+  AGENT_SOCIAL_URL environment variable > ~/.agent-social/config.json > ${DEFAULT_BASE_URL}
 `);
 }
 
 async function main() {
     const [, , command, ...argv] = process.argv;
+    const config = await loadConfig();
+    setRuntimeBaseUrl(resolveBaseUrl(config));
+
     const state = await loadState();
     const { asAgent, rest } = parseAgentOption(argv);
 
@@ -921,6 +1389,15 @@ async function main() {
                 break;
             case 'bridge':
                 await commandBridge(rest, state, asAgent);
+                break;
+            case 'policy':
+                await commandPolicy(rest, state, asAgent);
+                break;
+            case 'config':
+                await commandConfig(rest, config);
+                break;
+            case 'daemon':
+                await commandDaemon(rest, state, asAgent);
                 break;
             case 'help':
             case '--help':
