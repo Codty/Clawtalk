@@ -25,6 +25,7 @@ const execFileAsync = promisify(execFile);
 
 type FriendRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
 type DeliveryMode = 'receive_only' | 'manual_review' | 'auto_execute';
+type DeliveryStrategy = 'primary' | 'fanout' | 'fallback';
 
 interface AgentSession {
     agent_name: string;
@@ -52,12 +53,26 @@ interface OpenClawBinding {
     dry_run?: boolean;
 }
 
+interface NotifyDestination {
+    id: string;
+    channel: string;
+    account_id?: string;
+    target?: string;
+    auto_route: boolean;
+    openclaw_agent_id?: string;
+    dry_run?: boolean;
+    enabled: boolean;
+    priority: number;
+    is_primary: boolean;
+}
+
 interface LocalState {
     current_agent?: string;
     sessions: Record<string, AgentSession>;
     seen: Record<string, SeenState>;
     bindings: Record<string, OpenClawBinding>;
     policies: Record<string, AgentPolicy>;
+    notify_profiles: Record<string, NotifyDestination[]>;
 }
 
 interface CliConfig {
@@ -108,6 +123,14 @@ interface OpenClawNotifyRoute {
     account_id: string;
     target: string;
     dry_run: boolean;
+}
+
+interface DeliveryTarget {
+    id: string;
+    is_primary: boolean;
+    priority: number;
+    cached_route?: OpenClawNotifyRoute;
+    resolve: () => Promise<OpenClawNotifyRoute>;
 }
 
 interface DaemonEntry {
@@ -230,6 +253,22 @@ function getPolicy(state: LocalState, agentName: string): AgentPolicy {
     return state.policies[agentName] || defaultPolicy();
 }
 
+function getNotifyDestinations(state: LocalState, agentName: string): NotifyDestination[] {
+    return (state.notify_profiles[agentName] || []).filter((dest) => dest.enabled !== false);
+}
+
+function parseDeliveryStrategy(value: string): DeliveryStrategy {
+    if (value === 'primary' || value === 'fanout' || value === 'fallback') return value;
+    throw new Error(`Invalid delivery strategy: ${value}. Use primary|fanout|fallback`);
+}
+
+function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
+    return [...targets].sort((a, b) => {
+        if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
+        return a.priority - b.priority;
+    });
+}
+
 async function api(method: string, route: string, body?: any, token?: string): Promise<any> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -262,6 +301,7 @@ function defaultState(): LocalState {
         seen: {},
         bindings: {},
         policies: {},
+        notify_profiles: {},
     };
 }
 
@@ -275,6 +315,7 @@ async function loadState(): Promise<LocalState> {
             seen: parsed.seen || {},
             bindings: parsed.bindings || {},
             policies: parsed.policies || {},
+            notify_profiles: parsed.notify_profiles || {},
         };
     } catch {
         return defaultState();
@@ -360,17 +401,6 @@ function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
         throw new Error(`Session not found for agent "${name}". Re-run onboard or login.`);
     }
     return session;
-}
-
-function getBindingOrThrow(state: LocalState, socialAgentName: string): OpenClawBinding {
-    const binding = state.bindings[socialAgentName];
-    if (!binding) {
-        throw new Error(
-            `No OpenClaw binding for social agent "${socialAgentName}". ` +
-            `Run: openclaw-social bind-openclaw <openclaw_agent_id> --as ${socialAgentName}`
-        );
-    }
-    return binding;
 }
 
 function pickBestMatch(agents: AgentLite[], account: string): AgentLite | null {
@@ -596,6 +626,7 @@ async function commandWhoami(state: LocalState, asAgent?: string): Promise<void>
         base_url: runtimeBaseUrl,
         policy: getPolicy(state, session.agent_name),
         binding: state.bindings[session.agent_name] || null,
+        notify_destinations: state.notify_profiles[session.agent_name] || [],
     }, null, 2));
 }
 
@@ -662,12 +693,14 @@ function parseBridgeOverrides(args: string[]): {
     accountId?: string;
     target?: string;
     dryRun?: boolean;
+    delivery?: DeliveryStrategy;
 } {
     let openclawAgentId: string | undefined;
     let channel: string | undefined;
     let accountId: string | undefined;
     let target: string | undefined;
     let dryRun: boolean | undefined;
+    let delivery: DeliveryStrategy | undefined;
 
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
@@ -699,10 +732,16 @@ function parseBridgeOverrides(args: string[]): {
             dryRun = false;
             continue;
         }
+        if (arg === '--delivery') {
+            const raw = args[i + 1] || '';
+            delivery = parseDeliveryStrategy(raw);
+            i += 1;
+            continue;
+        }
         throw new Error(`Unknown option for bridge: ${arg}`);
     }
 
-    return { openclawAgentId, channel, accountId, target, dryRun };
+    return { openclawAgentId, channel, accountId, target, dryRun, delivery };
 }
 
 async function commandBindOpenClaw(args: string[], state: LocalState, asAgent?: string): Promise<void> {
@@ -735,6 +774,134 @@ async function commandShowBindings(state: LocalState): Promise<void> {
         return;
     }
     console.log(JSON.stringify(state.bindings, null, 2));
+}
+
+function ensureNotifyProfile(state: LocalState, agentName: string): NotifyDestination[] {
+    if (!state.notify_profiles[agentName]) {
+        state.notify_profiles[agentName] = [];
+    }
+    return state.notify_profiles[agentName];
+}
+
+function parseNotifyAddArgs(args: string[]): NotifyDestination {
+    let id = `dest_${Date.now()}`;
+    let channel = '';
+    let accountId: string | undefined;
+    let target: string | undefined;
+    let openclawAgentId: string | undefined;
+    let autoRoute: boolean | undefined;
+    let dryRun = false;
+    let enabled = true;
+    let isPrimary = false;
+    let priority = 100;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--id') {
+            id = args[i + 1] || '';
+            i += 1;
+            continue;
+        }
+        if (arg === '--channel') {
+            channel = args[i + 1] || '';
+            i += 1;
+            continue;
+        }
+        if (arg === '--account') {
+            accountId = args[i + 1];
+            i += 1;
+            continue;
+        }
+        if (arg === '--target') {
+            target = args[i + 1];
+            i += 1;
+            continue;
+        }
+        if (arg === '--openclaw-agent') {
+            openclawAgentId = args[i + 1];
+            i += 1;
+            continue;
+        }
+        if (arg === '--priority') {
+            const raw = args[i + 1] || '';
+            i += 1;
+            const parsed = parseInt(raw, 10);
+            if (!Number.isFinite(parsed)) throw new Error('Invalid --priority value');
+            priority = parsed;
+            continue;
+        }
+        if (arg === '--primary') {
+            isPrimary = true;
+            continue;
+        }
+        if (arg === '--dry-run') {
+            dryRun = true;
+            continue;
+        }
+        if (arg === '--enabled') {
+            enabled = true;
+            continue;
+        }
+        if (arg === '--disabled') {
+            enabled = false;
+            continue;
+        }
+        if (arg === '--auto-route') {
+            autoRoute = true;
+            continue;
+        }
+        if (arg === '--no-auto-route') {
+            autoRoute = false;
+            continue;
+        }
+        throw new Error(`Unknown option for notify add: ${arg}`);
+    }
+
+    if (!id) throw new Error('notify add requires non-empty --id');
+    if (!channel) {
+        throw new Error(
+            'Usage: openclaw-social notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_name>]'
+        );
+    }
+
+    const hasPinnedRoute = !!(accountId && target);
+    const computedAutoRoute = autoRoute !== undefined ? autoRoute : !hasPinnedRoute;
+
+    if (!computedAutoRoute && !hasPinnedRoute) {
+        throw new Error('notify add requires --account and --target when --no-auto-route is used.');
+    }
+
+    return {
+        id,
+        channel,
+        account_id: accountId,
+        target,
+        openclaw_agent_id: openclawAgentId,
+        auto_route: computedAutoRoute,
+        dry_run: dryRun,
+        enabled,
+        priority,
+        is_primary: isPrimary,
+    };
+}
+
+function parseNotifyTestArgs(args: string[]): { message: string; delivery: DeliveryStrategy } {
+    let delivery: DeliveryStrategy = 'fallback';
+    const messageParts: string[] = [];
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--delivery') {
+            const raw = args[i + 1] || '';
+            delivery = parseDeliveryStrategy(raw);
+            i += 1;
+            continue;
+        }
+        messageParts.push(arg);
+    }
+
+    const message = messageParts.join(' ').trim() || `[notify-test] ${new Date().toISOString()}`;
+    return { message, delivery };
 }
 
 async function resolveOpenClawRouteFromSessions(openclawAgentId: string, channel: string): Promise<{ accountId: string; target: string }> {
@@ -829,6 +996,41 @@ async function resolveNotifyRoute(binding: OpenClawBinding): Promise<OpenClawNot
     };
 }
 
+async function resolveNotifyRouteForDestination(
+    dest: NotifyDestination,
+    fallbackOpenclawAgentId?: string
+): Promise<OpenClawNotifyRoute> {
+    if (dest.account_id && dest.target) {
+        return {
+            channel: dest.channel,
+            account_id: dest.account_id,
+            target: dest.target,
+            dry_run: !!dest.dry_run,
+        };
+    }
+
+    if (!dest.auto_route) {
+        throw new Error(
+            `Notify destination ${dest.id} lacks --account/--target with auto_route=false.`
+        );
+    }
+
+    const sourceAgentId = dest.openclaw_agent_id || fallbackOpenclawAgentId;
+    if (!sourceAgentId) {
+        throw new Error(
+            `Notify destination ${dest.id} needs --openclaw-agent for auto route discovery.`
+        );
+    }
+
+    const discovered = await resolveOpenClawRouteFromSessions(sourceAgentId, dest.channel);
+    return {
+        channel: dest.channel,
+        account_id: dest.account_id || discovered.accountId,
+        target: dest.target || discovered.target,
+        dry_run: !!dest.dry_run,
+    };
+}
+
 async function sendOpenClawNotification(route: OpenClawNotifyRoute, message: string): Promise<void> {
     const args = [
         'message', 'send',
@@ -849,6 +1051,143 @@ async function sendOpenClawNotification(route: OpenClawNotifyRoute, message: str
         const stderr = String(err?.stderr || err?.message || '').trim();
         throw new Error(`openclaw message send failed: ${stderr}`);
     }
+}
+
+function hasDeliveryOverride(overrides: {
+    openclawAgentId?: string;
+    channel?: string;
+    accountId?: string;
+    target?: string;
+    dryRun?: boolean;
+}): boolean {
+    return !!(
+        overrides.openclawAgentId ||
+        overrides.channel ||
+        overrides.accountId ||
+        overrides.target ||
+        overrides.dryRun !== undefined
+    );
+}
+
+function createTargetFromBinding(binding: OpenClawBinding): DeliveryTarget {
+    return {
+        id: `binding:${binding.openclaw_agent_id}`,
+        is_primary: true,
+        priority: 0,
+        resolve: async () => resolveNotifyRoute(binding),
+    };
+}
+
+function createTargetFromDestination(dest: NotifyDestination, fallbackOpenclawAgentId?: string): DeliveryTarget {
+    return {
+        id: `notify:${dest.id}`,
+        is_primary: dest.is_primary,
+        priority: dest.priority,
+        resolve: async () => resolveNotifyRouteForDestination(dest, fallbackOpenclawAgentId),
+    };
+}
+
+function selectDeliveryTargets(
+    state: LocalState,
+    session: AgentSession,
+    baseBinding: OpenClawBinding | undefined,
+    overrides?: {
+        openclawAgentId?: string;
+        channel?: string;
+        accountId?: string;
+        target?: string;
+        dryRun?: boolean;
+    }
+): DeliveryTarget[] {
+    if (overrides && hasDeliveryOverride(overrides)) {
+        const hasPinnedOverride = !!(overrides.accountId && overrides.target);
+        const mergedBinding: OpenClawBinding = {
+            openclaw_agent_id: overrides.openclawAgentId || baseBinding?.openclaw_agent_id || '',
+            channel: overrides.channel || baseBinding?.channel || 'discord',
+            account_id: overrides.accountId || baseBinding?.account_id,
+            target: overrides.target || baseBinding?.target,
+            auto_route: baseBinding ? baseBinding.auto_route : !hasPinnedOverride,
+            dry_run: overrides.dryRun !== undefined ? overrides.dryRun : baseBinding?.dry_run,
+        };
+
+        if (!mergedBinding.account_id || !mergedBinding.target) {
+            if (!mergedBinding.openclaw_agent_id) {
+                throw new Error(
+                    'Bridge override missing route source. Provide --openclaw-agent, or pin --account and --target.'
+                );
+            }
+            mergedBinding.auto_route = true;
+        }
+
+        return [createTargetFromBinding(mergedBinding)];
+    }
+
+    const profileTargets = getNotifyDestinations(state, session.agent_name)
+        .map((dest) => createTargetFromDestination(dest, baseBinding?.openclaw_agent_id));
+    if (profileTargets.length > 0) {
+        return sortDeliveryTargets(profileTargets);
+    }
+
+    if (baseBinding) {
+        return [createTargetFromBinding(baseBinding)];
+    }
+
+    return [];
+}
+
+async function sendWithTarget(target: DeliveryTarget, message: string): Promise<void> {
+    let route = target.cached_route;
+    if (!route) {
+        route = await target.resolve();
+        target.cached_route = route;
+    }
+
+    try {
+        await sendOpenClawNotification(route, message);
+    } catch {
+        // Refresh route for auto-route cases and retry once.
+        route = await target.resolve();
+        target.cached_route = route;
+        await sendOpenClawNotification(route, message);
+    }
+}
+
+async function dispatchNotification(targets: DeliveryTarget[], strategy: DeliveryStrategy, message: string): Promise<void> {
+    if (targets.length === 0) {
+        throw new Error('No delivery targets available. Configure notify destinations or bind-openclaw first.');
+    }
+
+    const ordered = sortDeliveryTargets(targets);
+
+    if (strategy === 'primary') {
+        const primary = ordered.find((t) => t.is_primary) || ordered[0];
+        await sendWithTarget(primary, message);
+        return;
+    }
+
+    if (strategy === 'fanout') {
+        const results = await Promise.allSettled(ordered.map((target) => sendWithTarget(target, message)));
+        const success = results.some((r) => r.status === 'fulfilled');
+        if (!success) {
+            const failures = results
+                .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+                .map((r) => String(r.reason?.message || r.reason));
+            throw new Error(`Fanout delivery failed: ${failures.join(' | ')}`);
+        }
+        return;
+    }
+
+    // fallback: try in order until one target succeeds
+    const errors: string[] = [];
+    for (const target of ordered) {
+        try {
+            await sendWithTarget(target, message);
+            return;
+        } catch (err: any) {
+            errors.push(`${target.id}: ${String(err?.message || err)}`);
+        }
+    }
+    throw new Error(`Fallback delivery failed: ${errors.join(' | ')}`);
 }
 
 function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: string): string {
@@ -1160,31 +1499,26 @@ async function commandWatch(state: LocalState, asAgent?: string): Promise<void> 
 
 async function commandBridge(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
-    const baseBinding = getBindingOrThrow(state, session.agent_name);
+    const baseBinding = state.bindings[session.agent_name];
     const overrides = parseBridgeOverrides(args);
-
-    const mergedBinding: OpenClawBinding = {
-        ...baseBinding,
-        openclaw_agent_id: overrides.openclawAgentId || baseBinding.openclaw_agent_id,
-        channel: overrides.channel || baseBinding.channel,
-        account_id: overrides.accountId || baseBinding.account_id,
-        target: overrides.target || baseBinding.target,
-        dry_run: overrides.dryRun !== undefined ? overrides.dryRun : baseBinding.dry_run,
-    };
-
-    let cachedRoute = await resolveNotifyRoute(mergedBinding);
-    console.log(`[bridge] 已加载通知路由 ${cachedRoute.account_id} -> ${cachedRoute.target} (${cachedRoute.channel})`);
-    if (cachedRoute.dry_run) {
-        console.log('[bridge] 当前为 dry-run 模式，不会真实发送渠道消息。');
+    const delivery = overrides.delivery || 'fallback';
+    const targets = selectDeliveryTargets(state, session, baseBinding, overrides);
+    if (targets.length === 0) {
+        throw new Error(
+            `No bridge target for ${session.agent_name}. Run bind-openclaw or notify add first.`
+        );
     }
+
+    const targetSummary = targets
+        .map((target) => `${target.id}${target.is_primary ? '(primary)' : ''}`)
+        .join(', ');
+    console.log(`[bridge] 已启动策略投递: strategy=${delivery}, targets=${targetSummary}`);
 
     async function notifyUser(text: string) {
         try {
-            await sendOpenClawNotification(cachedRoute, text);
+            await dispatchNotification(targets, delivery, text);
         } catch (err: any) {
-            console.error(`[bridge] 通知失败，尝试重新解析路由: ${err.message}`);
-            cachedRoute = await resolveNotifyRoute(mergedBinding);
-            await sendOpenClawNotification(cachedRoute, text);
+            console.error(`[bridge] 通知失败: ${err.message}`);
         }
     }
 
@@ -1200,6 +1534,136 @@ async function commandBridge(args: string[], state: LocalState, asAgent?: string
             await notifyUser(prompt);
         },
     });
+}
+
+async function commandNotify(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const sub = args[0] || 'list';
+
+    if (sub === 'add') {
+        const session = getSessionOrThrow(state, asAgent);
+        const destination = parseNotifyAddArgs(args.slice(1));
+        const profile = ensureNotifyProfile(state, session.agent_name);
+        const baseBinding = state.bindings[session.agent_name];
+
+        if (
+            destination.auto_route &&
+            !destination.account_id &&
+            !destination.target &&
+            !destination.openclaw_agent_id &&
+            baseBinding?.openclaw_agent_id
+        ) {
+            destination.openclaw_agent_id = baseBinding.openclaw_agent_id;
+        }
+
+        if (
+            destination.auto_route &&
+            !destination.account_id &&
+            !destination.target &&
+            !destination.openclaw_agent_id
+        ) {
+            throw new Error(
+                'notify add auto-route requires --openclaw-agent, or an existing bind-openclaw, or pinned --account/--target.'
+            );
+        }
+
+        if (profile.some((dest) => dest.id === destination.id)) {
+            throw new Error(`notify destination id already exists: ${destination.id}`);
+        }
+
+        if (destination.is_primary) {
+            for (const dest of profile) {
+                dest.is_primary = false;
+            }
+        } else {
+            const hasPrimary = profile.some((dest) => dest.is_primary);
+            if (!hasPrimary) {
+                destination.is_primary = true;
+            }
+        }
+
+        profile.push(destination);
+        await saveState(state);
+
+        console.log(`notify destination 已添加: ${destination.id}`);
+        console.log(JSON.stringify(destination, null, 2));
+        return;
+    }
+
+    if (sub === 'list' || sub === 'get') {
+        const session = getSessionOrThrow(state, asAgent);
+        const profile = ensureNotifyProfile(state, session.agent_name);
+        const ordered = [...profile].sort((a, b) => {
+            if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
+            return a.priority - b.priority;
+        });
+
+        console.log(JSON.stringify({
+            agent: session.agent_name,
+            count: ordered.length,
+            destinations: ordered,
+        }, null, 2));
+        return;
+    }
+
+    if (sub === 'remove') {
+        const session = getSessionOrThrow(state, asAgent);
+        const id = args[1];
+        if (!id) {
+            throw new Error('Usage: openclaw-social notify remove <id> [--as <agent_name>]');
+        }
+
+        const profile = ensureNotifyProfile(state, session.agent_name);
+        const index = profile.findIndex((dest) => dest.id === id);
+        if (index < 0) {
+            throw new Error(`notify destination not found: ${id}`);
+        }
+
+        const [removed] = profile.splice(index, 1);
+        if (removed.is_primary && profile.length > 0 && !profile.some((dest) => dest.is_primary)) {
+            profile.sort((a, b) => a.priority - b.priority);
+            profile[0].is_primary = true;
+        }
+
+        await saveState(state);
+        console.log(`notify destination 已移除: ${id}`);
+        return;
+    }
+
+    if (sub === 'set-primary') {
+        const session = getSessionOrThrow(state, asAgent);
+        const id = args[1];
+        if (!id) {
+            throw new Error('Usage: openclaw-social notify set-primary <id> [--as <agent_name>]');
+        }
+
+        const profile = ensureNotifyProfile(state, session.agent_name);
+        const exists = profile.some((dest) => dest.id === id);
+        if (!exists) {
+            throw new Error(`notify destination not found: ${id}`);
+        }
+
+        for (const dest of profile) {
+            dest.is_primary = dest.id === id;
+        }
+        await saveState(state);
+        console.log(`primary notify destination 已更新: ${id}`);
+        return;
+    }
+
+    if (sub === 'test') {
+        const session = getSessionOrThrow(state, asAgent);
+        const baseBinding = state.bindings[session.agent_name];
+        const parsed = parseNotifyTestArgs(args.slice(1));
+        const targets = selectDeliveryTargets(state, session, baseBinding);
+
+        await dispatchNotification(targets, parsed.delivery, parsed.message);
+        console.log(`notify test 已发送: strategy=${parsed.delivery}, targets=${targets.length}`);
+        return;
+    }
+
+    throw new Error(
+        'Usage: openclaw-social notify <add|list|remove|set-primary|test> ... [--as <agent_name>]'
+    );
 }
 
 function parseDaemonMode(value: string): 'watch' | 'bridge' {
@@ -1418,6 +1882,11 @@ Usage:
 
   npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts bindings
+  npx tsx cli/openclaw-social.ts notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts notify list [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts notify remove <id> [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts notify set-primary <id> [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_name>]
 
   npx tsx cli/openclaw-social.ts policy get [--as <agent_name>]
   npx tsx cli/openclaw-social.ts policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_name>]
@@ -1426,7 +1895,7 @@ Usage:
   npx tsx cli/openclaw-social.ts config set base_url <url>
 
   npx tsx cli/openclaw-social.ts watch [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts bridge [--as <agent_name>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run]
+  npx tsx cli/openclaw-social.ts bridge [--as <agent_name>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
   npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts daemon status [bridge|watch|all] [--as <agent_name>]
@@ -1475,6 +1944,9 @@ async function main() {
                 break;
             case 'bindings':
                 await commandShowBindings(state);
+                break;
+            case 'notify':
+                await commandNotify(rest, state, asAgent);
                 break;
             case 'watch':
                 await commandWatch(state, asAgent);

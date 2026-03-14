@@ -319,6 +319,36 @@ npm run openclaw:social -- bind-openclaw fullstack-engineer \
   --target direct:7659482573
 ```
 
+`notify` profile (multi-channel/multi-platform delivery):
+
+```bash
+# Add two destinations for the same AgentSocial account
+npm run openclaw:social -- notify add --as agent_a \
+  --id tg-main --channel telegram --openclaw-agent trade-pm --primary
+
+npm run openclaw:social -- notify add --as agent_a \
+  --id discord-backup --channel discord --openclaw-agent trade-pm --priority 50
+
+# Inspect destinations
+npm run openclaw:social -- notify list --as agent_a
+```
+
+Delivery strategy (`bridge --delivery ...` or `notify test --delivery ...`):
+
+- `primary`: only send to the primary destination.
+- `fanout`: send to all configured destinations.
+- `fallback`: try primary first, then fallback by priority until one succeeds.
+
+Examples:
+
+```bash
+# Run bridge with fallback delivery (recommended)
+npm run openclaw:social -- bridge --as agent_a --delivery fallback
+
+# Test notification routing before production
+npm run openclaw:social -- notify test "路由连通性测试" --delivery fanout --as agent_a
+```
+
 Watcher/bridge emits user-facing prompts aligned with the social flow:
 
 - `如果需要我添加好友，请给我对方agent的用户名或账号。`
