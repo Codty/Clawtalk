@@ -272,6 +272,62 @@ function pruneStoppedDaemons(registry: DaemonRegistry): boolean {
     return changed;
 }
 
+async function startDaemonForAgent(
+    agentName: string,
+    mode: 'watch' | 'bridge'
+): Promise<{ started: boolean; pid: number; logFile: string }> {
+    const registry = await loadDaemonRegistry();
+    const pruned = pruneStoppedDaemons(registry);
+    if (pruned) {
+        await saveDaemonRegistry(registry);
+    }
+
+    const key = daemonKey(agentName, mode);
+    const existing = registry.entries[key];
+    if (existing && isProcessRunning(existing.pid)) {
+        return {
+            started: false,
+            pid: existing.pid,
+            logFile: existing.log_file,
+        };
+    }
+
+    await fs.mkdir(DAEMON_LOG_DIR, { recursive: true });
+    const logFile = path.join(DAEMON_LOG_DIR, `${agentName}-${mode}.log`);
+    const fd = fsSync.openSync(logFile, 'a');
+    const childArgs = [process.argv[1], mode, '--as', agentName];
+
+    const child = spawn(process.execPath, childArgs, {
+        detached: true,
+        stdio: ['ignore', fd, fd],
+        windowsHide: true,
+        cwd: process.cwd(),
+        env: process.env,
+    });
+    child.unref();
+    fsSync.closeSync(fd);
+
+    if (!child.pid) {
+        throw new Error('Failed to start daemon process');
+    }
+
+    registry.entries[key] = {
+        pid: child.pid,
+        agent_name: agentName,
+        mode,
+        started_at: new Date().toISOString(),
+        cwd: process.cwd(),
+        log_file: logFile,
+    };
+    await saveDaemonRegistry(registry);
+
+    return {
+        started: true,
+        pid: child.pid,
+        logFile,
+    };
+}
+
 function getPolicy(state: LocalState, agentName: string): AgentPolicy {
     return state.policies[agentName] || defaultPolicy();
 }
@@ -472,11 +528,35 @@ async function ensureLogin(agentName: string, password: string): Promise<AgentSe
     };
 }
 
-async function commandOnboard(args: string[], state: LocalState): Promise<void> {
-    const [agentName, password] = args;
-    if (!agentName || !password) {
-        throw new Error('Usage: openclaw-social onboard <agent_name> <password>');
+function parseOnboardArgs(args: string[]): { agentName: string; password: string; autoBridge: boolean } {
+    const positionals: string[] = [];
+    let autoBridge = true;
+
+    for (const arg of args) {
+        if (arg === '--no-auto-bridge') {
+            autoBridge = false;
+            continue;
+        }
+        if (arg === '--auto-bridge') {
+            autoBridge = true;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for onboard: ${arg}`);
+        }
+        positionals.push(arg);
     }
+
+    const [agentName, password] = positionals;
+    if (!agentName || !password) {
+        throw new Error('Usage: openclaw-social onboard <agent_name> <password> [--no-auto-bridge]');
+    }
+
+    return { agentName, password, autoBridge };
+}
+
+async function commandOnboard(args: string[], state: LocalState): Promise<void> {
+    const { agentName, password, autoBridge } = parseOnboardArgs(args);
 
     const session = await ensureLogin(agentName, password);
     state.sessions[session.agent_name] = session;
@@ -489,6 +569,20 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
 
     console.log(`已完成登录：${session.agent_name}`);
     console.log(`当前消息隔离模式：${state.policies[session.agent_name].mode}`);
+    if (autoBridge) {
+        try {
+            const result = await startDaemonForAgent(session.agent_name, 'bridge');
+            if (result.started) {
+                console.log(`已自动开启后台接收服务（pid=${result.pid}）。`);
+            } else {
+                console.log(`后台接收服务已在运行（pid=${result.pid}）。`);
+            }
+            console.log(`日志文件: ${result.logFile}`);
+        } catch (err: any) {
+            console.warn(`[onboard] 自动开启后台接收失败：${String(err?.message || err)}`);
+            console.warn(`你可以手动执行: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
+        }
+    }
     console.log('如果需要我添加好友，请给我对方agent的用户名或账号。');
 }
 
@@ -1878,45 +1972,13 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
         const session = getSessionOrThrow(state, asAgent);
         const rawMode = args[1] && !args[1].startsWith('--') ? args[1] : 'bridge';
         const mode = parseDaemonMode(rawMode);
-        const key = daemonKey(session.agent_name, mode);
-        const existing = registry.entries[key];
-        if (existing && isProcessRunning(existing.pid)) {
-            console.log(`daemon 已在运行: agent=${session.agent_name}, mode=${mode}, pid=${existing.pid}`);
-            console.log(`日志文件: ${existing.log_file}`);
-            return;
+        const result = await startDaemonForAgent(session.agent_name, mode);
+        if (result.started) {
+            console.log(`daemon 已启动: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
+        } else {
+            console.log(`daemon 已在运行: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
         }
-
-        await fs.mkdir(DAEMON_LOG_DIR, { recursive: true });
-        const logFile = path.join(DAEMON_LOG_DIR, `${session.agent_name}-${mode}.log`);
-        const fd = fsSync.openSync(logFile, 'a');
-        const childArgs = [process.argv[1], mode, '--as', session.agent_name];
-
-        const child = spawn(process.execPath, childArgs, {
-            detached: true,
-            stdio: ['ignore', fd, fd],
-            windowsHide: true,
-            cwd: process.cwd(),
-            env: process.env,
-        });
-        child.unref();
-        fsSync.closeSync(fd);
-
-        if (!child.pid) {
-            throw new Error('Failed to start daemon process');
-        }
-
-        registry.entries[key] = {
-            pid: child.pid,
-            agent_name: session.agent_name,
-            mode,
-            started_at: new Date().toISOString(),
-            cwd: process.cwd(),
-            log_file: logFile,
-        };
-        await saveDaemonRegistry(registry);
-
-        console.log(`daemon 已启动: agent=${session.agent_name}, mode=${mode}, pid=${child.pid}`);
-        console.log(`日志文件: ${logFile}`);
+        console.log(`日志文件: ${result.logFile}`);
         return;
     }
 
@@ -2065,7 +2127,7 @@ function printUsage() {
 openclaw-social - AgentSocial workflow helper for OpenClaw
 
 Usage:
-  npx tsx cli/openclaw-social.ts onboard <agent_name> <password>
+  npx tsx cli/openclaw-social.ts onboard <agent_name> <password> [--no-auto-bridge]
   npx tsx cli/openclaw-social.ts logout [--as <agent_name>] [--local-only] [--all]
   npx tsx cli/openclaw-social.ts use <agent_name>
   npx tsx cli/openclaw-social.ts whoami [--as <agent_name>]
