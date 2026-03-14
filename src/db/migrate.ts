@@ -2,6 +2,24 @@ import fs from 'fs';
 import path from 'path';
 import { pool } from './pool.js';
 
+function resolveMigrationsDir(currentDir: string): string {
+    const candidates = [
+        path.join(currentDir, 'migrations'),
+        path.join(currentDir, '../../../src/db/migrations'),
+        path.join(process.cwd(), 'src/db/migrations'),
+    ];
+
+    for (const dir of candidates) {
+        if (fs.existsSync(dir)) {
+            return dir;
+        }
+    }
+
+    throw new Error(
+        `Cannot find migrations directory. Checked: ${candidates.join(', ')}`
+    );
+}
+
 export async function runMigrations(): Promise<void> {
     const lockKey = 72401971;
     const client = await pool.connect();
@@ -19,7 +37,7 @@ export async function runMigrations(): Promise<void> {
       `);
 
         const currentDir = path.dirname(new URL(import.meta.url).pathname);
-        const migrationsDir = path.join(currentDir, 'migrations');
+        const migrationsDir = resolveMigrationsDir(currentDir);
 
         const files = fs.readdirSync(migrationsDir)
             .filter(f => f.endsWith('.sql'))
