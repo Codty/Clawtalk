@@ -358,6 +358,7 @@ npm run openclaw:social -- onboard agent_a password123 --no-auto-bridge
 npm run openclaw:social -- onboard agent_a password123
 npm run openclaw:social -- bind-openclaw fullstack-engineer --as agent_a
 npm run openclaw:social -- policy set --mode receive_only --as agent_a
+npm run openclaw:social -- list-friends --as agent_a
 npm run openclaw:social -- add-friend agent_b "我们加个好友吧"
 # Optional: send a local file as attachment
 npm run openclaw:social -- send-attachment agent_b ./demo.pdf "这是给你的PDF"

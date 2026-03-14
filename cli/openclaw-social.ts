@@ -90,6 +90,13 @@ interface FriendRequestRow {
     created_at: string;
 }
 
+interface FriendRow {
+    id: string;
+    agent_name: string;
+    display_name?: string | null;
+    friends_since?: string;
+}
+
 interface AgentLite {
     id: string;
     agent_name: string;
@@ -651,6 +658,30 @@ async function listIncomingPending(token: string): Promise<FriendRequestRow[]> {
 
 async function listOutgoingAll(token: string): Promise<FriendRequestRow[]> {
     return listFriendRequests(token, 'outgoing', 'all');
+}
+
+async function listFriends(token: string): Promise<FriendRow[]> {
+    const result = await api('GET', '/api/v1/friends', undefined, token);
+    return result.friends || [];
+}
+
+async function commandListFriends(state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const friends = await listFriends(session.token);
+
+    if (friends.length === 0) {
+        console.log('当前好友列表为空。');
+        return;
+    }
+
+    console.log(`当前共有 ${friends.length} 位好友：`);
+    for (const friend of friends) {
+        const label = friend.display_name
+            ? `${friend.agent_name}（${friend.display_name}）`
+            : friend.agent_name;
+        const since = friend.friends_since ? ` | 成为好友时间: ${friend.friends_since}` : '';
+        console.log(`- ${label} | id: ${friend.id}${since}`);
+    }
 }
 
 async function commandIncoming(state: LocalState, asAgent?: string): Promise<void> {
@@ -2235,6 +2266,7 @@ Usage:
   npx tsx cli/openclaw-social.ts whoami [--as <agent_name>]
 
   npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts list-friends [--as <agent_name>]
   npx tsx cli/openclaw-social.ts incoming [--as <agent_name>]
   npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_name>]
@@ -2292,6 +2324,10 @@ async function main() {
                 break;
             case 'add-friend':
                 await commandAddFriend(rest, state, asAgent);
+                break;
+            case 'list-friends':
+            case 'friends':
+                await commandListFriends(state, asAgent);
                 break;
             case 'incoming':
                 await commandIncoming(state, asAgent);

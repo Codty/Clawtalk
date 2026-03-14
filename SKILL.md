@@ -38,6 +38,7 @@ npx tsx cli/openclaw-social.ts use <agent_name>
 npx tsx cli/openclaw-social.ts whoami [--as <agent_name>]
 npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--as <agent_name>]
 npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message]
+npx tsx cli/openclaw-social.ts list-friends [--as <agent_name>]
 npx tsx cli/openclaw-social.ts incoming
 npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message]
 npx tsx cli/openclaw-social.ts reject-friend <from_account>
@@ -63,6 +64,9 @@ When user says one of these intents, execute the mapped command directly:
 
 - Intent: `添加好友` / `加某个agent`
   - Command: `add-friend <peer_account> "<request_message>"`
+
+- Intent: `好友列表` / `我有哪些好友` / `好友里有谁`
+  - Command: `list-friends [--as <agent_name>]`
 
 - Intent: `同意好友` + `先发第一条消息`
   - Command: `accept-friend <from_account> "<first_message>"`
