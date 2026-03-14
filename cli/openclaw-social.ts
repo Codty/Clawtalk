@@ -15,6 +15,7 @@ const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
 const DAEMON_FILE = path.join(STATE_DIR, 'openclaw-social-daemons.json');
 const DAEMON_LOG_DIR = path.join(STATE_DIR, 'logs');
 const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
+const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 const WATCH_POLL_INTERVAL_MS = 5000;
 const MAX_SEEN_IDS = 300;
 
@@ -45,7 +46,7 @@ interface AgentPolicy {
 }
 
 interface OpenClawBinding {
-    openclaw_agent_id: string;
+    openclaw_agent_id?: string;
     channel: string;
     account_id?: string;
     target?: string;
@@ -123,6 +124,28 @@ interface OpenClawNotifyRoute {
     account_id: string;
     target: string;
     dry_run: boolean;
+}
+
+interface OpenClawConfigBindingMatch {
+    channel?: string;
+    accountId?: string;
+}
+
+interface OpenClawConfigBinding {
+    agentId?: string;
+    match?: OpenClawConfigBindingMatch;
+}
+
+interface OpenClawConfig {
+    bindings?: OpenClawConfigBinding[];
+}
+
+interface SessionRouteCandidate {
+    agentId: string;
+    channel: string;
+    accountId: string;
+    target: string;
+    updatedAt: number;
 }
 
 interface DeliveryTarget {
@@ -904,34 +927,41 @@ function parseNotifyTestArgs(args: string[]): { message: string; delivery: Deliv
     return { message, delivery };
 }
 
-async function resolveOpenClawRouteFromSessions(openclawAgentId: string, channel: string): Promise<{ accountId: string; target: string }> {
-    const sessionsPath = path.join(OPENCLAW_HOME, 'agents', openclawAgentId, 'sessions', 'sessions.json');
-
-    let content: string;
+async function loadOpenClawConfig(): Promise<OpenClawConfig> {
     try {
-        content = await fs.readFile(sessionsPath, 'utf-8');
+        const content = await fs.readFile(OPENCLAW_CONFIG_PATH, 'utf-8');
+        return JSON.parse(content) as OpenClawConfig;
     } catch {
-        throw new Error(`Cannot read OpenClaw sessions file: ${sessionsPath}`);
+        return {};
     }
+}
 
-    let sessions: Record<string, any> = {};
+async function listOpenClawAgentIds(): Promise<string[]> {
+    const agentsDir = path.join(OPENCLAW_HOME, 'agents');
     try {
-        sessions = JSON.parse(content) as Record<string, any>;
+        const entries = await fs.readdir(agentsDir, { withFileTypes: true });
+        return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
     } catch {
-        throw new Error(`Invalid JSON in OpenClaw sessions file: ${sessionsPath}`);
+        return [];
     }
+}
 
-    type Candidate = { updatedAt: number; accountId: string; target: string };
-    const candidates: Candidate[] = [];
+function extractSessionRouteCandidates(
+    sessions: Record<string, any>,
+    agentId: string,
+    expectedChannel?: string
+): SessionRouteCandidate[] {
+    const candidates: SessionRouteCandidate[] = [];
 
     for (const session of Object.values(sessions)) {
-        const lastChannel = typeof session?.lastChannel === 'string'
+        const channel = typeof session?.lastChannel === 'string'
             ? session.lastChannel
             : typeof session?.deliveryContext?.channel === 'string'
                 ? session.deliveryContext.channel
                 : '';
 
-        if (lastChannel !== channel) continue;
+        if (!channel) continue;
+        if (expectedChannel && channel !== expectedChannel) continue;
 
         const accountId = typeof session?.lastAccountId === 'string'
             ? session.lastAccountId
@@ -948,19 +978,95 @@ async function resolveOpenClawRouteFromSessions(openclawAgentId: string, channel
         if (!accountId || !target) continue;
 
         const updatedAt = typeof session?.updatedAt === 'number' ? session.updatedAt : 0;
-        candidates.push({ updatedAt, accountId, target });
+        candidates.push({
+            agentId,
+            channel,
+            accountId,
+            target,
+            updatedAt,
+        });
     }
 
-    candidates.sort((a, b) => b.updatedAt - a.updatedAt);
-    const best = candidates[0];
+    return candidates;
+}
 
-    if (!best) {
+async function readSessionRouteCandidates(
+    openclawAgentId: string,
+    expectedChannel?: string
+): Promise<SessionRouteCandidate[]> {
+    const sessionsPath = path.join(OPENCLAW_HOME, 'agents', openclawAgentId, 'sessions', 'sessions.json');
+
+    let content: string;
+    try {
+        content = await fs.readFile(sessionsPath, 'utf-8');
+    } catch {
+        return [];
+    }
+
+    let sessions: Record<string, any> = {};
+    try {
+        sessions = JSON.parse(content) as Record<string, any>;
+    } catch {
+        throw new Error(`Invalid JSON in OpenClaw sessions file: ${sessionsPath}`);
+    }
+
+    return extractSessionRouteCandidates(sessions, openclawAgentId, expectedChannel);
+}
+
+function matchesOpenClawBinding(candidate: SessionRouteCandidate, binding: OpenClawConfigBinding): boolean {
+    if (!binding.agentId || binding.agentId !== candidate.agentId) return false;
+    const match = binding.match || {};
+    if (match.channel && match.channel !== candidate.channel) return false;
+    if (match.accountId && match.accountId !== candidate.accountId) return false;
+    return true;
+}
+
+async function resolveOpenClawRouteAuto(
+    preferredAgentId?: string,
+    preferredChannel?: string
+): Promise<SessionRouteCandidate> {
+    const agentIds = preferredAgentId ? [preferredAgentId] : await listOpenClawAgentIds();
+    if (agentIds.length === 0) {
+        throw new Error('No OpenClaw agents found under ~/.openclaw/agents.');
+    }
+
+    const allCandidates: SessionRouteCandidate[] = [];
+    for (const agentId of agentIds) {
+        const routes = await readSessionRouteCandidates(agentId, preferredChannel);
+        allCandidates.push(...routes);
+    }
+
+    if (allCandidates.length === 0) {
+        const scope = preferredAgentId ? `agent "${preferredAgentId}"` : 'all OpenClaw agents';
+        const channelHint = preferredChannel ? ` in channel "${preferredChannel}"` : '';
         throw new Error(
-            `No recent OpenClaw ${channel} session route found for agent "${openclawAgentId}". ` +
-            `Chat with this OpenClaw agent once in channel "${channel}", then retry, or bind with --account and --target.`
+            `No recent OpenClaw session route found for ${scope}${channelHint}. ` +
+            'Send one message from your OpenClaw chat first, then retry.'
         );
     }
 
+    const openclawConfig = await loadOpenClawConfig();
+    const bindings = Array.isArray(openclawConfig.bindings) ? openclawConfig.bindings : [];
+
+    let candidates = allCandidates;
+    if (bindings.length > 0) {
+        const matched = candidates.filter((candidate) =>
+            bindings.some((binding) => matchesOpenClawBinding(candidate, binding))
+        );
+        if (matched.length > 0) {
+            candidates = matched;
+        }
+    }
+
+    candidates.sort((a, b) => b.updatedAt - a.updatedAt);
+    return candidates[0];
+}
+
+async function resolveOpenClawRouteFromSessions(
+    openclawAgentId: string,
+    channel: string
+): Promise<{ accountId: string; target: string }> {
+    const best = await resolveOpenClawRouteAuto(openclawAgentId, channel);
     return {
         accountId: best.accountId,
         target: best.target,
@@ -968,12 +1074,12 @@ async function resolveOpenClawRouteFromSessions(openclawAgentId: string, channel
 }
 
 async function resolveNotifyRoute(binding: OpenClawBinding): Promise<OpenClawNotifyRoute> {
-    const channel = binding.channel || 'discord';
+    const channel = binding.channel || '';
     const dryRun = !!binding.dry_run;
 
     if (binding.account_id && binding.target) {
         return {
-            channel,
+            channel: channel || 'discord',
             account_id: binding.account_id,
             target: binding.target,
             dry_run: dryRun,
@@ -982,16 +1088,30 @@ async function resolveNotifyRoute(binding: OpenClawBinding): Promise<OpenClawNot
 
     if (!binding.auto_route) {
         throw new Error(
-            `Binding for ${binding.openclaw_agent_id} lacks --account/--target and auto_route=false. ` +
+            `Binding for ${binding.openclaw_agent_id || 'auto'} lacks --account/--target and auto_route=false. ` +
             'Re-bind with --account <id> --target <dest> or enable auto route.'
         );
     }
 
-    const discovered = await resolveOpenClawRouteFromSessions(binding.openclaw_agent_id, channel);
+    let resolvedChannel = channel || 'discord';
+    let resolvedAccountId = binding.account_id || '';
+    let resolvedTarget = binding.target || '';
+
+    if (binding.openclaw_agent_id) {
+        const discovered = await resolveOpenClawRouteFromSessions(binding.openclaw_agent_id, resolvedChannel);
+        resolvedAccountId = resolvedAccountId || discovered.accountId;
+        resolvedTarget = resolvedTarget || discovered.target;
+    } else {
+        const discovered = await resolveOpenClawRouteAuto(undefined, channel || undefined);
+        resolvedChannel = channel || discovered.channel;
+        resolvedAccountId = resolvedAccountId || discovered.accountId;
+        resolvedTarget = resolvedTarget || discovered.target;
+    }
+
     return {
-        channel,
-        account_id: binding.account_id || discovered.accountId,
-        target: binding.target || discovered.target,
+        channel: resolvedChannel,
+        account_id: resolvedAccountId,
+        target: resolvedTarget,
         dry_run: dryRun,
     };
 }
@@ -1016,13 +1136,10 @@ async function resolveNotifyRouteForDestination(
     }
 
     const sourceAgentId = dest.openclaw_agent_id || fallbackOpenclawAgentId;
-    if (!sourceAgentId) {
-        throw new Error(
-            `Notify destination ${dest.id} needs --openclaw-agent for auto route discovery.`
-        );
-    }
+    const discovered = sourceAgentId
+        ? await resolveOpenClawRouteFromSessions(sourceAgentId, dest.channel)
+        : await resolveOpenClawRouteAuto(undefined, dest.channel);
 
-    const discovered = await resolveOpenClawRouteFromSessions(sourceAgentId, dest.channel);
     return {
         channel: dest.channel,
         account_id: dest.account_id || discovered.accountId,
@@ -1071,7 +1188,7 @@ function hasDeliveryOverride(overrides: {
 
 function createTargetFromBinding(binding: OpenClawBinding): DeliveryTarget {
     return {
-        id: `binding:${binding.openclaw_agent_id}`,
+        id: `binding:${binding.openclaw_agent_id || 'auto'}`,
         is_primary: true,
         priority: 0,
         resolve: async () => resolveNotifyRoute(binding),
@@ -1102,7 +1219,7 @@ function selectDeliveryTargets(
     if (overrides && hasDeliveryOverride(overrides)) {
         const hasPinnedOverride = !!(overrides.accountId && overrides.target);
         const mergedBinding: OpenClawBinding = {
-            openclaw_agent_id: overrides.openclawAgentId || baseBinding?.openclaw_agent_id || '',
+            openclaw_agent_id: overrides.openclawAgentId || baseBinding?.openclaw_agent_id,
             channel: overrides.channel || baseBinding?.channel || 'discord',
             account_id: overrides.accountId || baseBinding?.account_id,
             target: overrides.target || baseBinding?.target,
@@ -1111,11 +1228,6 @@ function selectDeliveryTargets(
         };
 
         if (!mergedBinding.account_id || !mergedBinding.target) {
-            if (!mergedBinding.openclaw_agent_id) {
-                throw new Error(
-                    'Bridge override missing route source. Provide --openclaw-agent, or pin --account and --target.'
-                );
-            }
             mergedBinding.auto_route = true;
         }
 
@@ -1132,7 +1244,13 @@ function selectDeliveryTargets(
         return [createTargetFromBinding(baseBinding)];
     }
 
-    return [];
+    return [
+        createTargetFromBinding({
+            channel: '',
+            auto_route: true,
+            dry_run: false,
+        }),
+    ];
 }
 
 async function sendWithTarget(target: DeliveryTarget, message: string): Promise<void> {
@@ -1154,7 +1272,9 @@ async function sendWithTarget(target: DeliveryTarget, message: string): Promise<
 
 async function dispatchNotification(targets: DeliveryTarget[], strategy: DeliveryStrategy, message: string): Promise<void> {
     if (targets.length === 0) {
-        throw new Error('No delivery targets available. Configure notify destinations or bind-openclaw first.');
+        throw new Error(
+            'No delivery targets available. Configure notify/bind, or make sure OpenClaw has recent active sessions for auto route discovery.'
+        );
     }
 
     const ordered = sortDeliveryTargets(targets);
@@ -1555,17 +1675,6 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
             destination.openclaw_agent_id = baseBinding.openclaw_agent_id;
         }
 
-        if (
-            destination.auto_route &&
-            !destination.account_id &&
-            !destination.target &&
-            !destination.openclaw_agent_id
-        ) {
-            throw new Error(
-                'notify add auto-route requires --openclaw-agent, or an existing bind-openclaw, or pinned --account/--target.'
-            );
-        }
-
         if (profile.some((dest) => dest.id === destination.id)) {
             throw new Error(`notify destination id already exists: ${destination.id}`);
         }
@@ -1880,6 +1989,7 @@ Usage:
   npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_name>]
   npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_name>]
 
+  # Optional manual binding (recommended only when you want fixed route)
   npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts bindings
   npx tsx cli/openclaw-social.ts notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_name>]
@@ -1895,6 +2005,7 @@ Usage:
   npx tsx cli/openclaw-social.ts config set base_url <url>
 
   npx tsx cli/openclaw-social.ts watch [--as <agent_name>]
+  # Bridge will auto-discover route from ~/.openclaw/openclaw.json + sessions.json when bind/notify is not set
   npx tsx cli/openclaw-social.ts bridge [--as <agent_name>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
   npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_name>]
