@@ -490,6 +490,23 @@ function pickBestMatch(agents: AgentLite[], account: string): AgentLite | null {
     return startsWith || agents[0] || null;
 }
 
+function guessMimeType(filePath: string): string {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.pdf') return 'application/pdf';
+    if (ext === '.png') return 'image/png';
+    if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+    if (ext === '.gif') return 'image/gif';
+    if (ext === '.webp') return 'image/webp';
+    if (ext === '.txt') return 'text/plain';
+    if (ext === '.md') return 'text/markdown';
+    if (ext === '.json') return 'application/json';
+    if (ext === '.csv') return 'text/csv';
+    if (ext === '.mp3') return 'audio/mpeg';
+    if (ext === '.wav') return 'audio/wav';
+    if (ext === '.mp4') return 'video/mp4';
+    return 'application/octet-stream';
+}
+
 async function findAgentByAccount(token: string, account: string): Promise<AgentLite> {
     const result = await api('GET', `/api/v1/agents?search=${encodeURIComponent(account)}&limit=20`, undefined, token);
     const candidates = (result.agents || []) as AgentLite[];
@@ -719,6 +736,72 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
         session.token
     );
     console.log(`已发送消息给 ${peer.agent_name}（会话 ${dm.id}）`);
+    console.log(`message_id: ${sent.id}`);
+}
+
+async function commandSendAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [peerAccount, filePathArg, ...captionParts] = args;
+    const caption = captionParts.join(' ').trim();
+    if (!peerAccount || !filePathArg) {
+        throw new Error('Usage: openclaw-social send-attachment <peer_account> <file_path> [caption] [--as <agent_name>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const peer = await findAgentByAccount(session.token, peerAccount);
+    const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peer.id }, session.token);
+
+    const resolvedPath = path.resolve(filePathArg);
+    let fileBuffer: Buffer;
+    try {
+        fileBuffer = await fs.readFile(resolvedPath);
+    } catch {
+        throw new Error(`Cannot read file: ${resolvedPath}`);
+    }
+    if (fileBuffer.length === 0) {
+        throw new Error('Attachment file is empty');
+    }
+
+    const filename = path.basename(resolvedPath);
+    const mimeType = guessMimeType(resolvedPath);
+
+    const upload = await api(
+        'POST',
+        '/api/v1/uploads',
+        {
+            filename,
+            mime_type: mimeType,
+            data_base64: fileBuffer.toString('base64'),
+        },
+        session.token
+    );
+
+    const mediaPayload = {
+        type: 'media',
+        content: caption || `附件：${filename}`,
+        data: {
+            attachments: [
+                {
+                    url: upload.url,
+                    mime_type: upload.mime_type || mimeType,
+                    size_bytes: upload.size_bytes || fileBuffer.length,
+                    metadata: {
+                        upload_id: upload.id,
+                        filename: upload.filename || filename,
+                    },
+                },
+            ],
+        },
+    };
+
+    const sent = await api(
+        'POST',
+        `/api/v1/conversations/${dm.id}/messages`,
+        { payload: mediaPayload, client_msg_id: `att-${Date.now()}` },
+        session.token
+    );
+
+    console.log(`已发送附件给 ${peer.agent_name}（会话 ${dm.id}）`);
+    console.log(`attachment_id: ${upload.id}`);
     console.log(`message_id: ${sent.id}`);
 }
 
@@ -1500,6 +1583,25 @@ function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: str
     return `${senderName}跟我说“${content}”。当前为 auto_execute 模式，请确认是否继续按自动策略处理。`;
 }
 
+function summarizeIncomingMessage(event: RealtimeMessageEvent): string {
+    const payloadType = event.payload?.type || '';
+    if (payloadType === 'media') {
+        const attachments = Array.isArray(event.payload?.data?.attachments)
+            ? event.payload?.data?.attachments
+            : [];
+        const count = attachments.length;
+        if (count === 0) {
+            return '我收到了一个附件消息。';
+        }
+        const first = attachments[0] || {};
+        const filename = first?.metadata?.filename || first?.filename || first?.url || '未知附件';
+        return count === 1
+            ? `我收到了一个附件：${filename}`
+            : `我收到了${count}个附件（例如：${filename}）`;
+    }
+    return event.payload?.content || event.content || '[空消息]';
+}
+
 function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
     const toName = req.to_agent_name || req.to_agent_id;
     return buildOutgoingStatusPromptByStatus(req.status, toName);
@@ -1645,7 +1747,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 }
 
                 const senderName = await resolveAgentName(data.sender_id || '');
-                const content = data.payload?.content || data.content || '[空消息]';
+                const content = summarizeIncomingMessage(data);
                 const prompt = buildMessagePrompt(policy.mode, senderName, content);
 
                 if (hooks.onNewMessage) {
@@ -2137,6 +2239,7 @@ Usage:
   npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_name>]
   npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_name>]
   npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts send-attachment <peer_account> <file_path> [caption] [--as <agent_name>]
 
   # Optional manual binding (recommended only when you want fixed route)
   npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
@@ -2201,6 +2304,9 @@ async function main() {
                 break;
             case 'send-dm':
                 await commandSendDm(rest, state, asAgent);
+                break;
+            case 'send-attachment':
+                await commandSendAttachment(rest, state, asAgent);
                 break;
             case 'bind-openclaw':
                 await commandBindOpenClaw(rest, state, asAgent);

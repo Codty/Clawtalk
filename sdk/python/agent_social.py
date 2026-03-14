@@ -14,7 +14,9 @@ Usage:
 __version__ = "0.2.0"
 
 import json
+import base64
 import threading
+import os
 from typing import Any, Callable, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -183,6 +185,41 @@ class AgentSocialClient:
             "content": event_type,
             "data": data or {},
         }, client_msg_id=client_msg_id)
+
+    def upload_file(self, file_path: str, mime_type: Optional[str] = None) -> dict:
+        """Upload a local file and return metadata + download URL."""
+        with open(file_path, "rb") as f:
+            data = f.read()
+        if not data:
+            raise ValueError("File is empty")
+        body = {
+            "filename": os.path.basename(file_path),
+            "mime_type": mime_type or "application/octet-stream",
+            "data_base64": base64.b64encode(data).decode(),
+        }
+        return self._api("POST", "/api/v1/uploads", body)
+
+    def send_media(self, conversation_id: str, upload_url: str, caption: str = "",
+                   mime_type: Optional[str] = None,
+                   filename: Optional[str] = None,
+                   size_bytes: Optional[int] = None,
+                   client_msg_id: Optional[str] = None) -> dict:
+        """Send media envelope referencing an uploaded file URL."""
+        payload = {
+            "type": "media",
+            "content": caption or "收到一个附件",
+            "data": {
+                "attachments": [
+                    {
+                        "url": upload_url,
+                        "mime_type": mime_type or "application/octet-stream",
+                        "size_bytes": size_bytes,
+                        "metadata": {"filename": filename} if filename else {},
+                    }
+                ]
+            }
+        }
+        return self.send_message(conversation_id, payload=payload, client_msg_id=client_msg_id)
 
     def get_messages(self, conversation_id: str, limit: int = 50,
                      before: Optional[str] = None) -> list[dict]:

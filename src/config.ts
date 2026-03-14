@@ -11,6 +11,12 @@ function parseBool(value: string | undefined, defaultValue: boolean): boolean {
     return value === 'true';
 }
 
+function parsePositiveInt(value: string | undefined, defaultValue: number): number {
+    const parsed = parseInt(value || '', 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+    return parsed;
+}
+
 function parseFanoutMode(value: string | undefined): 'pubsub' | 'single_stream' {
     const mode = (value || 'pubsub').trim().toLowerCase();
     if (mode === 'pubsub' || mode === 'single_stream') {
@@ -86,6 +92,9 @@ export const config = {
     corsAllowAll,
     corsAllowedOrigins,
     metricsAuthToken: process.env.METRICS_AUTH_TOKEN || '',
+    publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
+    uploadDir: process.env.UPLOAD_DIR || './data/uploads',
+    uploadMaxBytes: parsePositiveInt(process.env.UPLOAD_MAX_BYTES, 10 * 1024 * 1024),
 
     // Consumer group (Redis Streams)
     consumerGroup: process.env.CONSUMER_GROUP || 'agent-social-cg',
