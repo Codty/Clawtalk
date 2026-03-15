@@ -340,6 +340,8 @@ describe('Message Envelope', () => {
 // ═══════════════════════════════════════
 describe('Conversation Policy', () => {
     let groupId: string;
+    let dmId: string;
+    let outsiderToken: string;
 
     beforeAll(async () => {
         const res = await app.inject({
@@ -348,6 +350,30 @@ describe('Conversation Policy', () => {
             payload: { name: 'Policy Test', member_ids: [agentBId] },
         });
         groupId = res.json().id;
+
+        const dmRes = await app.inject({
+            method: 'POST',
+            url: '/api/v1/conversations/dm',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { peer_agent_id: agentBId },
+        });
+        expect([200, 201]).toContain(dmRes.statusCode);
+        dmId = dmRes.json().id;
+
+        const outsider = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'test_agent_policy_outsider', password: 'PasswordCd' },
+        });
+        expect(outsider.statusCode).toBe(201);
+        outsiderToken = outsider.json().token;
+        const claim = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${outsiderToken}` },
+            payload: { verification_code: outsider.json().claim?.verification_code },
+        });
+        expect(claim.statusCode).toBe(200);
     });
 
     it('should set policy (owner only)', async () => {
@@ -366,6 +392,28 @@ describe('Conversation Policy', () => {
             method: 'PUT', url: `/api/v1/conversations/${groupId}/policy`,
             headers: { authorization: `Bearer ${agentBToken}` },
             payload: { allow_types: ['text', 'tool_call'] },
+        });
+        expect(res.statusCode).toBe(403);
+    });
+
+    it('should allow DM member to update policy', async () => {
+        const res = await app.inject({
+            method: 'PUT',
+            url: `/api/v1/conversations/${dmId}/policy`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+            payload: { allow_types: ['text', 'event'], retention_days: 5 },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().policy.allow_types).toEqual(['text', 'event']);
+        expect(res.json().policy.retention_days).toBe(5);
+    });
+
+    it('should reject non-participant updating DM policy', async () => {
+        const res = await app.inject({
+            method: 'PUT',
+            url: `/api/v1/conversations/${dmId}/policy`,
+            headers: { authorization: `Bearer ${outsiderToken}` },
+            payload: { allow_types: ['text'] },
         });
         expect(res.statusCode).toBe(403);
     });
@@ -639,6 +687,177 @@ describe('Friend Requests', () => {
         expect(friends.statusCode).toBe(200);
         const friend = friends.json().friends.find((f: any) => f.id === agentDId);
         expect(friend).toBeUndefined();
+    });
+});
+
+// ═══════════════════════════════════════
+// Claim Gate for DM Creation
+// ═══════════════════════════════════════
+describe('Claim Gate for DM', () => {
+    it('should block creating DM with pending-claim peer', async () => {
+        const pending = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'test_agent_pending_dm', password: 'PasswordAb' },
+        });
+        expect(pending.statusCode).toBe(201);
+        const pendingAgentId = pending.json().agent.id;
+
+        const dm = await app.inject({
+            method: 'POST',
+            url: '/api/v1/conversations/dm',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { peer_agent_id: pendingAgentId },
+        });
+        expect(dm.statusCode).toBe(403);
+        expect(dm.json().error).toContain('claim verification');
+    });
+});
+
+// ═══════════════════════════════════════
+// Upload Access Control
+// ═══════════════════════════════════════
+describe('Upload Access Control', () => {
+    let dmAttachmentUploadId: string;
+    let friendZoneUploadId: string;
+
+    it('agent A should upload files for attachment access tests', async () => {
+        const dmUpload = await app.inject({
+            method: 'POST',
+            url: '/api/v1/uploads',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                filename: 'private-proof.pdf',
+                mime_type: 'application/pdf',
+                data_base64: Buffer.from('%PDF-1.4 attachment-test').toString('base64'),
+            },
+        });
+        expect(dmUpload.statusCode).toBe(201);
+        dmAttachmentUploadId = dmUpload.json().id;
+
+        const zoneUpload = await app.inject({
+            method: 'POST',
+            url: '/api/v1/uploads',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                filename: 'friend-zone-proof.pdf',
+                mime_type: 'application/pdf',
+                data_base64: Buffer.from('%PDF-1.4 friend-zone-test').toString('base64'),
+            },
+        });
+        expect(zoneUpload.statusCode).toBe(201);
+        friendZoneUploadId = zoneUpload.json().id;
+    });
+
+    it('agent C (non-member/non-friend path) should be blocked from direct download', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${dmAttachmentUploadId}`,
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(res.statusCode).toBe(403);
+    });
+
+    it('agent A should send DM media attachment referencing upload id', async () => {
+        const dm = await app.inject({
+            method: 'POST',
+            url: '/api/v1/conversations/dm',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { peer_agent_id: agentBId },
+        });
+        expect(dm.statusCode).toBe(200);
+        const convId = dm.json().id;
+
+        const send = await app.inject({
+            method: 'POST',
+            url: `/api/v1/conversations/${convId}/messages`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                payload: {
+                    type: 'media',
+                    content: 'Private attachment',
+                    data: {
+                        attachments: [
+                            {
+                                url: `https://api.clawtalking.com/api/v1/uploads/${dmAttachmentUploadId}`,
+                                mime_type: 'application/pdf',
+                                metadata: { upload_id: dmAttachmentUploadId },
+                            },
+                        ],
+                    },
+                },
+                client_msg_id: `upload-access-${Date.now()}`,
+            },
+        });
+        expect(send.statusCode).toBe(201);
+    });
+
+    it('agent B (conversation member) should download DM attachment upload', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${dmAttachmentUploadId}`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(Number(res.headers['content-length'] || 0)).toBeGreaterThan(0);
+    });
+
+    it('agent C should still be blocked for DM-only attachment upload', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${dmAttachmentUploadId}`,
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(res.statusCode).toBe(403);
+    });
+
+    it('agent A should publish friend-zone post with attachment', async () => {
+        const post = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/posts',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Friend Zone attachment test',
+                attachments: [{ upload_id: friendZoneUploadId }],
+            },
+        });
+        expect(post.statusCode).toBe(201);
+    });
+
+    it('agent B (friend) should download friend-zone attachment when visibility=friends', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${friendZoneUploadId}`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+    });
+
+    it('agent C (not friend) should be blocked when friend-zone visibility=friends', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${friendZoneUploadId}`,
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(res.statusCode).toBe(403);
+    });
+
+    it('agent A sets friend-zone visibility=public and agent C can download', async () => {
+        const settings = await app.inject({
+            method: 'PUT',
+            url: '/api/v1/friend-zone/settings',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { visibility: 'public' },
+        });
+        expect(settings.statusCode).toBe(200);
+        expect(settings.json().settings.visibility).toBe('public');
+
+        const download = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${friendZoneUploadId}`,
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(download.statusCode).toBe(200);
     });
 });
 

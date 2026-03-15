@@ -6,6 +6,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
 const DEFAULT_BASE_URL = 'http://localhost:3000';
@@ -18,6 +19,9 @@ const LOCAL_DATA_DIR = path.join(STATE_DIR, 'local-data');
 const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
 const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 const WATCH_POLL_INTERVAL_MS = 5000;
+const WATCH_CONVERSATION_SCAN_LIMIT = 5;
+const WATCH_MESSAGES_PER_CONVERSATION = 10;
+const WATCH_MESSAGE_POLL_EVERY_TICKS = 3;
 const MAX_SEEN_IDS = 300;
 
 let runtimeBaseUrl = DEFAULT_BASE_URL;
@@ -108,6 +112,13 @@ interface FriendRow {
     friends_since?: string;
 }
 
+interface ConversationRow {
+    id: string;
+    type?: string;
+    name?: string | null;
+    created_at?: string;
+}
+
 interface AgentLite {
     id: string;
     agent_name: string;
@@ -118,6 +129,7 @@ interface RealtimeMessageEvent {
     id?: string;
     conversation_id?: string;
     sender_id?: string;
+    sender_name?: string;
     created_at?: string;
     payload?: {
         type?: string;
@@ -261,6 +273,15 @@ async function loadConfig(): Promise<CliConfig> {
 async function saveConfig(config: CliConfig): Promise<void> {
     await fs.mkdir(STATE_DIR, { recursive: true });
     await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+    try {
+        await fs.access(targetPath);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function resolveBaseUrl(config: CliConfig): string {
@@ -434,13 +455,20 @@ function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
 }
 
 async function api(method: string, route: string, body?: any, token?: string): Promise<any> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
+
+    // Only declare JSON payload when we actually send one.
+    // Sending `Content-Type: application/json` with an empty POST body triggers 400 on Fastify.
+    const hasJsonBody = body !== undefined;
+    if (hasJsonBody) {
+        headers['Content-Type'] = 'application/json';
+    }
 
     const res = await fetch(`${runtimeBaseUrl}${route}`, {
         method,
         headers,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
+        body: hasJsonBody ? JSON.stringify(body) : undefined,
     });
 
     const text = await res.text();
@@ -567,12 +595,34 @@ function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
     return session;
 }
 
-function pickBestMatch(agents: AgentLite[], account: string): AgentLite | null {
-    if (!Array.isArray(agents) || agents.length === 0) return null;
-    const exact = agents.find((a) => a.agent_name === account);
-    if (exact) return exact;
-    const startsWith = agents.find((a) => a.agent_name.startsWith(account));
-    return startsWith || agents[0] || null;
+function pickBestMatch(
+    agents: AgentLite[],
+    account: string
+): { picked: AgentLite | null; ambiguous: boolean; suggestions: string[] } {
+    if (!Array.isArray(agents) || agents.length === 0) {
+        return { picked: null, ambiguous: false, suggestions: [] };
+    }
+
+    const needle = account.trim().toLowerCase();
+    const exact = agents.find((a) => a.agent_name.toLowerCase() === needle);
+    if (exact) {
+        return { picked: exact, ambiguous: false, suggestions: [] };
+    }
+
+    const prefixMatches = agents.filter((a) => a.agent_name.toLowerCase().startsWith(needle));
+    if (prefixMatches.length === 1) {
+        return { picked: prefixMatches[0], ambiguous: false, suggestions: [] };
+    }
+
+    if (prefixMatches.length > 1) {
+        return {
+            picked: null,
+            ambiguous: true,
+            suggestions: prefixMatches.slice(0, 10).map((a) => a.agent_name),
+        };
+    }
+
+    return { picked: null, ambiguous: false, suggestions: [] };
 }
 
 function guessMimeType(filePath: string): string {
@@ -766,11 +816,17 @@ async function appendLocalConversationRecord(
 async function findAgentByAccount(token: string, account: string): Promise<AgentLite> {
     const result = await api('GET', `/api/v1/agents?search=${encodeURIComponent(account)}&limit=20`, undefined, token);
     const candidates = (result.agents || []) as AgentLite[];
-    const picked = pickBestMatch(candidates, account);
-    if (!picked) {
+    const match = pickBestMatch(candidates, account);
+    if (match.ambiguous) {
+        throw new Error(
+            `Ambiguous agent account "${account}". Matches: ${match.suggestions.join(', ')}. ` +
+            'Please use the exact Agent Username.'
+        );
+    }
+    if (!match.picked) {
         throw new Error(`No agent found for account "${account}"`);
     }
-    return picked;
+    return match.picked;
 }
 
 async function registerSession(
@@ -1065,9 +1121,54 @@ async function listFriends(token: string): Promise<FriendRow[]> {
     return result.friends || [];
 }
 
+async function listConversationsForAgent(token: string): Promise<ConversationRow[]> {
+    const result = await api('GET', '/api/v1/conversations', undefined, token);
+    return result.conversations || [];
+}
+
+async function listConversationMessages(
+    token: string,
+    conversationId: string,
+    limit: number
+): Promise<RealtimeMessageEvent[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const result = await api(
+        'GET',
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages?limit=${safeLimit}`,
+        undefined,
+        token
+    );
+    return result.messages || [];
+}
+
+function parseRequestStatusArg(
+    args: string[],
+    defaultStatus: FriendRequestStatus | 'all'
+): FriendRequestStatus | 'all' {
+    let status: FriendRequestStatus | 'all' = defaultStatus;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--status') {
+            const value = args[i + 1];
+            if (!value) {
+                throw new Error('Missing value for --status');
+            }
+            if (value !== 'pending' && value !== 'accepted' && value !== 'rejected' && value !== 'cancelled' && value !== 'all') {
+                throw new Error('Invalid --status. Use pending|accepted|rejected|cancelled|all');
+            }
+            status = value;
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for request listing: ${arg}`);
+    }
+    return status;
+}
+
 async function commandListFriends(state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
     const friends = await listFriends(session.token);
+    console.log(`Current agent: ${session.agent_name} | id: ${session.agent_id}`);
 
     if (friends.length === 0) {
         console.log('Friend list is empty.');
@@ -1084,18 +1185,39 @@ async function commandListFriends(state: LocalState, asAgent?: string): Promise<
     }
 }
 
-async function commandIncoming(state: LocalState, asAgent?: string): Promise<void> {
+async function commandIncoming(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
-    const requests = await listIncomingPending(session.token);
+    const status = parseRequestStatusArg(args, 'pending');
+    const requests = await listFriendRequests(session.token, 'incoming', status);
 
     if (requests.length === 0) {
-        console.log('No pending incoming friend requests.');
+        if (status === 'pending') {
+            console.log('No pending incoming friend requests.');
+        } else {
+            console.log(`No incoming friend requests with status=${status}.`);
+        }
         return;
     }
 
     for (const req of requests) {
         const fromName = req.from_agent_name || req.from_agent_id;
-        console.log(`- ${req.id} | from: ${fromName} | time: ${req.created_at}`);
+        console.log(`- ${req.id} | from: ${fromName} | status: ${req.status} | time: ${req.created_at}`);
+    }
+}
+
+async function commandOutgoing(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const status = parseRequestStatusArg(args, 'all');
+    const requests = await listFriendRequests(session.token, 'outgoing', status);
+
+    if (requests.length === 0) {
+        console.log(`No outgoing friend requests with status=${status}.`);
+        return;
+    }
+
+    for (const req of requests) {
+        const toName = req.to_agent_name || req.to_agent_id;
+        console.log(`- ${req.id} | to: ${toName} | status: ${req.status} | time: ${req.created_at}`);
     }
 }
 
@@ -1159,6 +1281,47 @@ async function commandRejectFriend(args: string[], state: LocalState, asAgent?: 
 
     await api('POST', `/api/v1/friends/requests/${target.id}/reject`, undefined, session.token);
     console.log(`Rejected friend request from ${fromAccount}.`);
+}
+
+function isUuidLike(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function commandCancelFriendRequest(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [requestOrAccount] = args;
+    if (!requestOrAccount) {
+        throw new Error('Usage: openclaw-social cancel-friend-request <request_id|peer_account> [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    let requestId = requestOrAccount;
+    let peerName = requestOrAccount;
+
+    if (!isUuidLike(requestOrAccount)) {
+        const outgoing = await listFriendRequests(session.token, 'outgoing', 'pending');
+        const target = outgoing.find((r) => (r.to_agent_name || '') === requestOrAccount)
+            || outgoing.find((r) => r.to_agent_id === requestOrAccount);
+        if (!target) {
+            throw new Error(`No pending outgoing friend request found for "${requestOrAccount}"`);
+        }
+        requestId = target.id;
+        peerName = target.to_agent_name || requestOrAccount;
+    }
+
+    await api('DELETE', `/api/v1/friends/requests/${requestId}`, undefined, session.token);
+    console.log(`Cancelled friend request (${requestId}) for ${peerName}.`);
+}
+
+async function commandUnfriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [peerAccount] = args;
+    if (!peerAccount) {
+        throw new Error('Usage: openclaw-social unfriend <peer_account> [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const peer = await findAgentByAccount(session.token, peerAccount);
+    await api('DELETE', `/api/v1/friends/${peer.id}`, undefined, session.token);
+    console.log(`Removed friend: ${peer.agent_name}.`);
 }
 
 async function commandSendDm(args: string[], state: LocalState, asAgent?: string): Promise<void> {
@@ -2576,6 +2739,66 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
+    async function handleIncomingMessageEvent(data: RealtimeMessageEvent): Promise<void> {
+        const messageId = data.id;
+
+        if (messageId && seen.message_ids.includes(messageId)) {
+            return;
+        }
+
+        // Ignore self-sent messages to avoid noisy self-notify loops.
+        if (data.sender_id && data.sender_id === session.agent_id) {
+            if (messageId) {
+                addSeenId(seen.message_ids, messageId);
+                await saveState(state);
+            }
+            return;
+        }
+
+        if (messageId) {
+            addSeenId(seen.message_ids, messageId);
+            await saveState(state);
+        }
+
+        const senderName = data.sender_name || await resolveAgentName(data.sender_id || '');
+        const cachedAttachments = await cacheIncomingAttachments(session, data);
+        let content = summarizeIncomingMessage(data);
+        const localPaths = cachedAttachments
+            .map((item) => item.local_path)
+            .filter((value): value is string => typeof value === 'string' && value.length > 0);
+        if (localPaths.length > 0) {
+            content = `${content} Local cache saved: ${localPaths.join(', ')}`;
+        }
+        const prompt = buildMessagePrompt(policy.mode, senderName, content);
+        const incomingAttachments = cachedAttachments.length > 0
+            ? cachedAttachments
+            : extractAttachmentsFromPayload(data.payload);
+
+        await appendLocalConversationRecord(session.agent_name, {
+            direction: 'incoming',
+            message_id: data.id || `local-${Date.now()}`,
+            conversation_id: data.conversation_id || 'unknown-conversation',
+            agent_username: session.agent_name,
+            peer_agent_username: senderName,
+            envelope_type: data.payload?.type || 'text',
+            content,
+            attachments: incomingAttachments,
+            sent_at: data.created_at || new Date().toISOString(),
+        });
+
+        if (hooks.onNewMessage) {
+            try {
+                await hooks.onNewMessage({ event: data, senderName, prompt });
+            } catch (err: any) {
+                console.error(`[watch] message callback error: ${err.message}`);
+            }
+        }
+
+        if (hooks.echoConsole !== false) {
+            console.log(`\n${prompt}`);
+        }
+    }
+
     async function pollIncomingFriendRequests() {
         try {
             const requests = await listIncomingPending(session.token);
@@ -2660,6 +2883,31 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
+    async function pollRecentMessages() {
+        try {
+            const conversations = await listConversationsForAgent(session.token);
+            for (const conv of conversations.slice(0, WATCH_CONVERSATION_SCAN_LIMIT)) {
+                const messages = await listConversationMessages(
+                    session.token,
+                    conv.id,
+                    WATCH_MESSAGES_PER_CONVERSATION
+                );
+                if (!Array.isArray(messages) || messages.length === 0) continue;
+
+                // API returns DESC; replay oldest first for stable user-facing order.
+                const ordered = [...messages].reverse();
+                for (const row of ordered) {
+                    await handleIncomingMessageEvent({
+                        ...row,
+                        conversation_id: row.conversation_id || conv.id,
+                    });
+                }
+            }
+        } catch (err: any) {
+            console.error(`[watch] poll recent messages failed: ${err.message}`);
+        }
+    }
+
     async function handleRealtime(raw: WebSocket.RawData) {
         try {
             const msg = JSON.parse(raw.toString());
@@ -2670,63 +2918,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
             if (msg.type === 'new_message') {
                 const data = (msg.data || {}) as RealtimeMessageEvent;
-                const messageId = data.id;
-
-                if (messageId && seen.message_ids.includes(messageId)) {
-                    return;
-                }
-
-                // Ignore self-sent messages to avoid noisy self-notify loops.
-                if (data.sender_id && data.sender_id === session.agent_id) {
-                    if (messageId) {
-                        addSeenId(seen.message_ids, messageId);
-                        await saveState(state);
-                    }
-                    return;
-                }
-
-                if (messageId) {
-                    addSeenId(seen.message_ids, messageId);
-                    await saveState(state);
-                }
-
-                const senderName = await resolveAgentName(data.sender_id || '');
-                const cachedAttachments = await cacheIncomingAttachments(session, data);
-                let content = summarizeIncomingMessage(data);
-                const localPaths = cachedAttachments
-                    .map((item) => item.local_path)
-                    .filter((value): value is string => typeof value === 'string' && value.length > 0);
-                if (localPaths.length > 0) {
-                    content = `${content} Local cache saved: ${localPaths.join(', ')}`;
-                }
-                const prompt = buildMessagePrompt(policy.mode, senderName, content);
-                const incomingAttachments = cachedAttachments.length > 0
-                    ? cachedAttachments
-                    : extractAttachmentsFromPayload(data.payload);
-
-                await appendLocalConversationRecord(session.agent_name, {
-                    direction: 'incoming',
-                    message_id: data.id || `local-${Date.now()}`,
-                    conversation_id: data.conversation_id || 'unknown-conversation',
-                    agent_username: session.agent_name,
-                    peer_agent_username: senderName,
-                    envelope_type: data.payload?.type || 'text',
-                    content,
-                    attachments: incomingAttachments,
-                    sent_at: data.created_at || new Date().toISOString(),
-                });
-
-                if (hooks.onNewMessage) {
-                    try {
-                        await hooks.onNewMessage({ event: data, senderName, prompt });
-                    } catch (err: any) {
-                        console.error(`[watch] message callback error: ${err.message}`);
-                    }
-                }
-
-                if (hooks.echoConsole !== false) {
-                    console.log(`\n${prompt}`);
-                }
+                await handleIncomingMessageEvent(data);
                 return;
             }
 
@@ -2848,13 +3040,19 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }, 30000);
 
+    let pollTick = 0;
     const pollTimer = setInterval(() => {
+        pollTick += 1;
         void pollIncomingFriendRequests();
         void pollOutgoingRequestStatus();
+        if (pollTick % WATCH_MESSAGE_POLL_EVERY_TICKS === 0) {
+            void pollRecentMessages();
+        }
     }, WATCH_POLL_INTERVAL_MS);
 
     await pollIncomingFriendRequests();
     await pollOutgoingRequestStatus();
+    await pollRecentMessages();
 
     process.on('SIGINT', () => {
         clearInterval(pingTimer);
@@ -3200,6 +3398,165 @@ async function commandConfig(args: string[], config: CliConfig): Promise<void> {
     throw new Error('Usage: openclaw-social config <get|set> [base_url <url>]');
 }
 
+async function commandGuided(state: LocalState): Promise<void> {
+    const rl = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+
+    try {
+        console.log('Clawtalk guided setup started.');
+        console.log(`Current API base_url: ${runtimeBaseUrl}`);
+
+        const authModeRaw = (await rl.question('Do you want to login or register? [login/register] (default: register): '))
+            .trim()
+            .toLowerCase();
+        const authMode = authModeRaw === 'login' ? 'login' : 'register';
+
+        const agentUsername = (await rl.question('Agent Username: ')).trim();
+        if (!agentUsername) {
+            throw new Error('Agent Username cannot be empty.');
+        }
+
+        const password = (await rl.question('Password: ')).trim();
+        if (!password) {
+            throw new Error('Password cannot be empty.');
+        }
+
+        const authArgs = [agentUsername, password];
+        if (authMode === 'register') {
+            const friendZoneRaw = (await rl.question(
+                'Friend Zone visibility [friends/public/closed] (default: friends): '
+            )).trim().toLowerCase();
+            if (friendZoneRaw === 'public') {
+                authArgs.push('--friend-zone-public');
+            } else if (friendZoneRaw === 'closed') {
+                authArgs.push('--friend-zone-closed');
+            } else {
+                authArgs.push('--friend-zone-friends');
+            }
+            await commandOnboard(authArgs, state);
+        } else {
+            await commandLogin(authArgs, state);
+        }
+
+        const activeSession = getSessionOrThrow(state);
+        await commandClaimStatus(state, activeSession.agent_name);
+
+        const claimSession = getSessionOrThrow(state, activeSession.agent_name);
+        if (claimSession.claim?.claim_status === 'pending_claim') {
+            const verificationCode = (await rl.question('Enter verification_code to complete claim: ')).trim();
+            if (!verificationCode) {
+                throw new Error('verification_code is required to complete claim.');
+            }
+            await commandClaimComplete([verificationCode], state, claimSession.agent_name);
+        }
+
+        const finalSession = getSessionOrThrow(state);
+        await commandPolicy(['set', '--mode', 'receive_only'], state, finalSession.agent_name);
+        await commandWhoami(state, finalSession.agent_name);
+        console.log('Clawtalk is ready.');
+    } finally {
+        rl.close();
+    }
+}
+
+async function commandDoctor(state: LocalState): Promise<void> {
+    const expectedProjectDir = path.join(OPENCLAW_HOME, 'clawtalk');
+    const expectedSkillsDir = path.join(OPENCLAW_HOME, 'skills', 'clawtalk');
+    const expectedSkillFile = path.join(expectedSkillsDir, 'SKILL.md');
+    const expectedSkillAdapter = path.join(expectedSkillsDir, 'skill', 'agent_social_skill.ts');
+
+    const checks: Array<{ name: string; status: 'ok' | 'warn' | 'fail'; detail: string }> = [];
+
+    const projectOk = await pathExists(path.join(expectedProjectDir, 'package.json'));
+    checks.push({
+        name: 'project_dir',
+        status: projectOk ? 'ok' : 'fail',
+        detail: projectOk
+            ? `Found project at ${expectedProjectDir}`
+            : `Project not found at ${expectedProjectDir}`,
+    });
+
+    const cwdOk = path.resolve(process.cwd()) === path.resolve(expectedProjectDir);
+    checks.push({
+        name: 'current_workdir',
+        status: cwdOk ? 'ok' : 'warn',
+        detail: cwdOk
+            ? `Working directory is ${expectedProjectDir}`
+            : `Current directory is ${process.cwd()} (recommended: ${expectedProjectDir})`,
+    });
+
+    const skillFileOk = await pathExists(expectedSkillFile);
+    checks.push({
+        name: 'skill_file',
+        status: skillFileOk ? 'ok' : 'fail',
+        detail: skillFileOk
+            ? `Found skill manifest at ${expectedSkillFile}`
+            : `Missing skill manifest at ${expectedSkillFile}`,
+    });
+
+    const skillAdapterOk = await pathExists(expectedSkillAdapter);
+    checks.push({
+        name: 'skill_adapter',
+        status: skillAdapterOk ? 'ok' : 'warn',
+        detail: skillAdapterOk
+            ? `Found skill adapter at ${expectedSkillAdapter}`
+            : `Missing skill adapter at ${expectedSkillAdapter}`,
+    });
+
+    const openclawConfigOk = await pathExists(OPENCLAW_CONFIG_PATH);
+    checks.push({
+        name: 'openclaw_config',
+        status: openclawConfigOk ? 'ok' : 'warn',
+        detail: openclawConfigOk
+            ? `Found OpenClaw config at ${OPENCLAW_CONFIG_PATH}`
+            : `OpenClaw config not found at ${OPENCLAW_CONFIG_PATH}`,
+    });
+
+    try {
+        const ready = await api('GET', '/readyz');
+        const postgres = ready?.checks?.postgres;
+        const redis = ready?.checks?.redis;
+        const readyOk = postgres === 'ok' && redis === 'ok';
+        checks.push({
+            name: 'server_readyz',
+            status: readyOk ? 'ok' : 'warn',
+            detail: `base_url=${runtimeBaseUrl}, postgres=${postgres || 'unknown'}, redis=${redis || 'unknown'}`,
+        });
+    } catch (err: any) {
+        checks.push({
+            name: 'server_readyz',
+            status: 'fail',
+            detail: `Cannot reach ${runtimeBaseUrl}/readyz: ${String(err?.message || err)}`,
+        });
+    }
+
+    const sessionCount = Object.keys(state.sessions || {}).length;
+    checks.push({
+        name: 'local_sessions',
+        status: sessionCount > 0 ? 'ok' : 'warn',
+        detail: sessionCount > 0
+            ? `${sessionCount} local AgentSocial session(s) found`
+            : 'No local sessions found. Run guided/onboard/login first.',
+    });
+
+    const hasFail = checks.some((c) => c.status === 'fail');
+    const hasWarn = checks.some((c) => c.status === 'warn');
+    const overall = hasFail ? 'fail' : hasWarn ? 'warn' : 'ok';
+
+    console.log(JSON.stringify({
+        overall,
+        expected_paths: {
+            project_dir: expectedProjectDir,
+            skills_dir: expectedSkillsDir,
+            openclaw_config: OPENCLAW_CONFIG_PATH,
+        },
+        effective_base_url: runtimeBaseUrl,
+        checks,
+    }, null, 2));
+}
+
 function printUsage() {
     console.log(`
 openclaw-social - AgentSocial workflow helper for OpenClaw
@@ -3214,8 +3571,11 @@ Usage:
   npx tsx cli/openclaw-social.ts whoami [--as <agent_username>]
 
   npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts unfriend <peer_account> [--as <agent_username>]
   npx tsx cli/openclaw-social.ts list-friends [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts incoming [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts incoming [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts outgoing [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts cancel-friend-request <request_id|peer_account> [--as <agent_username>]
   npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_username>]
   npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_username>]
   npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_username>]
@@ -3242,6 +3602,8 @@ Usage:
 
   npx tsx cli/openclaw-social.ts config get
   npx tsx cli/openclaw-social.ts config set base_url <url>
+  npx tsx cli/openclaw-social.ts guided
+  npx tsx cli/openclaw-social.ts doctor
 
   npx tsx cli/openclaw-social.ts watch [--as <agent_username>]
   # Bridge will auto-discover route from ~/.openclaw/openclaw.json + sessions.json when bind/notify is not set
@@ -3289,18 +3651,29 @@ async function main() {
             case 'add-friend':
                 await commandAddFriend(rest, state, asAgent);
                 break;
+            case 'unfriend':
+            case 'remove-friend':
+                await commandUnfriend(rest, state, asAgent);
+                break;
             case 'list-friends':
             case 'friends':
                 await commandListFriends(state, asAgent);
                 break;
             case 'incoming':
-                await commandIncoming(state, asAgent);
+                await commandIncoming(rest, state, asAgent);
+                break;
+            case 'outgoing':
+                await commandOutgoing(rest, state, asAgent);
                 break;
             case 'accept-friend':
                 await commandAcceptFriend(rest, state, asAgent);
                 break;
             case 'reject-friend':
                 await commandRejectFriend(rest, state, asAgent);
+                break;
+            case 'cancel-friend-request':
+            case 'cancel-request':
+                await commandCancelFriendRequest(rest, state, asAgent);
                 break;
             case 'send-dm':
                 await commandSendDm(rest, state, asAgent);
@@ -3338,6 +3711,12 @@ async function main() {
                 break;
             case 'config':
                 await commandConfig(rest, config);
+                break;
+            case 'guided':
+                await commandGuided(state);
+                break;
+            case 'doctor':
+                await commandDoctor(state);
                 break;
             case 'daemon':
                 await commandDaemon(rest, state, asAgent);

@@ -183,7 +183,80 @@ export async function getUpload(uploadId: string) {
     return rows[0];
 }
 
-export async function getUploadForDownload(uploadId: string) {
+async function hasConversationAttachmentAccess(uploadId: string, viewerId: string): Promise<boolean> {
+    const { rowCount } = await pool.query(
+        `SELECT 1
+         FROM message_attachments ma
+         JOIN messages m ON m.id = ma.message_id
+         JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+         WHERE cm.agent_id = $2
+           AND m.deleted_at IS NULL
+           AND (
+                ma.metadata->>'upload_id' = $1
+                OR substring(ma.url from '/api/v1/uploads/([^/?#]+)') = $1
+           )
+         LIMIT 1`,
+        [uploadId, viewerId]
+    );
+    return (rowCount || 0) > 0;
+}
+
+async function hasFriendZoneAttachmentAccess(uploadId: string, viewerId: string): Promise<boolean> {
+    const { rows } = await pool.query(
+        `SELECT p.owner_id,
+                a.friend_zone_enabled,
+                a.friend_zone_visibility
+         FROM friend_zone_posts p
+         JOIN agents a ON a.id = p.owner_id
+         WHERE EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(COALESCE(p.post_json->'attachments', '[]'::jsonb)) att
+            WHERE att->>'upload_id' = $1
+         )
+         ORDER BY p.created_at DESC`,
+        [uploadId]
+    );
+
+    for (const row of rows) {
+        if (row.owner_id === viewerId) {
+            return true;
+        }
+
+        if (!row.friend_zone_enabled) {
+            continue;
+        }
+
+        if (row.friend_zone_visibility === 'public') {
+            return true;
+        }
+
+        if (row.friend_zone_visibility === 'friends') {
+            const { rowCount } = await pool.query(
+                `SELECT 1
+                 FROM friendships
+                 WHERE agent_id = $1 AND friend_id = $2
+                 LIMIT 1`,
+                [viewerId, row.owner_id]
+            );
+            if ((rowCount || 0) > 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+async function assertUploadDownloadAccess(uploadId: string, viewerId: string, uploaderId: string): Promise<void> {
+    if (viewerId === uploaderId) return;
+
+    if (await hasConversationAttachmentAccess(uploadId, viewerId)) return;
+    if (await hasFriendZoneAttachmentAccess(uploadId, viewerId)) return;
+
+    throw new UploadError('Not authorized to download this upload', 403);
+}
+
+export async function getUploadForDownload(uploadId: string, viewerId: string) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -213,6 +286,7 @@ export async function getUploadForDownload(uploadId: string) {
         }
 
         let row = rows[0];
+        await assertUploadDownloadAccess(uploadId, viewerId, row.uploader_id);
         const relayState = isRelayUnavailable(row);
         if (relayState.unavailable) {
             throw new UploadError(relayState.reason || 'Upload is unavailable', 410);

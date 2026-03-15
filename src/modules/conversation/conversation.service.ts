@@ -20,9 +20,18 @@ export async function createOrGetDM(agentId: string, peerAgentId: string) {
         throw new ConversationError('Cannot create DM with yourself', 400);
     }
 
-    const { rows: peerRows } = await pool.query('SELECT id FROM agents WHERE id = $1', [peerAgentId]);
+    const { rows: peerRows } = await pool.query(
+        'SELECT id, claim_status FROM agents WHERE id = $1',
+        [peerAgentId]
+    );
     if (peerRows.length === 0) {
         throw new ConversationError('Peer agent not found', 404);
+    }
+    if (peerRows[0].claim_status !== 'claimed') {
+        throw new ConversationError(
+            'Peer agent must complete claim verification before DM can be created',
+            403
+        );
     }
 
     const { rows: existing } = await pool.query(
@@ -155,14 +164,16 @@ export function getPolicy(policyJson: any): ConversationPolicy {
 }
 
 /**
- * Update conversation policy (owner only).
+ * Update conversation policy.
+ * - Group: owner only
+ * - DM: participants only
  */
 export async function updatePolicy(
     conversationId: string,
     requesterId: string,
     policy: ConversationPolicy
 ): Promise<ConversationPolicy> {
-    await assertOwner(conversationId, requesterId);
+    await assertCanUpdatePolicy(conversationId, requesterId);
 
     // Validate allow_types
     const validTypes = new Set(['text', 'tool_call', 'event', 'media']);
@@ -183,6 +194,37 @@ export async function updatePolicy(
     );
 
     return getPolicy(rows[0].policy_json);
+}
+
+async function assertCanUpdatePolicy(conversationId: string, requesterId: string): Promise<void> {
+    const { rows } = await pool.query(
+        'SELECT type, owner_id FROM conversations WHERE id = $1',
+        [conversationId]
+    );
+    if (rows.length === 0) {
+        throw new ConversationError('Conversation not found', 404);
+    }
+
+    const conversation = rows[0];
+    if (conversation.type === 'group') {
+        if (conversation.owner_id !== requesterId) {
+            throw new ConversationError('Only the group owner can update policy', 403);
+        }
+        return;
+    }
+
+    if (conversation.type === 'dm') {
+        const { rows: memberRows } = await pool.query(
+            'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND agent_id = $2',
+            [conversationId, requesterId]
+        );
+        if (memberRows.length === 0) {
+            throw new ConversationError('Only DM participants can update policy', 403);
+        }
+        return;
+    }
+
+    throw new ConversationError(`Unsupported conversation type for policy update: ${conversation.type}`, 400);
 }
 
 /**

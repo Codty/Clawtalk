@@ -17,12 +17,16 @@ let currentAgentId: string | null = null;
 let currentAgentName: string | null = null;
 
 async function api(method: string, path: string, body?: any): Promise<any> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {};
     if (currentToken) headers.Authorization = `Bearer ${currentToken}`;
+    const hasJsonBody = body !== undefined;
+    if (hasJsonBody) {
+        headers['Content-Type'] = 'application/json';
+    }
 
     const res = await fetch(`${BASE_URL}${path}`, {
         method, headers,
-        body: body ? JSON.stringify(body) : undefined,
+        body: hasJsonBody ? JSON.stringify(body) : undefined,
     });
 
     const data = await res.json();
@@ -86,14 +90,28 @@ function requireAuthToken(): string {
 }
 
 async function findAgentByAccount(account: string): Promise<any> {
-    const token = requireAuthToken();
+    requireAuthToken();
     const result = await api('GET', `/api/v1/agents?search=${encodeURIComponent(account)}&limit=20`);
     const agents = result?.agents || [];
     if (!agents.length) {
         throw new Error(`No agent found for account: ${account}`);
     }
-    const exact = agents.find((a: any) => a.agent_name === account);
-    return exact || agents[0];
+    const normalized = account.trim().toLowerCase();
+    const exact = agents.find((a: any) => String(a.agent_name || '').toLowerCase() === normalized);
+    if (exact) return exact;
+
+    const prefixMatches = agents.filter((a: any) =>
+        String(a.agent_name || '').toLowerCase().startsWith(normalized)
+    );
+    if (prefixMatches.length === 1) return prefixMatches[0];
+    if (prefixMatches.length > 1) {
+        throw new Error(
+            `Ambiguous account "${account}". Matches: ${prefixMatches.map((a: any) => a.agent_name).join(', ')}. ` +
+            'Please use the exact Agent Username.'
+        );
+    }
+
+    throw new Error(`No exact/prefix account match for: ${account}`);
 }
 
 async function ensureDm(peerAgentId: string): Promise<any> {
@@ -197,7 +215,8 @@ export function listenInbox(
     onMessage: (msg: any) => void,
     onSystemPrompt?: (prompt: string) => void,
     onConnect?: () => void,
-    onError?: (err: Error) => void
+    onError?: (err: Error) => void,
+    onFriendEvent?: (event: any) => void
 ): () => void {
     if (!currentToken) throw new Error('Not authenticated');
 
@@ -216,6 +235,12 @@ export function listenInbox(
                     onSystemPrompt(msg.content);
                 } else {
                     console.log(`\n[SYSTEM PROMPT INSTRUCTION]\n${msg.content}\n`);
+                }
+            } else if (msg.type === 'friend_request_event') {
+                if (onFriendEvent) {
+                    onFriendEvent(msg.data);
+                } else {
+                    console.log(`[friend_request_event] ${JSON.stringify(msg.data)}`);
                 }
             } else if (msg.type === 'new_message') {
                 onMessage(msg.data);

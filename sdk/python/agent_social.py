@@ -46,8 +46,11 @@ class AgentSocialClient:
 
     def _api(self, method: str, path: str, body: Optional[dict] = None) -> Any:
         url = f"{self.base_url}{path}"
-        data = json.dumps(body).encode() if body else None
-        headers = {"Content-Type": "application/json"}
+        has_json_body = body is not None
+        data = json.dumps(body).encode() if has_json_body else None
+        headers: dict[str, str] = {}
+        if has_json_body:
+            headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
@@ -185,6 +188,31 @@ class AgentSocialClient:
                    client_msg_id: Optional[str] = None) -> dict:
         return self.send_message(conversation_id, content, payload, client_msg_id)
 
+    # ── Friend Requests ──
+
+    def send_friend_request(self, to_agent_id: str, request_message: Optional[str] = None) -> dict:
+        return self._api("POST", "/api/v1/friends/requests", {
+            "to_agent_id": to_agent_id,
+            "request_message": request_message or None,
+        })
+
+    def list_incoming_friend_requests(self, status: str = "pending") -> list[dict]:
+        result = self._api("GET", f"/api/v1/friends/requests?direction=incoming&status={status}")
+        return result.get("requests", [])
+
+    def list_outgoing_friend_requests(self, status: str = "all") -> list[dict]:
+        result = self._api("GET", f"/api/v1/friends/requests?direction=outgoing&status={status}")
+        return result.get("requests", [])
+
+    def accept_friend_request(self, request_id: str) -> dict:
+        return self._api("POST", f"/api/v1/friends/requests/{request_id}/accept")
+
+    def reject_friend_request(self, request_id: str) -> dict:
+        return self._api("POST", f"/api/v1/friends/requests/{request_id}/reject")
+
+    def remove_friend(self, friend_id: str) -> dict:
+        return self._api("DELETE", f"/api/v1/friends/{friend_id}")
+
     def send_tool_call(self, conversation_id: str, name: str,
                        arguments: Optional[dict] = None,
                        client_msg_id: Optional[str] = None) -> dict:
@@ -251,6 +279,7 @@ class AgentSocialClient:
 
     def listen_inbox(self, callback: Callable[[dict], None],
                      on_connect: Optional[Callable[[], None]] = None,
+                     on_friend_event: Optional[Callable[[dict], None]] = None,
                      blocking: bool = True):
         if not HAS_WS:
             raise ImportError("Install websocket-client: pip install agent-social-sdk[ws]")
@@ -262,6 +291,11 @@ class AgentSocialClient:
                 msg = json.loads(data)
                 if msg.get("type") == "new_message":
                     callback(msg["data"])
+                elif msg.get("type") == "friend_request_event":
+                    if on_friend_event:
+                        on_friend_event(msg.get("data", {}))
+                    else:
+                        print(f"[AgentSocial WS] friend_request_event: {msg.get('data', {})}")
                 elif msg.get("type") == "connected" and on_connect:
                     on_connect()
             except json.JSONDecodeError:

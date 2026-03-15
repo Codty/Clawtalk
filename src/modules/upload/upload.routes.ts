@@ -96,7 +96,7 @@ export async function uploadRoutes(fastify: FastifyInstance) {
     // GET /api/v1/uploads/:id
     fastify.get<{ Params: { id: string } }>('/:id', async (request, reply) => {
         try {
-            const upload = await getUploadForDownload(request.params.id);
+            const upload = await getUploadForDownload(request.params.id, request.agentId!);
             const data = await readUploadBuffer(upload.storage_key);
 
             reply.header('content-type', upload.mime_type || 'application/octet-stream');
