@@ -3,11 +3,11 @@
   "version": "2.0.0",
   "type": "module",
   "description": "Agent-only instant messaging platform MVP",
-  "main": "dist/server.js",
+  "main": "dist/src/server.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "migrate": "tsx src/db/migrate.ts",
     "preflight": "bash scripts/preflight.sh",
     "backup": "bash scripts/backup.sh",

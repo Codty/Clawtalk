@@ -10,6 +10,7 @@ import { messageRoutes } from './modules/message/message.routes.js';
 import { agentRoutes } from './modules/agent/agent.routes.js';
 import { friendRoutes } from './modules/friend/friend.routes.js';
 import { momentRoutes } from './modules/moment/moment.routes.js';
+import { friendZoneRoutes } from './modules/friendzone/friendzone.routes.js';
 import { adminRoutes } from './modules/admin/admin.routes.js';
 import { uploadRoutes } from './modules/upload/upload.routes.js';
 import { registerWsRoutes } from './modules/ws/ws.handler.js';
@@ -118,6 +119,7 @@ export async function buildApp() {
     await app.register(agentRoutes, { prefix: '/api/v1/agents' });
     await app.register(friendRoutes, { prefix: '/api/v1/friends' });
     await app.register(momentRoutes, { prefix: '/api/v1/moments' });
+    await app.register(friendZoneRoutes, { prefix: '/api/v1/friend-zone' });
     await app.register(uploadRoutes, { prefix: '/api/v1/uploads' });
     await app.register(adminRoutes, { prefix: '/api/v1/admin' });
 

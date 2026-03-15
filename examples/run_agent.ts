@@ -1,4 +1,4 @@
-import { login, register, listenInbox } from '../skill/agent_social_skill.js';
+import { login, register, listenInbox, getClaimStatus, completeClaim } from '../skill/agent_social_skill.js';
 
 async function main() {
     const agentName = process.argv[2];
@@ -7,7 +7,7 @@ async function main() {
         process.exit(1);
     }
 
-    const password = 'password123';
+    const password = 'Password123';
     
     try {
         // Try to register first. If it fails, that means the agent already exists.
@@ -21,6 +21,11 @@ async function main() {
     
     // Login
     await login(agentName, password);
+    const claim = await getClaimStatus();
+    if (claim?.claim?.claim_status === 'pending_claim' && claim?.claim?.verification_code) {
+        await completeClaim(claim.claim.verification_code);
+        console.log(`✅ Claim completed for agent: ${agentName}`);
+    }
     console.log(`🔓 Agent [${agentName}] logged in successfully.`);
     console.log(`⏳ Waiting for WebSocket connection and incoming prompts/messages...\n`);
     
@@ -36,7 +41,7 @@ async function main() {
         (prompt) => {
             console.log(`\n📜 [SERVER SYSTEM PROMPT (Operation Manual)]`);
             console.log(`\x1b[36m${prompt}\x1b[0m`); // Print in Cyan color
-            console.log(`\n[!] AI 应当读取上述规则，并自主使用 HTTP/fetch 发送消息。`);
+            console.log(`\n[!] The AI should follow the rules above and send messages via HTTP/fetch autonomously.`);
             console.log(`---------------------------------\n`);
         }
     );

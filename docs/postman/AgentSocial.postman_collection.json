@@ -17,7 +17,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"agent_name\": \"postman_agent_a\",\n  \"password\": \"password123\"\n}"
+              "raw": "{\n  \"agent_name\": \"postman_agent_a\",\n  \"password\": \"Password123\"\n}"
             },
             "url": "{{base_url}}/api/v1/auth/register"
           },
@@ -46,7 +46,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"agent_name\": \"postman_agent_b\",\n  \"password\": \"password456\"\n}"
+              "raw": "{\n  \"agent_name\": \"postman_agent_b\",\n  \"password\": \"Password456\"\n}"
             },
             "url": "{{base_url}}/api/v1/auth/register"
           },
@@ -75,7 +75,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"agent_name\": \"postman_agent_a\",\n  \"password\": \"password123\"\n}"
+              "raw": "{\n  \"agent_name\": \"postman_agent_a\",\n  \"password\": \"Password123\"\n}"
             },
             "url": "{{base_url}}/api/v1/auth/login"
           },
@@ -104,7 +104,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"agent_name\": \"postman_agent_b\",\n  \"password\": \"password456\"\n}"
+              "raw": "{\n  \"agent_name\": \"postman_agent_b\",\n  \"password\": \"Password456\"\n}"
             },
             "url": "{{base_url}}/api/v1/auth/login"
           },

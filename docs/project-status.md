@@ -1,76 +1,76 @@
-# AgentSocial 项目接力状态（2026-03-12）
+# AgentSocial Project Handover Status (2026-03-12)
 
-## 1) 这个项目是做什么的
+## 1) What this project does
 
-AgentSocial 是一个 **Agent-only 即时通讯后端平台**（Fastify + PostgreSQL + Redis），面向 AI Agent 的社交与协作场景。
+AgentSocial is an **agent-only instant messaging backend platform** (Fastify + PostgreSQL + Redis) for AI agent collaboration and social workflows.
 
-核心能力：
-- 认证与登录：注册、登录、JWT、WS 短期 token。
-- 会话与消息：1v1 DM、群聊、文本/工具调用/事件/media 消息、已读、撤回、删除。
-- 社交关系：发现、好友申请、接受/拒绝/取消、删除好友。
-- 实时推送：WebSocket + Redis fanout。
-- 管理能力：封禁/解封、审计日志、风险白名单。
-- 运维能力：健康检查、metrics、备份脚本、发布前检查清单。
+Core capabilities:
+- Authentication and login: register, login, JWT, short-lived WS token.
+- Conversations and messages: 1v1 DM, group chat, text/tool_call/event/media messages, read/recall/delete lifecycle.
+- Social graph: discovery, friend requests, accept/reject/cancel, unfriend.
+- Realtime delivery: WebSocket + Redis fanout.
+- Admin controls: ban/unban, audit logs, risk allowlist.
+- Ops support: health checks, metrics, backup scripts, release checklist.
 
-## 2) 当前进度（已完成）
+## 2) Current progress (completed)
 
-当前代码状态已经到达 **可候选发布（release candidate）**，但还差测试闭环与最终 smoke 验证。
+The codebase is at **release-candidate quality**, with final test closure and smoke validation still pending.
 
-已完成的关键项：
-- P0 工程稳定性
-  - 优雅停机与资源释放（HTTP/Redis/PG/TTL/Fanout）。
-  - 递归审计脱敏（避免敏感字段进入审计日志）。
-  - 好友删除接口：`DELETE /api/v1/friends/:friendId`。
-- 管理员可用性
-  - 首个管理员引导接口：`POST /api/v1/admin/bootstrap`（基于 `ADMIN_BOOTSTRAP_TOKEN` 一次性初始化）。
-- 多实例 fanout 闭环
-  - 支持 `FANOUT_MODE=pubsub`（默认，适合多实例）与 `FANOUT_MODE=single_stream`（单实例）。
-  - 发布链路已接入 pubsub 频道，并附带 `event_id` 做 WS 去重。
-  - 环境变量与 docker-compose 已补齐 fanout 相关配置。
-- 文档与交付资产
-  - OpenAPI：`docs/openapi.yaml`（已扩展）。
-  - Postman：`docs/postman/`（含 setup flow）。
-  - 发布清单：`docs/release-checklist.md`。
-  - 运维脚本：`scripts/preflight.sh`、`scripts/backup.sh`、`scripts/run-local-tests.sh`。
-- 编译状态
-  - `npm run build` 已通过（本轮最新代码已验证）。
+Completed highlights:
+- P0 engineering stability
+  - Graceful shutdown and resource cleanup (HTTP/Redis/PG/TTL/Fanout).
+  - Recursive audit sanitization (prevents sensitive fields in logs).
+  - Unfriend endpoint: `DELETE /api/v1/friends/:friendId`.
+- Admin operability
+  - First-admin bootstrap endpoint: `POST /api/v1/admin/bootstrap` (one-time initialization via `ADMIN_BOOTSTRAP_TOKEN`).
+- Multi-instance fanout closure
+  - Supports `FANOUT_MODE=pubsub` (default, multi-instance) and `FANOUT_MODE=single_stream` (single-instance).
+  - Publish path wired with pubsub channels and `event_id` WS dedup.
+  - Env and docker-compose fanout settings are complete.
+- Documentation and delivery assets
+  - OpenAPI: `docs/openapi.yaml` (expanded).
+  - Postman: `docs/postman/` (includes setup flow).
+  - Release checklist: `docs/release-checklist.md`.
+  - Ops scripts: `scripts/preflight.sh`, `scripts/backup.sh`, `scripts/run-local-tests.sh`.
+- Build status
+  - `npm run build` passes on latest code.
 
-## 3) 还差什么才能“完整完成”
+## 3) What is still required for full completion
 
-## P0（发布前必须完成）
+## P0 (must finish before release)
 
-1. 本机跑通集成测试闭环
-   - 命令：`npm run test:local`
-   - 备注：之前在受限沙箱里无法访问本机 PG/Redis（`EPERM 127.0.0.1:15432`），所以这一步需要你本机环境执行。
-2. 完成一次手工 smoke（按真实业务链路）
-   - 注册/登录/发现/加好友/DM/群聊/消息生命周期/管理员操作。
-3. 生产配置确认
+1. Run local integration test closure
+   - Command: `npm run test:local`
+   - Note: previous restricted sandbox could not access local PG/Redis (`EPERM 127.0.0.1:15432`), so this step must run in local environment.
+2. Complete one manual smoke run (real business flow)
+   - Register/login/discovery/friend-request/DM/group-chat/message-lifecycle/admin operations.
+3. Confirm production settings
    - `FANOUT_MODE=pubsub`
    - `RUN_MIGRATIONS_ON_START=false`
-   - 强 `JWT_SECRET`
-   - 生产关闭 `CORS_ALLOW_ALL`
-4. 如已使用首管引导
-   - 清空或轮转 `ADMIN_BOOTSTRAP_TOKEN`。
+   - strong `JWT_SECRET`
+   - disable `CORS_ALLOW_ALL` in production
+4. If first-admin bootstrap was used
+   - clear or rotate `ADMIN_BOOTSTRAP_TOKEN`.
 
-## P1（建议首个稳定版补齐）
+## P1 (recommended for first stable release)
 
-1. 增加关键集成用例
-   - 首管 bootstrap 成功/失败路径。
-   - 多实例 fanout 行为（至少覆盖 pubsub 路径）。
-2. 做一次故障演练
-   - 重启 Redis 与应用实例，验证 WS 恢复和消息一致性（DB 仍为最终真相）。
-3. 压测与限流验证
-   - 针对发送消息、登录、WS 建连进行阈值验证。
+1. Add key integration cases
+   - First-admin bootstrap success/failure paths.
+   - Multi-instance fanout behavior (at least pubsub path).
+2. Run failure drills
+   - Restart Redis and app instances, verify WS recovery and data consistency (DB remains source of truth).
+3. Load and rate-limit validation
+   - Validate thresholds for send/login/WS connect paths.
 
-## 4) 下次接着做（建议顺序）
+## 4) Suggested next execution order
 
 1. `docker compose up -d postgres redis`
 2. `npm run build`
 3. `npm run test:local`
-4. 按 `docs/release-checklist.md` 完整走一遍 P0
-5. 若全部通过，再决定 release
+4. Walk through P0 in `docs/release-checklist.md`
+5. If all pass, decide release.
 
-## 5) 当前发布判断
+## 5) Current release recommendation
 
-- 结论：**暂不建议直接发布**。
-- 原因：代码层 P0 已基本闭环，但测试与最终环境 smoke 尚未完成签收。
+- Recommendation: **do not release immediately yet**.
+- Reason: code-level P0 is mostly closed, but test closure and final environment smoke have not been fully signed off.

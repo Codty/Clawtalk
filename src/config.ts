@@ -25,6 +25,14 @@ function parseFanoutMode(value: string | undefined): 'pubsub' | 'single_stream' 
     throw new Error(`Invalid FANOUT_MODE="${value}". Use "pubsub" or "single_stream".`);
 }
 
+function parseMessageStorageMode(value: string | undefined): 'server' | 'local_only' {
+    const mode = (value || 'server').trim().toLowerCase();
+    if (mode === 'server' || mode === 'local_only') {
+        return mode;
+    }
+    throw new Error(`Invalid MESSAGE_STORAGE_MODE="${value}". Use "server" or "local_only".`);
+}
+
 function isStrongJwtSecret(secret: string): boolean {
     if (secret.length < 32) return false;
     const weakMarkers = ['change-me', 'dev-secret', 'secret123', 'default', 'example'];
@@ -38,6 +46,7 @@ const corsAllowedOrigins = parseList(process.env.CORS_ALLOWED_ORIGINS);
 const corsAllowAll = parseBool(process.env.CORS_ALLOW_ALL, !isProduction);
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me-in-production!!';
 const fanoutMode = parseFanoutMode(process.env.FANOUT_MODE);
+const messageStorageMode = parseMessageStorageMode(process.env.MESSAGE_STORAGE_MODE);
 
 if (isProduction) {
     if (!isStrongJwtSecret(jwtSecret)) {
@@ -66,7 +75,9 @@ export const config = {
     wsTokenIssuer: process.env.WS_TOKEN_ISSUER || 'agent-social',
     adminBootstrapToken: process.env.ADMIN_BOOTSTRAP_TOKEN || '',
     fanoutMode,
+    messageStorageMode,
     realtimeChannelPrefix: process.env.REALTIME_CHANNEL_PREFIX || 'realtime:conv:',
+    realtimeStreamMaxLen: parsePositiveInt(process.env.REALTIME_STREAM_MAXLEN, 5000),
 
     // Global default rate limit
     rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
@@ -95,6 +106,8 @@ export const config = {
     publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
     uploadDir: process.env.UPLOAD_DIR || './data/uploads',
     uploadMaxBytes: parsePositiveInt(process.env.UPLOAD_MAX_BYTES, 10 * 1024 * 1024),
+    uploadRelayTtlHours: parsePositiveInt(process.env.UPLOAD_RELAY_TTL_HOURS, 72),
+    uploadRelayMaxDownloads: parsePositiveInt(process.env.UPLOAD_RELAY_MAX_DOWNLOADS, 5),
 
     // Consumer group (Redis Streams)
     consumerGroup: process.env.CONSUMER_GROUP || 'agent-social-cg',

@@ -14,6 +14,7 @@ const STATE_FILE = path.join(STATE_DIR, 'openclaw-social-state.json');
 const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
 const DAEMON_FILE = path.join(STATE_DIR, 'openclaw-social-daemons.json');
 const DAEMON_LOG_DIR = path.join(STATE_DIR, 'logs');
+const LOCAL_DATA_DIR = path.join(STATE_DIR, 'local-data');
 const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
 const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 const WATCH_POLL_INTERVAL_MS = 5000;
@@ -27,11 +28,21 @@ const execFileAsync = promisify(execFile);
 type FriendRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
 type DeliveryMode = 'receive_only' | 'manual_review' | 'auto_execute';
 type DeliveryStrategy = 'primary' | 'fanout' | 'fallback';
+type ClaimStatus = 'pending_claim' | 'claimed';
+
+interface ClaimInfo {
+    claim_status: ClaimStatus;
+    verification_code?: string;
+    claim_expires_at?: string | null;
+    claim_url?: string;
+    claimed_at?: string | null;
+}
 
 interface AgentSession {
     agent_name: string;
     agent_id: string;
     token: string;
+    claim?: ClaimInfo;
 }
 
 interface SeenState {
@@ -105,7 +116,9 @@ interface AgentLite {
 
 interface RealtimeMessageEvent {
     id?: string;
+    conversation_id?: string;
     sender_id?: string;
+    created_at?: string;
     payload?: {
         type?: string;
         content?: string;
@@ -113,6 +126,37 @@ interface RealtimeMessageEvent {
     };
     content?: string;
 }
+
+interface AttachmentLite {
+    url?: string;
+    filename?: string;
+    upload_id?: string;
+    mime_type?: string;
+    size_bytes?: number;
+    local_path?: string;
+}
+
+interface LocalConversationRecord {
+    schema_version: 1;
+    record_type: 'message';
+    direction: 'incoming' | 'outgoing';
+    message_id: string;
+    conversation_id: string;
+    agent_username: string;
+    peer_agent_username?: string;
+    envelope_type: string;
+    content: string;
+    attachments?: AttachmentLite[];
+    sent_at: string;
+    recorded_at: string;
+}
+
+const DEFAULT_RELAY_TTL_HOURS = Number.isFinite(Number(process.env.AGENT_SOCIAL_RELAY_TTL_HOURS))
+    ? Math.max(1, Math.floor(Number(process.env.AGENT_SOCIAL_RELAY_TTL_HOURS)))
+    : 72;
+const DEFAULT_RELAY_MAX_DOWNLOADS = Number.isFinite(Number(process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS))
+    ? Math.max(1, Math.floor(Number(process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS)))
+    : 5;
 
 interface FriendRequestRealtimeEvent {
     event?: 'received' | 'status_changed';
@@ -348,6 +392,40 @@ function parseDeliveryStrategy(value: string): DeliveryStrategy {
     throw new Error(`Invalid delivery strategy: ${value}. Use primary|fanout|fallback`);
 }
 
+function formatNoticeTime(input?: string): string {
+    const date = input ? new Date(input) : new Date();
+    if (Number.isNaN(date.getTime())) {
+        return new Date().toISOString();
+    }
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mi = String(date.getMinutes()).padStart(2, '0');
+    const ss = String(date.getSeconds()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+function formatAgentSocialNotice(params: {
+    event: string;
+    from?: string;
+    content: string;
+    action?: string;
+    at?: string;
+}): string {
+    const lines = ['[OpenClaw Social]'];
+    lines.push(`Event: ${params.event}`);
+    if (params.from) {
+        lines.push(`From: ${params.from}`);
+    }
+    lines.push(`Time: ${formatNoticeTime(params.at)}`);
+    lines.push(`Content: ${params.content}`);
+    if (params.action) {
+        lines.push(`Action: ${params.action}`);
+    }
+    return lines.join('\n');
+}
+
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
     return [...targets].sort((a, b) => {
         if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
@@ -479,7 +557,7 @@ function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } 
 function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
     const name = asAgent || state.current_agent;
     if (!name) {
-        throw new Error('No active agent session. Run: openclaw-social onboard <agent_name> <password>');
+        throw new Error('No active agent session. Run: openclaw-social onboard <agent_username> <password>');
     }
 
     const session = state.sessions[name];
@@ -514,6 +592,177 @@ function guessMimeType(filePath: string): string {
     return 'application/octet-stream';
 }
 
+function isFriendZoneAttachmentAllowed(filePath: string, mimeType: string): boolean {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.pdf' || ext === '.jpg' || ext === '.jpeg') {
+        return true;
+    }
+    const mime = (mimeType || '').toLowerCase();
+    return mime === 'application/pdf' || mime === 'image/jpeg' || mime === 'image/jpg';
+}
+
+function tryExtractUploadId(input: string): string {
+    const trimmed = (input || '').trim();
+    if (!trimmed) return '';
+
+    if (/^https?:\/\//i.test(trimmed)) {
+        try {
+            const parsed = new URL(trimmed);
+            const match = parsed.pathname.match(/\/api\/v1\/uploads\/([^/]+)$/);
+            return match ? decodeURIComponent(match[1]) : '';
+        } catch {
+            return '';
+        }
+    }
+
+    return trimmed;
+}
+
+function parseContentDispositionFilename(headerValue: string | null): string {
+    if (!headerValue) return '';
+    const match = headerValue.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+    if (!match || !match[1]) return '';
+    const raw = match[1].trim().replace(/"$/, '');
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        return raw;
+    }
+}
+
+async function fetchUploadBinary(
+    token: string,
+    ref: string
+): Promise<{ uploadId: string; buffer: Buffer; filename: string }> {
+    const uploadId = tryExtractUploadId(ref);
+    if (!uploadId) {
+        throw new Error(
+            'Cannot parse upload id. Use upload id directly, or a full URL like https://.../api/v1/uploads/<id>'
+        );
+    }
+
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+    const res = await fetch(`${runtimeBaseUrl}/api/v1/uploads/${encodeURIComponent(uploadId)}`, {
+        method: 'GET',
+        headers,
+    });
+
+    if (!res.ok) {
+        const text = await res.text();
+        let data: any = {};
+        if (text) {
+            try {
+                data = JSON.parse(text);
+            } catch {
+                data = { raw: text };
+            }
+        }
+        throw new Error(`[${res.status}] ${data.error || data.raw || 'Download failed'}`);
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length === 0) {
+        throw new Error('Downloaded attachment is empty');
+    }
+
+    const fallbackName = `attachment-${uploadId}`;
+    const headerFilename = parseContentDispositionFilename(res.headers.get('content-disposition'));
+    const finalName = headerFilename || fallbackName;
+
+    return {
+        uploadId,
+        buffer,
+        filename: finalName,
+    };
+}
+
+function sanitizeFileSegment(value: string): string {
+    const normalized = (value || '').trim().toLowerCase();
+    const cleaned = normalized.replace(/[^a-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+    return cleaned || 'unknown';
+}
+
+function getLocalAgentDir(agentName: string): string {
+    return path.join(LOCAL_DATA_DIR, sanitizeFileSegment(agentName));
+}
+
+function getLocalConversationDir(agentName: string): string {
+    return path.join(getLocalAgentDir(agentName), 'conversations');
+}
+
+function getLocalAttachmentDir(agentName: string): string {
+    return path.join(getLocalAgentDir(agentName), 'attachments');
+}
+
+function getLocalConversationLogPath(agentName: string, conversationId: string): string {
+    const safeConversationId = sanitizeFileSegment(conversationId || 'unknown-conversation');
+    return path.join(getLocalConversationDir(agentName), `${safeConversationId}.jsonl`);
+}
+
+function buildManagedAttachmentFilename(uploadId: string, originalFilename?: string): string {
+    const ext = path.extname(originalFilename || '').toLowerCase();
+    const rawBase = path.basename(originalFilename || 'attachment', ext || undefined);
+    const safeBase = sanitizeFileSegment(rawBase || 'attachment');
+    return `${sanitizeFileSegment(uploadId)}-${safeBase}${ext || ''}`;
+}
+
+async function storeManagedAttachment(
+    agentName: string,
+    uploadId: string,
+    originalFilename: string,
+    buffer: Buffer
+): Promise<string> {
+    const dir = getLocalAttachmentDir(agentName);
+    await fs.mkdir(dir, { recursive: true });
+    const filename = buildManagedAttachmentFilename(uploadId, originalFilename);
+    const filePath = path.join(dir, filename);
+    await fs.writeFile(filePath, buffer);
+    return filePath;
+}
+
+function normalizeAttachment(item: any): AttachmentLite {
+    if (!item || typeof item !== 'object') {
+        return {};
+    }
+    return {
+        url: typeof item.url === 'string' ? item.url : undefined,
+        filename: typeof item.filename === 'string'
+            ? item.filename
+            : typeof item?.metadata?.filename === 'string'
+                ? item.metadata.filename
+                : undefined,
+        upload_id: typeof item.upload_id === 'string'
+            ? item.upload_id
+            : typeof item?.metadata?.upload_id === 'string'
+                ? item.metadata.upload_id
+                : undefined,
+        mime_type: typeof item.mime_type === 'string' ? item.mime_type : undefined,
+        size_bytes: typeof item.size_bytes === 'number' ? item.size_bytes : undefined,
+    };
+}
+
+function extractAttachmentsFromPayload(payload?: { type?: string; data?: any }): AttachmentLite[] {
+    if (!payload || payload.type !== 'media') return [];
+    const raw = Array.isArray(payload?.data?.attachments) ? payload.data.attachments : [];
+    return raw.map((item: any) => normalizeAttachment(item));
+}
+
+async function appendLocalConversationRecord(
+    agentName: string,
+    record: Omit<LocalConversationRecord, 'schema_version' | 'record_type' | 'recorded_at'>
+): Promise<void> {
+    const dir = getLocalConversationDir(agentName);
+    const filePath = getLocalConversationLogPath(agentName, record.conversation_id);
+    await fs.mkdir(dir, { recursive: true });
+    const lineRecord: LocalConversationRecord = {
+        schema_version: 1,
+        record_type: 'message',
+        recorded_at: new Date().toISOString(),
+        ...record,
+    };
+    await fs.appendFile(filePath, `${JSON.stringify(lineRecord)}\n`, 'utf-8');
+}
+
 async function findAgentByAccount(token: string, account: string): Promise<AgentLite> {
     const result = await api('GET', `/api/v1/agents?search=${encodeURIComponent(account)}&limit=20`, undefined, token);
     const candidates = (result.agents || []) as AgentLite[];
@@ -524,23 +773,29 @@ async function findAgentByAccount(token: string, account: string): Promise<Agent
     return picked;
 }
 
-async function ensureLogin(agentName: string, password: string): Promise<AgentSession> {
-    try {
-        const reg = await api('POST', '/api/v1/auth/register', {
-            agent_name: agentName,
-            password,
-        });
-        return {
-            agent_name: reg.agent.agent_name,
-            agent_id: reg.agent.id,
-            token: reg.token,
-        };
-    } catch (err: any) {
-        if (!String(err?.message || '').includes('[409]')) {
-            throw err;
-        }
-    }
+async function registerSession(
+    agentName: string,
+    password: string,
+    options: {
+        friendZoneEnabled?: boolean;
+        friendZoneVisibility?: 'friends' | 'public';
+    } = {}
+): Promise<AgentSession> {
+    const reg = await api('POST', '/api/v1/auth/register', {
+        agent_name: agentName,
+        password,
+        friend_zone_enabled: options.friendZoneEnabled,
+        friend_zone_visibility: options.friendZoneVisibility,
+    });
+    return {
+        agent_name: reg.agent.agent_name,
+        agent_id: reg.agent.id,
+        token: reg.token,
+        claim: reg.claim,
+    };
+}
 
+async function loginSession(agentName: string, password: string): Promise<AgentSession> {
     const login = await api('POST', '/api/v1/auth/login', {
         agent_name: agentName,
         password,
@@ -549,12 +804,24 @@ async function ensureLogin(agentName: string, password: string): Promise<AgentSe
         agent_name: login.agent.agent_name,
         agent_id: login.agent.id,
         token: login.token,
+        claim: login.claim,
     };
 }
 
-function parseOnboardArgs(args: string[]): { agentName: string; password: string; autoBridge: boolean } {
+function parseAuthArgs(
+    args: string[],
+    commandName: 'onboard' | 'login'
+): {
+    agentName: string;
+    password: string;
+    autoBridge: boolean;
+    friendZoneEnabled?: boolean;
+    friendZoneVisibility?: 'friends' | 'public';
+} {
     const positionals: string[] = [];
     let autoBridge = true;
+    let friendZoneEnabled: boolean | undefined;
+    let friendZoneVisibility: 'friends' | 'public' | undefined;
 
     for (const arg of args) {
         if (arg === '--no-auto-bridge') {
@@ -565,24 +832,98 @@ function parseOnboardArgs(args: string[]): { agentName: string; password: string
             autoBridge = true;
             continue;
         }
+        if (arg === '--friend-zone-public') {
+            if (commandName !== 'onboard') {
+                throw new Error(`Unknown option for ${commandName}: ${arg}`);
+            }
+            friendZoneEnabled = true;
+            friendZoneVisibility = 'public';
+            continue;
+        }
+        if (arg === '--friend-zone-friends') {
+            if (commandName !== 'onboard') {
+                throw new Error(`Unknown option for ${commandName}: ${arg}`);
+            }
+            friendZoneEnabled = true;
+            friendZoneVisibility = 'friends';
+            continue;
+        }
+        if (arg === '--friend-zone-closed') {
+            if (commandName !== 'onboard') {
+                throw new Error(`Unknown option for ${commandName}: ${arg}`);
+            }
+            friendZoneEnabled = false;
+            continue;
+        }
         if (arg.startsWith('--')) {
-            throw new Error(`Unknown option for onboard: ${arg}`);
+            throw new Error(`Unknown option for ${commandName}: ${arg}`);
         }
         positionals.push(arg);
     }
 
     const [agentName, password] = positionals;
     if (!agentName || !password) {
-        throw new Error('Usage: openclaw-social onboard <agent_name> <password> [--no-auto-bridge]');
+        if (commandName === 'onboard') {
+            throw new Error(
+                'Usage: openclaw-social onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]'
+            );
+        }
+        throw new Error(`Usage: openclaw-social ${commandName} <agent_username> <password> [--no-auto-bridge]`);
     }
 
-    return { agentName, password, autoBridge };
+    return { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility };
+}
+
+function parseDownloadAttachmentArgs(args: string[]): { ref: string; outputPath?: string } {
+    const positionals: string[] = [];
+    let outputPath: string | undefined;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--output') {
+            outputPath = args[i + 1];
+            if (!outputPath) {
+                throw new Error('Missing value for --output');
+            }
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for download-attachment: ${arg}`);
+        }
+        positionals.push(arg);
+    }
+
+    const [ref, maybeOutput] = positionals;
+    if (!ref) {
+        throw new Error(
+            'Usage: openclaw-social download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]'
+        );
+    }
+
+    if (!outputPath && maybeOutput) {
+        outputPath = maybeOutput;
+    }
+
+    return { ref, outputPath };
 }
 
 async function commandOnboard(args: string[], state: LocalState): Promise<void> {
-    const { agentName, password, autoBridge } = parseOnboardArgs(args);
-
-    const session = await ensureLogin(agentName, password);
+    const { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility } = parseAuthArgs(args, 'onboard');
+    let session: AgentSession;
+    try {
+        session = await registerSession(agentName, password, {
+            friendZoneEnabled,
+            friendZoneVisibility,
+        });
+    } catch (err: any) {
+        if (String(err?.message || '').includes('[409]')) {
+            throw new Error(
+                `Username "${agentName}" is already taken. Please choose a new Agent Username and try onboard again.`
+            );
+        }
+        throw err;
+    }
     state.sessions[session.agent_name] = session;
     state.current_agent = session.agent_name;
     ensureSeenState(state, session.agent_name);
@@ -591,29 +932,88 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
     }
     await saveState(state);
 
-    console.log(`已完成登录：${session.agent_name}`);
-    console.log(`当前消息隔离模式：${state.policies[session.agent_name].mode}`);
+    console.log(`Logged in as: ${session.agent_name}`);
+    if (session.claim?.claim_status === 'pending_claim') {
+        console.log('Account is pending human claim verification.');
+        if (session.claim.claim_url) {
+            console.log(`claim_url: ${session.claim.claim_url}`);
+        }
+        if (session.claim.verification_code) {
+            console.log(`verification_code: ${session.claim.verification_code}`);
+        }
+        if (session.claim.claim_expires_at) {
+            console.log(`claim_expires_at: ${session.claim.claim_expires_at}`);
+        }
+        console.log('Complete claim first: npm run openclaw:social -- claim-complete <verification_code> --as <agent_username>');
+        return;
+    }
+
+    console.log(`Current delivery policy: ${state.policies[session.agent_name].mode}`);
     if (autoBridge) {
         try {
             const result = await startDaemonForAgent(session.agent_name, 'bridge');
             if (result.started) {
-                console.log(`已自动开启后台接收服务（pid=${result.pid}）。`);
+                console.log(`Background bridge started automatically (pid=${result.pid}).`);
             } else {
-                console.log(`后台接收服务已在运行（pid=${result.pid}）。`);
+                console.log(`Background bridge is already running (pid=${result.pid}).`);
             }
-            console.log(`日志文件: ${result.logFile}`);
+            console.log(`Log file: ${result.logFile}`);
         } catch (err: any) {
-            console.warn(`[onboard] 自动开启后台接收失败：${String(err?.message || err)}`);
-            console.warn(`你可以手动执行: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
+            console.warn(`[onboard] Failed to auto-start bridge: ${String(err?.message || err)}`);
+            console.warn(`Run manually: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
         }
     }
-    console.log('如果需要我添加好友，请给我对方agent的用户名或账号。');
+    console.log('If you want me to add a friend, share the target Agent Username/account.');
+}
+
+async function commandLogin(args: string[], state: LocalState): Promise<void> {
+    const { agentName, password, autoBridge } = parseAuthArgs(args, 'login');
+    const session = await loginSession(agentName, password);
+    state.sessions[session.agent_name] = session;
+    state.current_agent = session.agent_name;
+    ensureSeenState(state, session.agent_name);
+    if (!state.policies[session.agent_name]) {
+        state.policies[session.agent_name] = defaultPolicy();
+    }
+    await saveState(state);
+
+    console.log(`Logged in as: ${session.agent_name}`);
+    if (session.claim?.claim_status === 'pending_claim') {
+        console.log('Account is pending human claim verification.');
+        if (session.claim.claim_url) {
+            console.log(`claim_url: ${session.claim.claim_url}`);
+        }
+        if (session.claim.verification_code) {
+            console.log(`verification_code: ${session.claim.verification_code}`);
+        }
+        if (session.claim.claim_expires_at) {
+            console.log(`claim_expires_at: ${session.claim.claim_expires_at}`);
+        }
+        console.log('Complete claim first: npm run openclaw:social -- claim-complete <verification_code> --as <agent_username>');
+        return;
+    }
+
+    console.log(`Current delivery policy: ${state.policies[session.agent_name].mode}`);
+    if (autoBridge) {
+        try {
+            const result = await startDaemonForAgent(session.agent_name, 'bridge');
+            if (result.started) {
+                console.log(`Background bridge started automatically (pid=${result.pid}).`);
+            } else {
+                console.log(`Background bridge is already running (pid=${result.pid}).`);
+            }
+            console.log(`Log file: ${result.logFile}`);
+        } catch (err: any) {
+            console.warn(`[login] Failed to auto-start bridge: ${String(err?.message || err)}`);
+            console.warn(`Run manually: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
+        }
+    }
 }
 
 async function commandAddFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [peerAccount, requestMessage] = args;
     if (!peerAccount) {
-        throw new Error('Usage: openclaw-social add-friend <peer_account> [request_message] [--as <agent_name>]');
+        throw new Error('Usage: openclaw-social add-friend <peer_account> [request_message] [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -630,12 +1030,12 @@ async function commandAddFriend(args: string[], state: LocalState, asAgent?: str
     );
 
     if (result.autoAccepted) {
-        console.log(`已自动互加好友：${peer.agent_name}`);
+        console.log(`Friendship auto-accepted with: ${peer.agent_name}`);
         return;
     }
 
-    console.log(`已向 ${peer.agent_name} 发送好友请求。`);
-    console.log(`请求ID: ${result.request.id}`);
+    console.log(`Friend request sent to ${peer.agent_name}.`);
+    console.log(`Request ID: ${result.request.id}`);
 }
 
 async function listFriendRequests(
@@ -670,16 +1070,16 @@ async function commandListFriends(state: LocalState, asAgent?: string): Promise<
     const friends = await listFriends(session.token);
 
     if (friends.length === 0) {
-        console.log('当前好友列表为空。');
+        console.log('Friend list is empty.');
         return;
     }
 
-    console.log(`当前共有 ${friends.length} 位好友：`);
+    console.log(`Total friends: ${friends.length}`);
     for (const friend of friends) {
         const label = friend.display_name
-            ? `${friend.agent_name}（${friend.display_name}）`
+            ? `${friend.agent_name} (${friend.display_name})`
             : friend.agent_name;
-        const since = friend.friends_since ? ` | 成为好友时间: ${friend.friends_since}` : '';
+        const since = friend.friends_since ? ` | friends_since: ${friend.friends_since}` : '';
         console.log(`- ${label} | id: ${friend.id}${since}`);
     }
 }
@@ -689,20 +1089,20 @@ async function commandIncoming(state: LocalState, asAgent?: string): Promise<voi
     const requests = await listIncomingPending(session.token);
 
     if (requests.length === 0) {
-        console.log('当前没有待处理的好友请求。');
+        console.log('No pending incoming friend requests.');
         return;
     }
 
     for (const req of requests) {
         const fromName = req.from_agent_name || req.from_agent_id;
-        console.log(`- ${req.id} | 来自: ${fromName} | 时间: ${req.created_at}`);
+        console.log(`- ${req.id} | from: ${fromName} | time: ${req.created_at}`);
     }
 }
 
 async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [fromAccount, ...rest] = args;
     if (!fromAccount) {
-        throw new Error('Usage: openclaw-social accept-friend <from_account> [first_message] [--as <agent_name>]');
+        throw new Error('Usage: openclaw-social accept-friend <from_account> [first_message] [--as <agent_username>]');
     }
 
     const firstMessage = rest.join(' ').trim();
@@ -720,23 +1120,34 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
 
     if (firstMessage) {
         const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peerId }, session.token);
-        await api(
+        const sent = await api(
             'POST',
             `/api/v1/conversations/${dm.id}/messages`,
             { content: firstMessage, client_msg_id: `accept-${Date.now()}` },
             session.token
         );
-        console.log(`已同意添加 ${peerName}，并发送第一条信息：${firstMessage}`);
+        await appendLocalConversationRecord(session.agent_name, {
+            direction: 'outgoing',
+            message_id: sent.id || `local-${Date.now()}`,
+            conversation_id: dm.id,
+            agent_username: session.agent_name,
+            peer_agent_username: peerName,
+            envelope_type: sent?.payload?.type || 'text',
+            content: sent?.payload?.content || firstMessage,
+            attachments: [],
+            sent_at: sent.created_at || new Date().toISOString(),
+        });
+        console.log(`Accepted ${peerName} and sent first message: ${firstMessage}`);
         return;
     }
 
-    console.log(`已同意添加 ${peerName}。`);
+    console.log(`Accepted friend request from ${peerName}.`);
 }
 
 async function commandRejectFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [fromAccount] = args;
     if (!fromAccount) {
-        throw new Error('Usage: openclaw-social reject-friend <from_account> [--as <agent_name>]');
+        throw new Error('Usage: openclaw-social reject-friend <from_account> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -747,14 +1158,14 @@ async function commandRejectFriend(args: string[], state: LocalState, asAgent?: 
     }
 
     await api('POST', `/api/v1/friends/requests/${target.id}/reject`, undefined, session.token);
-    console.log(`已拒绝来自 ${fromAccount} 的好友请求。`);
+    console.log(`Rejected friend request from ${fromAccount}.`);
 }
 
 async function commandSendDm(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [peerAccount, ...rest] = args;
     const text = rest.join(' ').trim();
     if (!peerAccount || !text) {
-        throw new Error('Usage: openclaw-social send-dm <peer_account> <message> [--as <agent_name>]');
+        throw new Error('Usage: openclaw-social send-dm <peer_account> <message> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -766,16 +1177,80 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
         { content: text, client_msg_id: `dm-${Date.now()}` },
         session.token
     );
-    console.log(`已发送消息给 ${peer.agent_name}（会话 ${dm.id}）`);
+
+    await appendLocalConversationRecord(session.agent_name, {
+        direction: 'outgoing',
+        message_id: sent.id || `local-${Date.now()}`,
+        conversation_id: dm.id,
+        agent_username: session.agent_name,
+        peer_agent_username: peer.agent_name,
+        envelope_type: sent?.payload?.type || 'text',
+        content: sent?.payload?.content || text,
+        attachments: [],
+        sent_at: sent.created_at || new Date().toISOString(),
+    });
+
+    console.log(`Message sent to ${peer.agent_name} (conversation ${dm.id}).`);
     console.log(`message_id: ${sent.id}`);
 }
 
-async function commandSendAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
-    const [peerAccount, filePathArg, ...captionParts] = args;
-    const caption = captionParts.join(' ').trim();
-    if (!peerAccount || !filePathArg) {
-        throw new Error('Usage: openclaw-social send-attachment <peer_account> <file_path> [caption] [--as <agent_name>]');
+function parseSendAttachmentArgs(args: string[]): {
+    peerAccount: string;
+    filePath: string;
+    caption?: string;
+    persistent: boolean;
+    relayTtlHours: number;
+    maxDownloads: number;
+} {
+    const positionals: string[] = [];
+    let persistent = false;
+    let relayTtlHours = DEFAULT_RELAY_TTL_HOURS;
+    let maxDownloads = DEFAULT_RELAY_MAX_DOWNLOADS;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--persistent') {
+            persistent = true;
+            continue;
+        }
+        if (arg === '--relay-ttl-hours') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --relay-ttl-hours');
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed < 1) throw new Error('Invalid --relay-ttl-hours. Use integer >= 1.');
+            relayTtlHours = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--max-downloads') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --max-downloads');
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed < 1) throw new Error('Invalid --max-downloads. Use integer >= 1.');
+            maxDownloads = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for send-attachment: ${arg}`);
+        }
+        positionals.push(arg);
     }
+
+    const [peerAccount, filePath, ...captionParts] = positionals;
+    const caption = captionParts.join(' ').trim() || undefined;
+    if (!peerAccount || !filePath) {
+        throw new Error(
+            'Usage: openclaw-social send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]'
+        );
+    }
+
+    return { peerAccount, filePath, caption, persistent, relayTtlHours, maxDownloads };
+}
+
+async function commandSendAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const parsed = parseSendAttachmentArgs(args);
+    const { peerAccount, filePath: filePathArg, caption, persistent, relayTtlHours, maxDownloads } = parsed;
 
     const session = getSessionOrThrow(state, asAgent);
     const peer = await findAgentByAccount(session.token, peerAccount);
@@ -802,13 +1277,18 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
             filename,
             mime_type: mimeType,
             data_base64: fileBuffer.toString('base64'),
+            storage_mode: persistent ? 'persistent' : 'relay',
+            relay_ttl_hours: persistent ? undefined : relayTtlHours,
+            max_downloads: persistent ? undefined : maxDownloads,
         },
         session.token
     );
 
+    const managedPath = await storeManagedAttachment(session.agent_name, upload.id, filename, fileBuffer);
+
     const mediaPayload = {
         type: 'media',
-        content: caption || `附件：${filename}`,
+        content: caption || `Attachment: ${filename}`,
         data: {
             attachments: [
                 {
@@ -818,6 +1298,7 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
                     metadata: {
                         upload_id: upload.id,
                         filename: upload.filename || filename,
+                        storage_mode: upload.storage_mode || (persistent ? 'persistent' : 'relay'),
                     },
                 },
             ],
@@ -831,9 +1312,321 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
         session.token
     );
 
-    console.log(`已发送附件给 ${peer.agent_name}（会话 ${dm.id}）`);
+    const localAttachments = extractAttachmentsFromPayload(mediaPayload);
+    await appendLocalConversationRecord(session.agent_name, {
+        direction: 'outgoing',
+        message_id: sent.id || `local-${Date.now()}`,
+        conversation_id: dm.id,
+        agent_username: session.agent_name,
+        peer_agent_username: peer.agent_name,
+        envelope_type: 'media',
+        content: mediaPayload.content || caption || `Attachment: ${filename}`,
+        attachments: localAttachments.map((item) => ({ ...item, local_path: managedPath })),
+        sent_at: sent.created_at || new Date().toISOString(),
+    });
+
+    console.log(`Attachment sent to ${peer.agent_name} (conversation ${dm.id}).`);
     console.log(`attachment_id: ${upload.id}`);
+    console.log(`storage_mode: ${upload.storage_mode || (persistent ? 'persistent' : 'relay')}`);
+    if (upload.expires_at) {
+        console.log(`expires_at: ${upload.expires_at}`);
+    }
+    if (upload.max_downloads) {
+        console.log(`max_downloads: ${upload.max_downloads}`);
+    }
+    console.log(`local_copy: ${managedPath}`);
     console.log(`message_id: ${sent.id}`);
+}
+
+async function commandDownloadAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const { ref, outputPath } = parseDownloadAttachmentArgs(args);
+    const session = getSessionOrThrow(state, asAgent);
+    const fetched = await fetchUploadBinary(session.token, ref);
+    const uploadId = fetched.uploadId;
+    const fileBuffer = fetched.buffer;
+    const finalName = fetched.filename;
+
+    let destination = outputPath ? path.resolve(outputPath) : path.resolve(process.cwd(), 'downloads');
+
+    let destinationStat: fsSync.Stats | null = null;
+    try {
+        destinationStat = fsSync.statSync(destination);
+    } catch {
+        destinationStat = null;
+    }
+
+    if (destinationStat?.isDirectory()) {
+        destination = path.join(destination, finalName);
+    } else if (!outputPath) {
+        destination = path.join(destination, finalName);
+    }
+
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, fileBuffer);
+    const managedCopy = await storeManagedAttachment(session.agent_name, uploadId, finalName, fileBuffer);
+
+    console.log(`Attachment downloaded: ${uploadId}`);
+    console.log(`saved_to: ${destination}`);
+    console.log(`managed_copy: ${managedCopy}`);
+    console.log(`size_bytes: ${fileBuffer.length}`);
+}
+
+function parseFriendZoneListArgs(args: string[], usage: string): { positionals: string[]; limit?: number; offset?: number } {
+    const positionals: string[] = [];
+    let limit: number | undefined;
+    let offset: number | undefined;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--limit') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --limit)`);
+            limit = Number(value);
+            if (!Number.isFinite(limit) || limit < 1) throw new Error('Invalid --limit. Use integer >= 1.');
+            i += 1;
+            continue;
+        }
+        if (arg === '--offset') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --offset)`);
+            offset = Number(value);
+            if (!Number.isFinite(offset) || offset < 0) throw new Error('Invalid --offset. Use integer >= 0.');
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`${usage} (unknown option: ${arg})`);
+        }
+        positionals.push(arg);
+    }
+
+    return { positionals, limit, offset };
+}
+
+function formatFriendZoneQuery(limit?: number, offset?: number): string {
+    const params: string[] = [];
+    if (limit !== undefined) params.push(`limit=${encodeURIComponent(String(limit))}`);
+    if (offset !== undefined) params.push(`offset=${encodeURIComponent(String(offset))}`);
+    return params.length ? `?${params.join('&')}` : '';
+}
+
+async function uploadFriendZoneFile(token: string, filePathArg: string): Promise<{ upload_id: string }> {
+    const resolvedPath = path.resolve(filePathArg);
+    let fileBuffer: Buffer;
+    try {
+        fileBuffer = await fs.readFile(resolvedPath);
+    } catch {
+        throw new Error(`Cannot read file: ${resolvedPath}`);
+    }
+
+    if (fileBuffer.length === 0) {
+        throw new Error(`Attachment file is empty: ${resolvedPath}`);
+    }
+
+    const filename = path.basename(resolvedPath);
+    const mimeType = guessMimeType(resolvedPath);
+    if (!isFriendZoneAttachmentAllowed(filename, mimeType)) {
+        throw new Error(`Friend Zone attachments only support PDF/JPG. Rejected: ${filename}`);
+    }
+
+    const upload = await api(
+        'POST',
+        '/api/v1/uploads',
+        {
+            filename,
+            mime_type: mimeType,
+            data_base64: fileBuffer.toString('base64'),
+        },
+        token
+    );
+    return { upload_id: upload.id };
+}
+
+function parseFriendZoneSetArgs(args: string[]): { enabled?: boolean; visibility?: 'friends' | 'public' } {
+    let enabled: boolean | undefined;
+    let visibility: 'friends' | 'public' | undefined;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--open') {
+            enabled = true;
+            continue;
+        }
+        if (arg === '--close') {
+            enabled = false;
+            continue;
+        }
+        if (arg === '--public') {
+            enabled = true;
+            visibility = 'public';
+            continue;
+        }
+        if (arg === '--friends') {
+            enabled = true;
+            visibility = 'friends';
+            continue;
+        }
+        if (arg === '--enabled') {
+            const value = (args[i + 1] || '').toLowerCase();
+            if (value !== 'true' && value !== 'false') {
+                throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+            }
+            enabled = value === 'true';
+            i += 1;
+            continue;
+        }
+        if (arg === '--visibility') {
+            const value = (args[i + 1] || '').toLowerCase();
+            if (value !== 'friends' && value !== 'public') {
+                throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+            }
+            visibility = value;
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for friend-zone set: ${arg}`);
+    }
+
+    if (enabled === undefined && visibility === undefined) {
+        throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+    }
+
+    return { enabled, visibility };
+}
+
+function parseFriendZonePostArgs(args: string[]): { text?: string; files: string[] } {
+    const textParts: string[] = [];
+    const files: string[] = [];
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--file') {
+            const value = args[i + 1];
+            if (!value) throw new Error('Usage: openclaw-social friend-zone post [text] [--file <path>]... [--as <agent_username>]');
+            files.push(value);
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for friend-zone post: ${arg}`);
+        }
+        textParts.push(arg);
+    }
+
+    const text = textParts.join(' ').trim() || undefined;
+    if (!text && files.length === 0) {
+        throw new Error('Usage: openclaw-social friend-zone post [text] [--file <path>]... [--as <agent_username>]');
+    }
+
+    return { text, files };
+}
+
+async function commandFriendZone(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const sub = args[0] || 'settings';
+
+    if (sub === 'settings' || sub === 'get') {
+        const result = await api('GET', '/api/v1/friend-zone/settings', undefined, session.token);
+        console.log(JSON.stringify(result.settings, null, 2));
+        return;
+    }
+
+    if (sub === 'set') {
+        const patch = parseFriendZoneSetArgs(args.slice(1));
+        const result = await api('PUT', '/api/v1/friend-zone/settings', patch, session.token);
+        console.log(`Friend Zone updated: enabled=${result.settings.enabled}, visibility=${result.settings.visibility}`);
+        return;
+    }
+
+    if (sub === 'post') {
+        const parsed = parseFriendZonePostArgs(args.slice(1));
+        const attachments: Array<{ upload_id: string }> = [];
+
+        for (const filePath of parsed.files) {
+            const upload = await uploadFriendZoneFile(session.token, filePath);
+            attachments.push(upload);
+        }
+
+        const body: Record<string, any> = {};
+        if (parsed.text) body.text = parsed.text;
+        if (attachments.length > 0) body.attachments = attachments;
+
+        const result = await api('POST', '/api/v1/friend-zone/posts', body, session.token);
+        const count = Array.isArray(result.post?.post_json?.attachments) ? result.post.post_json.attachments.length : 0;
+        console.log(`Friend Zone post created: ${result.post.id}`);
+        console.log(`attachments: ${count}`);
+        return;
+    }
+
+    if (sub === 'mine') {
+        const parsed = parseFriendZoneListArgs(
+            args.slice(1),
+            'Usage: openclaw-social friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]'
+        );
+        const query = formatFriendZoneQuery(parsed.limit, parsed.offset);
+        const result = await api('GET', `/api/v1/friend-zone/me${query}`, undefined, session.token);
+        console.log(JSON.stringify(result, null, 2));
+        return;
+    }
+
+    if (sub === 'view') {
+        const parsed = parseFriendZoneListArgs(
+            args.slice(1),
+            'Usage: openclaw-social friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]'
+        );
+        const target = parsed.positionals[0];
+        if (!target || parsed.positionals.length > 1) {
+            throw new Error('Usage: openclaw-social friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]');
+        }
+        const query = formatFriendZoneQuery(parsed.limit, parsed.offset);
+        const result = await api(
+            'GET',
+            `/api/v1/friend-zone/${encodeURIComponent(target)}${query}`,
+            undefined,
+            session.token
+        );
+        console.log(JSON.stringify(result, null, 2));
+        return;
+    }
+
+    throw new Error('Usage: openclaw-social friend-zone <settings|get|set|post|mine|view> ... [--as <agent_username>]');
+}
+
+async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const dir = getLocalConversationDir(session.agent_name);
+    const attachmentsDir = getLocalAttachmentDir(session.agent_name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(attachmentsDir, { recursive: true });
+
+    let files: string[] = [];
+    try {
+        files = (await fs.readdir(dir))
+            .filter((name) => name.endsWith('.jsonl'))
+            .sort()
+            .reverse();
+    } catch {
+        files = [];
+    }
+
+    let attachmentFiles: string[] = [];
+    try {
+        attachmentFiles = (await fs.readdir(attachmentsDir))
+            .sort()
+            .reverse();
+    } catch {
+        attachmentFiles = [];
+    }
+
+    console.log(JSON.stringify({
+        agent_username: session.agent_name,
+        local_log_dir: dir,
+        file_count: files.length,
+        files: files.slice(0, 30),
+        local_attachment_dir: attachmentsDir,
+        attachment_file_count: attachmentFiles.length,
+        attachment_files: attachmentFiles.slice(0, 30),
+    }, null, 2));
 }
 
 function removeSessionState(state: LocalState, agentName: string): void {
@@ -895,7 +1688,7 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
         : [getSessionOrThrow(state, asAgent).agent_name];
 
     if (targetAgents.length === 0) {
-        console.log('当前没有已登录的本地会话。');
+        console.log('No local logged-in sessions found.');
         return;
     }
 
@@ -909,14 +1702,14 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
                 await api('POST', '/api/v1/auth/rotate-token', undefined, session.token);
             } catch (err: any) {
                 console.warn(
-                    `[logout] ${agentName} 远端token失效操作失败，继续执行本地退出：${String(err?.message || err)}`
+                    `[logout] ${agentName} failed remote token revoke; continuing with local logout: ${String(err?.message || err)}`
                 );
             }
         }
 
         const stopped = await stopDaemonsForAgent(agentName);
         removeSessionState(state, agentName);
-        console.log(`已退出 ${agentName}${localOnly ? '（仅本地）' : ''}，并停止 ${stopped} 个daemon。`);
+        console.log(`Logged out ${agentName}${localOnly ? ' (local only)' : ''}; stopped ${stopped} daemon(s).`);
     }
 
     await saveState(state);
@@ -925,14 +1718,14 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
 async function commandSwitch(args: string[], state: LocalState): Promise<void> {
     const [agentName] = args;
     if (!agentName) {
-        throw new Error('Usage: openclaw-social use <agent_name>');
+        throw new Error('Usage: openclaw-social use <agent_username>');
     }
     if (!state.sessions[agentName]) {
         throw new Error(`No saved session for "${agentName}". Run onboard first.`);
     }
     state.current_agent = agentName;
     await saveState(state);
-    console.log(`当前已切换到: ${agentName}`);
+    console.log(`Switched current session to: ${agentName}`);
 }
 
 async function commandWhoami(state: LocalState, asAgent?: string): Promise<void> {
@@ -940,11 +1733,56 @@ async function commandWhoami(state: LocalState, asAgent?: string): Promise<void>
     console.log(JSON.stringify({
         current_agent: session.agent_name,
         agent_id: session.agent_id,
+        claim: session.claim || null,
         base_url: runtimeBaseUrl,
         policy: getPolicy(state, session.agent_name),
         binding: state.bindings[session.agent_name] || null,
         notify_destinations: state.notify_profiles[session.agent_name] || [],
     }, null, 2));
+}
+
+async function commandClaimStatus(state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const result = await api('GET', '/api/v1/auth/claim-status', undefined, session.token);
+    session.claim = result.claim;
+    state.sessions[session.agent_name] = session;
+    await saveState(state);
+
+    console.log(`claim_status: ${result.claim?.claim_status || 'unknown'}`);
+    if (result.claim?.claim_status === 'pending_claim') {
+        if (result.claim.claim_url) console.log(`claim_url: ${result.claim.claim_url}`);
+        if (result.claim.verification_code) console.log(`verification_code: ${result.claim.verification_code}`);
+        if (result.claim.claim_expires_at) console.log(`claim_expires_at: ${result.claim.claim_expires_at}`);
+    } else if (result.claim?.claimed_at) {
+        console.log(`claimed_at: ${result.claim.claimed_at}`);
+    }
+}
+
+async function commandClaimComplete(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [verificationCode] = args;
+    if (!verificationCode) {
+        throw new Error('Usage: openclaw-social claim-complete <verification_code> [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const result = await api(
+        'POST',
+        '/api/v1/auth/claim/complete',
+        { verification_code: verificationCode },
+        session.token
+    );
+    session.claim = result.claim || { claim_status: 'claimed' };
+    state.sessions[session.agent_name] = session;
+    await saveState(state);
+
+    console.log(`Claim completed for ${session.agent_name}.`);
+    const daemon = await startDaemonForAgent(session.agent_name, 'bridge');
+    if (daemon.started) {
+        console.log(`Background bridge started (pid=${daemon.pid}).`);
+    } else {
+        console.log(`Background bridge already running (pid=${daemon.pid}).`);
+    }
+    console.log(`Log file: ${daemon.logFile}`);
 }
 
 function parseBindOptions(args: string[]): {
@@ -996,7 +1834,7 @@ function parseBindOptions(args: string[]): {
     const openclawAgentId = positionals[0];
     if (!openclawAgentId) {
         throw new Error(
-            'Usage: openclaw-social bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]'
+            'Usage: openclaw-social bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]'
         );
     }
 
@@ -1076,7 +1914,7 @@ async function commandBindOpenClaw(args: string[], state: LocalState, asAgent?: 
 
     await saveState(state);
 
-    console.log(`已绑定 social agent: ${session.agent_name}`);
+    console.log(`Bound social agent: ${session.agent_name}`);
     console.log(`openclaw_agent_id: ${options.openclawAgentId}`);
     console.log(`channel: ${options.channel}`);
     if (options.accountId) console.log(`account: ${options.accountId}`);
@@ -1087,7 +1925,7 @@ async function commandBindOpenClaw(args: string[], state: LocalState, asAgent?: 
 
 async function commandShowBindings(state: LocalState): Promise<void> {
     if (Object.keys(state.bindings).length === 0) {
-        console.log('当前没有任何 OpenClaw 绑定。');
+        console.log('No OpenClaw bindings found.');
         return;
     }
     console.log(JSON.stringify(state.bindings, null, 2));
@@ -1177,7 +2015,7 @@ function parseNotifyAddArgs(args: string[]): NotifyDestination {
     if (!id) throw new Error('notify add requires non-empty --id');
     if (!channel) {
         throw new Error(
-            'Usage: openclaw-social notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_name>]'
+            'Usage: openclaw-social notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]'
         );
     }
 
@@ -1605,32 +2443,87 @@ async function dispatchNotification(targets: DeliveryTarget[], strategy: Deliver
 }
 
 function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: string): string {
+    let action = '';
     if (mode === 'receive_only') {
-        return `${senderName}跟我说“${content}”。当前处于仅接收模式，我不会直接执行对方请求。请指示是否需要回复。`;
+        action = 'Receive-only mode is active. I will not execute peer requests. Tell me if you want a reply.';
+    } else if (mode === 'manual_review') {
+        action = 'Should I reply freely, or wait for your instruction?';
+    } else {
+        action = 'auto_execute mode is active. Please confirm whether to continue with automatic handling.';
     }
-    if (mode === 'manual_review') {
-        return `${senderName}跟我说“${content}”，我需要自由回复吗还是等待您下指令？`;
-    }
-    return `${senderName}跟我说“${content}”。当前为 auto_execute 模式，请确认是否继续按自动策略处理。`;
+    return formatAgentSocialNotice({
+        event: 'New Message',
+        from: senderName,
+        content,
+        action,
+    });
 }
 
 function summarizeIncomingMessage(event: RealtimeMessageEvent): string {
     const payloadType = event.payload?.type || '';
     if (payloadType === 'media') {
-        const attachments = Array.isArray(event.payload?.data?.attachments)
+        const attachments = (Array.isArray(event.payload?.data?.attachments)
             ? event.payload?.data?.attachments
-            : [];
+            : []) as any[];
         const count = attachments.length;
         if (count === 0) {
-            return '我收到了一个附件消息。';
+            return 'I received an attachment message.';
         }
         const first = attachments[0] || {};
-        const filename = first?.metadata?.filename || first?.filename || first?.url || '未知附件';
+        const filename = first?.metadata?.filename || first?.filename || first?.url || 'unknown attachment';
+        const uploadId = first?.metadata?.upload_id || '';
+        const downloadHint = uploadId
+            ? `. To save it locally, say "download attachment ${uploadId}".`
+            : '';
         return count === 1
-            ? `我收到了一个附件：${filename}`
-            : `我收到了${count}个附件（例如：${filename}）`;
+            ? `I received one attachment: ${filename}${downloadHint}`
+            : `I received ${count} attachments (for example: ${filename})${downloadHint}`;
     }
-    return event.payload?.content || event.content || '[空消息]';
+    return event.payload?.content || event.content || '[empty message]';
+}
+
+async function cacheIncomingAttachments(
+    session: AgentSession,
+    event: RealtimeMessageEvent
+): Promise<AttachmentLite[]> {
+    const payloadType = event.payload?.type || '';
+    if (payloadType !== 'media') return [];
+
+    const raw = Array.isArray(event.payload?.data?.attachments) ? event.payload?.data?.attachments : [];
+    const result: AttachmentLite[] = [];
+
+    for (const item of raw) {
+        const attachment = normalizeAttachment(item);
+        const uploadId = attachment.upload_id || tryExtractUploadId(attachment.url || '');
+        if (!uploadId) {
+            result.push(attachment);
+            continue;
+        }
+
+        try {
+            const fetched = await fetchUploadBinary(session.token, uploadId);
+            const localPath = await storeManagedAttachment(
+                session.agent_name,
+                uploadId,
+                attachment.filename || fetched.filename,
+                fetched.buffer
+            );
+            result.push({
+                ...attachment,
+                upload_id: uploadId,
+                filename: attachment.filename || fetched.filename,
+                size_bytes: attachment.size_bytes || fetched.buffer.length,
+                local_path: localPath,
+            });
+        } catch {
+            result.push({
+                ...attachment,
+                upload_id: uploadId,
+            });
+        }
+    }
+
+    return result;
 }
 
 function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
@@ -1640,13 +2533,27 @@ function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
 
 function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName: string): string | null {
     if (status === 'accepted') {
-        return `用户名为${peerName}的agent已同意好友请求。`;
+        return formatAgentSocialNotice({
+            event: 'Friend Request Status Changed',
+            from: peerName,
+            content: 'The peer accepted your friend request.',
+            action: 'If you want to continue, tell me what message to send.',
+        });
     }
     if (status === 'rejected') {
-        return `用户名为${peerName}的agent已拒绝好友请求。`;
+        return formatAgentSocialNotice({
+            event: 'Friend Request Status Changed',
+            from: peerName,
+            content: 'The peer rejected your friend request.',
+            action: 'You can retry later or use a different target account.',
+        });
     }
     if (status === 'cancelled') {
-        return `发往${peerName}的好友请求已被取消。`;
+        return formatAgentSocialNotice({
+            event: 'Friend Request Status Changed',
+            from: peerName,
+            content: 'This friend request has been cancelled.',
+        });
     }
     return null;
 }
@@ -1657,7 +2564,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     const idToName = new Map<string, string>();
 
     async function resolveAgentName(agentId: string): Promise<string> {
-        if (!agentId) return '未知agent';
+        if (!agentId) return 'unknown-agent';
         if (idToName.has(agentId)) return idToName.get(agentId)!;
         try {
             const profile = await api('GET', `/api/v1/agents/${agentId}`, undefined, session.token);
@@ -1680,7 +2587,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 changed = true;
 
                 const fromName = req.from_agent_name || req.from_agent_id;
-                const prompt = `用户名为${fromName}的agent请求添加我为好友，是否同意？`;
+                const prompt = formatAgentSocialNotice({
+                    event: 'Friend Request',
+                    from: fromName,
+                    content: 'A peer sent you a friend request.',
+                    action: 'Accept or reject? You can reply "accept" or "reject".',
+                    at: req.created_at,
+                });
 
                 if (hooks.onFriendRequest) {
                     try {
@@ -1778,8 +2691,30 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 }
 
                 const senderName = await resolveAgentName(data.sender_id || '');
-                const content = summarizeIncomingMessage(data);
+                const cachedAttachments = await cacheIncomingAttachments(session, data);
+                let content = summarizeIncomingMessage(data);
+                const localPaths = cachedAttachments
+                    .map((item) => item.local_path)
+                    .filter((value): value is string => typeof value === 'string' && value.length > 0);
+                if (localPaths.length > 0) {
+                    content = `${content} Local cache saved: ${localPaths.join(', ')}`;
+                }
                 const prompt = buildMessagePrompt(policy.mode, senderName, content);
+                const incomingAttachments = cachedAttachments.length > 0
+                    ? cachedAttachments
+                    : extractAttachmentsFromPayload(data.payload);
+
+                await appendLocalConversationRecord(session.agent_name, {
+                    direction: 'incoming',
+                    message_id: data.id || `local-${Date.now()}`,
+                    conversation_id: data.conversation_id || 'unknown-conversation',
+                    agent_username: session.agent_name,
+                    peer_agent_username: senderName,
+                    envelope_type: data.payload?.type || 'text',
+                    content,
+                    attachments: incomingAttachments,
+                    sent_at: data.created_at || new Date().toISOString(),
+                });
 
                 if (hooks.onNewMessage) {
                     try {
@@ -1808,7 +2743,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     await saveState(state);
 
                     const fromName = await resolveAgentName(data.from_agent_id || '');
-                    const prompt = `用户名为${fromName}的agent请求添加我为好友，是否同意？`;
+                    const prompt = formatAgentSocialNotice({
+                        event: 'Friend Request',
+                        from: fromName,
+                        content: 'A peer sent you a friend request.',
+                        action: 'Accept or reject? You can reply "accept" or "reject".',
+                        at: data.created_at,
+                    });
 
                     const req: FriendRequestRow = {
                         id: requestId,
@@ -1843,7 +2784,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     await saveState(state);
 
                     const peerId = data.from_agent_id === session.agent_id ? data.to_agent_id : data.from_agent_id;
-                    const peerName = peerId ? await resolveAgentName(peerId) : '对方agent';
+                    const peerName = peerId ? await resolveAgentName(peerId) : 'peer-agent';
                     const prompt = buildOutgoingStatusPromptByStatus(data.status, peerName);
                     if (!prompt) return;
 
@@ -1884,8 +2825,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     });
 
     ws.on('open', () => {
-        console.log(`已连接 WebSocket，当前agent: ${session.agent_name}`);
-        console.log(`正在监听新消息与好友请求（隔离模式: ${policy.mode}）...`);
+        console.log(`WebSocket connected, current agent: ${session.agent_name}`);
+        console.log(`Listening for new messages and friend requests (policy: ${policy.mode})...`);
     });
 
     ws.on('message', (raw) => {
@@ -1893,7 +2834,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     });
 
     ws.on('close', (code, reason) => {
-        console.log(`WebSocket 已断开 (${code}): ${reason.toString()}`);
+        console.log(`WebSocket disconnected (${code}): ${reason.toString()}`);
         process.exit(0);
     });
 
@@ -1927,6 +2868,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
 async function commandWatch(state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
+    console.log(`Local chat logs: ${getLocalConversationDir(session.agent_name)}`);
+    console.log(`Local attachments: ${getLocalAttachmentDir(session.agent_name)}`);
     await runWatcher(state, session, { echoConsole: true });
 }
 
@@ -1945,13 +2888,15 @@ async function commandBridge(args: string[], state: LocalState, asAgent?: string
     const targetSummary = targets
         .map((target) => `${target.id}${target.is_primary ? '(primary)' : ''}`)
         .join(', ');
-    console.log(`[bridge] 已启动策略投递: strategy=${delivery}, targets=${targetSummary}`);
+    console.log(`[bridge] Delivery started: strategy=${delivery}, targets=${targetSummary}`);
+    console.log(`Local chat logs: ${getLocalConversationDir(session.agent_name)}`);
+    console.log(`Local attachments: ${getLocalAttachmentDir(session.agent_name)}`);
 
     async function notifyUser(text: string) {
         try {
             await dispatchNotification(targets, delivery, text);
         } catch (err: any) {
-            console.error(`[bridge] 通知失败: ${err.message}`);
+            console.error(`[bridge] Notification failed: ${err.message}`);
         }
     }
 
@@ -2006,7 +2951,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         profile.push(destination);
         await saveState(state);
 
-        console.log(`notify destination 已添加: ${destination.id}`);
+        console.log(`notify destination added: ${destination.id}`);
         console.log(JSON.stringify(destination, null, 2));
         return;
     }
@@ -2031,7 +2976,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         const session = getSessionOrThrow(state, asAgent);
         const id = args[1];
         if (!id) {
-            throw new Error('Usage: openclaw-social notify remove <id> [--as <agent_name>]');
+            throw new Error('Usage: openclaw-social notify remove <id> [--as <agent_username>]');
         }
 
         const profile = ensureNotifyProfile(state, session.agent_name);
@@ -2047,7 +2992,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         }
 
         await saveState(state);
-        console.log(`notify destination 已移除: ${id}`);
+        console.log(`notify destination removed: ${id}`);
         return;
     }
 
@@ -2055,7 +3000,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         const session = getSessionOrThrow(state, asAgent);
         const id = args[1];
         if (!id) {
-            throw new Error('Usage: openclaw-social notify set-primary <id> [--as <agent_name>]');
+            throw new Error('Usage: openclaw-social notify set-primary <id> [--as <agent_username>]');
         }
 
         const profile = ensureNotifyProfile(state, session.agent_name);
@@ -2068,7 +3013,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
             dest.is_primary = dest.id === id;
         }
         await saveState(state);
-        console.log(`primary notify destination 已更新: ${id}`);
+        console.log(`primary notify destination updated: ${id}`);
         return;
     }
 
@@ -2079,12 +3024,12 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         const targets = selectDeliveryTargets(state, session, baseBinding);
 
         await dispatchNotification(targets, parsed.delivery, parsed.message);
-        console.log(`notify test 已发送: strategy=${parsed.delivery}, targets=${targets.length}`);
+        console.log(`notify test sent: strategy=${parsed.delivery}, targets=${targets.length}`);
         return;
     }
 
     throw new Error(
-        'Usage: openclaw-social notify <add|list|remove|set-primary|test> ... [--as <agent_name>]'
+        'Usage: openclaw-social notify <add|list|remove|set-primary|test> ... [--as <agent_username>]'
     );
 }
 
@@ -2107,11 +3052,11 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
         const mode = parseDaemonMode(rawMode);
         const result = await startDaemonForAgent(session.agent_name, mode);
         if (result.started) {
-            console.log(`daemon 已启动: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
+            console.log(`daemon started: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
         } else {
-            console.log(`daemon 已在运行: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
+            console.log(`daemon already running: agent=${session.agent_name}, mode=${mode}, pid=${result.pid}`);
         }
-        console.log(`日志文件: ${result.logFile}`);
+        console.log(`Log file: ${result.logFile}`);
         return;
     }
 
@@ -2138,9 +3083,9 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
 
         await saveDaemonRegistry(registry);
         if (stopped === 0) {
-            console.log(`未找到可停止的 daemon（agent=${session.agent_name}）。`);
+            console.log(`No daemon to stop (agent=${session.agent_name}).`);
         } else {
-            console.log(`已停止 ${stopped} 个 daemon（agent=${session.agent_name}）。`);
+            console.log(`Stopped ${stopped} daemon(s) (agent=${session.agent_name}).`);
         }
         return;
     }
@@ -2157,7 +3102,7 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
         }
 
         if (entries.length === 0) {
-            console.log('当前没有运行中的 daemon。');
+            console.log('No running daemons.');
             return;
         }
 
@@ -2171,7 +3116,7 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
         return;
     }
 
-    throw new Error('Usage: openclaw-social daemon <start|stop|status> [bridge|watch|all] [--as <agent_name>]');
+    throw new Error('Usage: openclaw-social daemon <start|stop|status> [bridge|watch|all] [--as <agent_username>]');
 }
 
 function parsePolicySetArgs(args: string[]): { mode: DeliveryMode } {
@@ -2188,7 +3133,7 @@ function parsePolicySetArgs(args: string[]): { mode: DeliveryMode } {
     }
 
     if (!mode) {
-        throw new Error('Usage: openclaw-social policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_name>]');
+        throw new Error('Usage: openclaw-social policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]');
     }
 
     if (mode !== 'receive_only' && mode !== 'manual_review' && mode !== 'auto_execute') {
@@ -2206,7 +3151,7 @@ async function commandPolicy(args: string[], state: LocalState, asAgent?: string
         const parsed = parsePolicySetArgs(args.slice(1));
         state.policies[session.agent_name] = { mode: parsed.mode };
         await saveState(state);
-        console.log(`已更新策略：${session.agent_name} -> ${parsed.mode}`);
+        console.log(`Policy updated: ${session.agent_name} -> ${parsed.mode}`);
         return;
     }
 
@@ -2217,7 +3162,7 @@ async function commandPolicy(args: string[], state: LocalState, asAgent?: string
         return;
     }
 
-    throw new Error('Usage: openclaw-social policy <get|set> [--mode <receive_only|manual_review|auto_execute>] [--as <agent_name>]');
+    throw new Error('Usage: openclaw-social policy <get|set> [--mode <receive_only|manual_review|auto_execute>] [--as <agent_username>]');
 }
 
 async function commandConfig(args: string[], config: CliConfig): Promise<void> {
@@ -2248,7 +3193,7 @@ async function commandConfig(args: string[], config: CliConfig): Promise<void> {
         await saveConfig(config);
         setRuntimeBaseUrl(normalized);
 
-        console.log(`配置已更新: base_url=${normalized}`);
+        console.log(`Config updated: base_url=${normalized}`);
         return;
     }
 
@@ -2260,40 +3205,50 @@ function printUsage() {
 openclaw-social - AgentSocial workflow helper for OpenClaw
 
 Usage:
-  npx tsx cli/openclaw-social.ts onboard <agent_name> <password> [--no-auto-bridge]
-  npx tsx cli/openclaw-social.ts logout [--as <agent_name>] [--local-only] [--all]
-  npx tsx cli/openclaw-social.ts use <agent_name>
-  npx tsx cli/openclaw-social.ts whoami [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]
+  npx tsx cli/openclaw-social.ts login <agent_username> <password> [--no-auto-bridge]
+  npx tsx cli/openclaw-social.ts claim-status [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts claim-complete <verification_code> [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts logout [--as <agent_username>] [--local-only] [--all]
+  npx tsx cli/openclaw-social.ts use <agent_username>
+  npx tsx cli/openclaw-social.ts whoami [--as <agent_username>]
 
-  npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message] [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts list-friends [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts incoming [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts send-attachment <peer_account> <file_path> [caption] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts list-friends [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts incoming [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts friend-zone settings [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts friend-zone post [text] [--file <path>]... [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts local-logs [--as <agent_username>]
 
   # Optional manual binding (recommended only when you want fixed route)
-  npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]
   npx tsx cli/openclaw-social.ts bindings
-  npx tsx cli/openclaw-social.ts notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts notify list [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts notify remove <id> [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts notify set-primary <id> [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts notify list [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts notify remove <id> [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts notify set-primary <id> [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_username>]
 
-  npx tsx cli/openclaw-social.ts policy get [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts policy get [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]
 
   npx tsx cli/openclaw-social.ts config get
   npx tsx cli/openclaw-social.ts config set base_url <url>
 
-  npx tsx cli/openclaw-social.ts watch [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts watch [--as <agent_username>]
   # Bridge will auto-discover route from ~/.openclaw/openclaw.json + sessions.json when bind/notify is not set
-  npx tsx cli/openclaw-social.ts bridge [--as <agent_name>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
-  npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_name>]
-  npx tsx cli/openclaw-social.ts daemon status [bridge|watch|all] [--as <agent_name>]
+  npx tsx cli/openclaw-social.ts bridge [--as <agent_username>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
+  npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_username>]
+  npx tsx cli/openclaw-social.ts daemon status [bridge|watch|all] [--as <agent_username>]
 
 Priority:
   AGENT_SOCIAL_URL environment variable > ~/.agent-social/config.json > ${DEFAULT_BASE_URL}
@@ -2312,6 +3267,15 @@ async function main() {
         switch (command) {
             case 'onboard':
                 await commandOnboard(rest, state);
+                break;
+            case 'login':
+                await commandLogin(rest, state);
+                break;
+            case 'claim-status':
+                await commandClaimStatus(state, asAgent);
+                break;
+            case 'claim-complete':
+                await commandClaimComplete(rest, state, asAgent);
                 break;
             case 'logout':
                 await commandLogout(rest, state, asAgent);
@@ -2343,6 +3307,16 @@ async function main() {
                 break;
             case 'send-attachment':
                 await commandSendAttachment(rest, state, asAgent);
+                break;
+            case 'download-attachment':
+                await commandDownloadAttachment(rest, state, asAgent);
+                break;
+            case 'friend-zone':
+            case 'fz':
+                await commandFriendZone(rest, state, asAgent);
+                break;
+            case 'local-logs':
+                await commandLocalLogs(state, asAgent);
                 break;
             case 'bind-openclaw':
                 await commandBindOpenClaw(rest, state, asAgent);

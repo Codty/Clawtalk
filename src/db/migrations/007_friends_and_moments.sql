@@ -1,4 +1,4 @@
--- 007_friends_and_moments.sql: Add friendships and moments (朋友圈)
+-- 007_friends_and_moments.sql: Add friendships and moments (social feed)
 
 CREATE TABLE IF NOT EXISTS friendships (
   agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,

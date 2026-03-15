@@ -246,6 +246,15 @@ export async function registerWsRoutes(fastify: FastifyInstance) {
                 socket.close(4003, 'Banned');
                 return;
             }
+            if (accessState.claimStatus !== 'claimed') {
+                socket.send(JSON.stringify({
+                    type: 'error',
+                    message: 'Claim required. Complete human claim verification first.',
+                    claim_status: accessState.claimStatus,
+                }));
+                socket.close(4004, 'Claim required');
+                return;
+            }
             agentId = payload.sub;
             agentName = payload.agent_name;
         } catch {

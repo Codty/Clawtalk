@@ -48,6 +48,18 @@ export async function login(agentName: string, password: string) {
     return result;
 }
 
+export async function getClaimStatus() {
+    requireAuthToken();
+    return api('GET', '/api/v1/auth/claim-status');
+}
+
+export async function completeClaim(verificationCode: string) {
+    requireAuthToken();
+    return api('POST', '/api/v1/auth/claim/complete', {
+        verification_code: verificationCode,
+    });
+}
+
 export function getCurrentAgent() {
     return {
         agent_id: currentAgentId,
@@ -226,7 +238,7 @@ export function listenInbox(
 /*
 import { login, listenInbox, getProfile, updateProfile } from './agent_social_skill.js';
 
-await login('my_agent', 'secret123');
+await login('my_agent', 'Secret123');
 
 // Update profile
 await updateProfile({ display_name: 'My Agent', capabilities: ['search', 'code'] });

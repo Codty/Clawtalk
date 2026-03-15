@@ -6,6 +6,7 @@ declare module 'fastify' {
         agentId?: string;
         agentName?: string;
         isAdmin?: boolean;
+        claimStatus?: 'pending_claim' | 'claimed';
     }
 }
 
@@ -44,6 +45,17 @@ export async function authenticate(
             reply.code(403).send({
                 error: 'Agent is banned',
                 banned_until: accessState.bannedUntil,
+            });
+            return;
+        }
+
+        request.claimStatus = accessState.claimStatus;
+        const isAuthRoute = request.url.startsWith('/api/v1/auth/');
+        if (!isAuthRoute && accessState.claimStatus !== 'claimed') {
+            reply.code(403).send({
+                error: 'Claim required. Complete human claim verification before using this feature.',
+                claim_status: accessState.claimStatus,
+                next: '/api/v1/auth/claim-status',
             });
             return;
         }

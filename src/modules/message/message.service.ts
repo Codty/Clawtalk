@@ -4,6 +4,7 @@ import { assertMember } from '../conversation/conversation.service.js';
 import { config, VALID_ENVELOPE_TYPES } from '../../config.js';
 import type { MessageEnvelope, ConversationPolicy } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
+import { randomUUID } from 'crypto';
 
 export class MessageError extends Error {
     statusCode: number;
@@ -213,8 +214,11 @@ async function publishRealtimeEnvelope(
     const streamKey = `stream:conv:${conversationId}`;
     const createdAtIso = createdAt || new Date().toISOString();
     const payloadJson = JSON.stringify(envelope);
-    const streamEventId = await redis.xadd(
-        streamKey,
+    const streamArgs: any[] = [streamKey];
+    if (config.realtimeStreamMaxLen > 0) {
+        streamArgs.push('MAXLEN', '~', String(config.realtimeStreamMaxLen));
+    }
+    streamArgs.push(
         '*',
         'id', messageId,
         'conversation_id', conversationId,
@@ -223,6 +227,7 @@ async function publishRealtimeEnvelope(
         'payload', payloadJson,
         'created_at', createdAtIso
     );
+    const streamEventId = await (redis as any).xadd(...streamArgs);
 
     if (config.fanoutMode === 'pubsub') {
         await redis.publish(
@@ -237,6 +242,41 @@ async function publishRealtimeEnvelope(
                 created_at: createdAtIso,
             })
         );
+    }
+}
+
+function buildLocalOnlyMessageRow(
+    conversationId: string,
+    senderId: string,
+    content: string,
+    envelope: MessageEnvelope,
+    attachments: AttachmentInput[],
+    clientMsgId?: string
+): MessageRow {
+    const now = new Date().toISOString();
+    return {
+        id: randomUUID(),
+        conversation_id: conversationId,
+        sender_id: senderId,
+        content,
+        payload: envelope,
+        client_msg_id: clientMsgId || null,
+        created_at: now,
+        read_count: 0,
+        attachments: attachments.map((item) => ({
+            id: randomUUID(),
+            url: item.url,
+            mime_type: item.mime_type || null,
+            size_bytes: item.size_bytes || null,
+            metadata: item.metadata || {},
+            created_at: now,
+        })),
+    };
+}
+
+function assertServerMessageStorage(featureName: string): void {
+    if (config.messageStorageMode === 'local_only') {
+        throw new MessageError(`${featureName} is unavailable when MESSAGE_STORAGE_MODE=local_only`, 409);
     }
 }
 
@@ -279,6 +319,29 @@ export async function sendMessage(
         });
         throw new MessageError('Too many messages. Please slow down.', 429);
     }
+
+    if (config.messageStorageMode === 'local_only') {
+        const message = buildLocalOnlyMessageRow(
+            conversationId,
+            senderId,
+            content,
+            envelope,
+            attachments,
+            clientMsgId
+        );
+
+        await publishRealtimeEnvelope(
+            conversationId,
+            message.id,
+            senderId,
+            envelope,
+            content,
+            message.created_at
+        );
+
+        return message;
+    }
+
     const client = await pool.connect();
     let message: any;
     try {
@@ -363,6 +426,9 @@ export async function markMessagesRead(
     agentId: string,
     messageIds: string[]
 ): Promise<{ read_count: number }> {
+    if (config.messageStorageMode === 'local_only') {
+        return { read_count: 0 };
+    }
     await assertMember(conversationId, agentId);
     if (!Array.isArray(messageIds) || messageIds.length === 0) {
         return { read_count: 0 };
@@ -393,6 +459,7 @@ export async function recallMessage(
     requesterId: string,
     reason?: string
 ): Promise<MessageRow> {
+    assertServerMessageStorage('Message recall');
     await assertMember(conversationId, requesterId);
 
     const { rows } = await pool.query(
@@ -458,6 +525,7 @@ export async function deleteMessage(
     messageId: string,
     requesterId: string
 ): Promise<void> {
+    assertServerMessageStorage('Message delete');
     await assertMember(conversationId, requesterId);
     const { rows } = await pool.query(
         `SELECT sender_id, deleted_at
@@ -505,6 +573,10 @@ export async function getMessages(
     agentId: string,
     options: { before?: string; limit?: number } = {}
 ): Promise<MessageRow[]> {
+    if (config.messageStorageMode === 'local_only') {
+        await assertMember(conversationId, agentId);
+        return [];
+    }
     await assertMember(conversationId, agentId);
 
     const limit = Math.min(options.limit || 50, 100);

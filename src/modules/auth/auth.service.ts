@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { randomBytes } from 'crypto';
 import { pool } from '../../db/pool.js';
 import { config } from '../../config.js';
 import { redis } from '../../infra/redis.js';
@@ -24,6 +25,75 @@ export interface AgentAccessState {
     isAdmin: boolean;
     banActive: boolean;
     bannedUntil: string | null;
+    claimStatus: 'pending_claim' | 'claimed';
+    claimExpiresAt: string | null;
+}
+
+export interface ClaimState {
+    claim_status: 'pending_claim' | 'claimed';
+    verification_code?: string;
+    claim_token?: string;
+    claim_expires_at?: string | null;
+    claimed_at?: string | null;
+}
+
+const USERNAME_REGEX = /^(?!.*[._-]{2})[a-z][a-z0-9._-]{2,22}[a-z0-9]$/;
+const PASSWORD_LOWER_REGEX = /[a-z]/;
+const PASSWORD_UPPER_REGEX = /[A-Z]/;
+const CLAIM_TTL_HOURS = 48;
+
+function normalizeAgentName(agentName: string): string {
+    return (agentName || '').trim().toLowerCase();
+}
+
+function validateAgentName(agentName: string): void {
+    if (!USERNAME_REGEX.test(agentName)) {
+        throw new AuthError(
+            'Invalid Agent Username. Use 4-24 chars: lowercase letters, numbers, ".", "_" or "-", start with a letter, end with letter/number, no repeated separators.',
+            400
+        );
+    }
+}
+
+function validatePassword(password: string): void {
+    if (!password || password.length < 6 || password.length > 128) {
+        throw new AuthError('Invalid password. Length must be 6-128 characters.', 400);
+    }
+    if (!PASSWORD_LOWER_REGEX.test(password) || !PASSWORD_UPPER_REGEX.test(password)) {
+        throw new AuthError('Invalid password. Must include at least one lowercase and one uppercase letter.', 400);
+    }
+}
+
+function generateClaimToken(): string {
+    return randomBytes(24).toString('hex');
+}
+
+function generateClaimCode(length = 8): string {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = randomBytes(length);
+    let out = '';
+    for (let i = 0; i < length; i += 1) {
+        out += alphabet[bytes[i] % alphabet.length];
+    }
+    return out;
+}
+
+function isClaimExpired(claimExpiresAt: string | null): boolean {
+    if (!claimExpiresAt) return true;
+    const ts = new Date(claimExpiresAt).getTime();
+    if (!Number.isFinite(ts)) return true;
+    return ts <= Date.now();
+}
+
+function toClaimState(row: any): ClaimState {
+    const status = row.claim_status === 'pending_claim' ? 'pending_claim' : 'claimed';
+    return {
+        claim_status: status,
+        verification_code: status === 'pending_claim' ? (row.claim_code || undefined) : undefined,
+        claim_token: status === 'pending_claim' ? (row.claim_token || undefined) : undefined,
+        claim_expires_at: row.claim_expires_at ? new Date(row.claim_expires_at).toISOString() : null,
+        claimed_at: row.claimed_at ? new Date(row.claimed_at).toISOString() : null,
+    };
 }
 
 function isBanActive(isBanned: boolean, bannedUntil: string | null): boolean {
@@ -47,16 +117,25 @@ async function clearExpiredBan(agentId: string): Promise<void> {
 
 export async function getAgentAccessState(agentId: string): Promise<AgentAccessState> {
     const { rows } = await pool.query(
-        'SELECT id, is_admin, is_banned, banned_until FROM agents WHERE id = $1',
+        'SELECT id, is_admin, is_banned, banned_until, claim_status, claim_expires_at FROM agents WHERE id = $1',
         [agentId]
     );
     if (rows.length === 0) {
-        return { exists: false, isAdmin: false, banActive: false, bannedUntil: null };
+        return {
+            exists: false,
+            isAdmin: false,
+            banActive: false,
+            bannedUntil: null,
+            claimStatus: 'pending_claim',
+            claimExpiresAt: null,
+        };
     }
 
     const row = rows[0];
     const bannedUntil = row.banned_until ? new Date(row.banned_until).toISOString() : null;
     const active = isBanActive(row.is_banned, bannedUntil);
+    const claimStatus = row.claim_status === 'pending_claim' ? 'pending_claim' : 'claimed';
+    const claimExpiresAt = row.claim_expires_at ? new Date(row.claim_expires_at).toISOString() : null;
 
     if (row.is_banned && !active) {
         await clearExpiredBan(agentId);
@@ -67,6 +146,8 @@ export async function getAgentAccessState(agentId: string): Promise<AgentAccessS
         isAdmin: !!row.is_admin,
         banActive: active,
         bannedUntil,
+        claimStatus,
+        claimExpiresAt,
     };
 }
 
@@ -83,25 +164,90 @@ async function isRiskWhitelistedIp(ip: string): Promise<boolean> {
     }
 }
 
-export async function registerAgent(agentName: string, password: string) {
+export async function registerAgent(
+    agentName: string,
+    password: string,
+    options: {
+        friendZoneEnabled?: boolean;
+        friendZoneVisibility?: 'friends' | 'public';
+    } = {}
+) {
+    const normalizedName = normalizeAgentName(agentName);
+    validateAgentName(normalizedName);
+    validatePassword(password);
+    const friendZoneEnabled = options.friendZoneEnabled !== undefined ? !!options.friendZoneEnabled : true;
+    const friendZoneVisibility = options.friendZoneVisibility === 'public' ? 'public' : 'friends';
+
     const hash = await bcrypt.hash(password, 10);
+    const claimToken = generateClaimToken();
+    const claimCode = generateClaimCode();
     const { rows } = await pool.query(
-        `INSERT INTO agents (agent_name, password_hash)
-     VALUES ($1, $2)
-     RETURNING id, agent_name, token_version, created_at`,
-        [agentName, hash]
+        `INSERT INTO agents (
+             agent_name,
+             password_hash,
+             claim_status,
+             claim_token,
+             claim_code,
+             claim_expires_at,
+             friend_zone_enabled,
+             friend_zone_visibility
+         )
+         VALUES (
+             $1,
+             $2,
+             'pending_claim',
+             $3,
+             $4,
+             NOW() + ($5 || ' hours')::interval,
+             $6,
+             $7
+         )
+     RETURNING id, agent_name, token_version, created_at, claim_status, claim_token, claim_code, claim_expires_at, claimed_at`,
+        [normalizedName, hash, claimToken, claimCode, String(CLAIM_TTL_HOURS), friendZoneEnabled, friendZoneVisibility]
     );
     const agent = rows[0];
     const token = signToken(agent);
-    return { agent, token };
+    return { agent, token, claim: toClaimState(agent) };
+}
+
+async function refreshClaimChallengeByAgentId(agentId: string) {
+    const claimToken = generateClaimToken();
+    const claimCode = generateClaimCode();
+    const { rows } = await pool.query(
+        `UPDATE agents
+         SET claim_token = $2,
+             claim_code = $3,
+             claim_expires_at = NOW() + ($4 || ' hours')::interval,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, agent_name, token_version, claim_status, claim_token, claim_code, claim_expires_at, claimed_at`,
+        [agentId, claimToken, claimCode, String(CLAIM_TTL_HOURS)]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Agent not found', 404);
+    }
+    return rows[0];
+}
+
+async function ensureActiveClaimChallenge(agent: any) {
+    if (agent.claim_status !== 'pending_claim') {
+        return agent;
+    }
+    if (!agent.claim_token || !agent.claim_code || isClaimExpired(agent.claim_expires_at || null)) {
+        return refreshClaimChallengeByAgentId(agent.id);
+    }
+    return agent;
 }
 
 export async function loginAgent(agentName: string, password: string) {
+    const normalizedName = normalizeAgentName(agentName);
+
     const { rows } = await pool.query(
-        `SELECT id, agent_name, password_hash, token_version, is_banned, banned_until
+        `SELECT id, agent_name, password_hash, token_version, is_banned, banned_until,
+                claim_status, claim_token, claim_code, claim_expires_at, claimed_at
          FROM agents
-         WHERE agent_name = $1`,
-        [agentName]
+         WHERE LOWER(agent_name) = LOWER($1)`,
+        [normalizedName]
     );
     if (rows.length === 0) {
         throw new AuthError('Invalid credentials', 401);
@@ -121,10 +267,12 @@ export async function loginAgent(agentName: string, password: string) {
         throw new AuthError('Invalid credentials', 401);
     }
 
-    const token = signToken(agent);
+    const withClaim = await ensureActiveClaimChallenge(agent);
+    const token = signToken(withClaim);
     return {
-        agent: { id: agent.id, agent_name: agent.agent_name, token_version: agent.token_version },
+        agent: { id: withClaim.id, agent_name: withClaim.agent_name, token_version: withClaim.token_version },
         token,
+        claim: toClaimState(withClaim),
     };
 }
 
@@ -165,7 +313,7 @@ export function signWsToken(agent: { id: string; agent_name: string; token_versi
 
 export async function createWsToken(agentId: string) {
     const { rows } = await pool.query(
-        `SELECT id, agent_name, token_version, is_banned, banned_until
+        `SELECT id, agent_name, token_version, is_banned, banned_until, claim_status
          FROM agents
          WHERE id = $1`,
         [agentId]
@@ -182,10 +330,171 @@ export async function createWsToken(agentId: string) {
     if (agent.is_banned) {
         await clearExpiredBan(agent.id);
     }
+    if (agent.claim_status !== 'claimed') {
+        throw new AuthError('Claim required before using realtime channels', 403);
+    }
 
     return {
         ws_token: signWsToken(agent),
         expires_in_sec: config.wsTokenTtlSec,
+    };
+}
+
+export async function getClaimStatusForAgent(agentId: string): Promise<{ agent_id: string; agent_name: string; claim: ClaimState }> {
+    const { rows } = await pool.query(
+        `SELECT id, agent_name, claim_status, claim_token, claim_code, claim_expires_at, claimed_at
+         FROM agents
+         WHERE id = $1`,
+        [agentId]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Agent not found', 404);
+    }
+    const row = await ensureActiveClaimChallenge(rows[0]);
+    return {
+        agent_id: row.id,
+        agent_name: row.agent_name,
+        claim: toClaimState(row),
+    };
+}
+
+export async function completeClaimForAgent(agentId: string, verificationCode: string): Promise<{
+    agent_id: string;
+    agent_name: string;
+    claim: ClaimState;
+}> {
+    const normalized = (verificationCode || '').trim().toUpperCase();
+    if (!normalized) {
+        throw new AuthError('verification_code is required', 400);
+    }
+
+    const { rows } = await pool.query(
+        `SELECT id, agent_name, claim_status, claim_code, claim_expires_at, claimed_at
+         FROM agents
+         WHERE id = $1`,
+        [agentId]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Agent not found', 404);
+    }
+
+    const row = rows[0];
+    if (row.claim_status === 'claimed') {
+        return {
+            agent_id: row.id,
+            agent_name: row.agent_name,
+            claim: {
+                claim_status: 'claimed',
+                claimed_at: row.claimed_at ? new Date(row.claimed_at).toISOString() : null,
+            },
+        };
+    }
+
+    if (isClaimExpired(row.claim_expires_at ? new Date(row.claim_expires_at).toISOString() : null)) {
+        throw new AuthError('Claim challenge expired. Request a fresh claim status and retry.', 409);
+    }
+
+    const expected = String(row.claim_code || '').trim().toUpperCase();
+    if (!expected || expected !== normalized) {
+        throw new AuthError('Invalid verification_code', 400);
+    }
+
+    const updated = await pool.query(
+        `UPDATE agents
+         SET claim_status = 'claimed',
+             claimed_at = NOW(),
+             claim_token = NULL,
+             claim_code = NULL,
+             claim_expires_at = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, agent_name, claim_status, claim_expires_at, claimed_at`,
+        [agentId]
+    );
+
+    const agent = updated.rows[0];
+    return {
+        agent_id: agent.id,
+        agent_name: agent.agent_name,
+        claim: toClaimState(agent),
+    };
+}
+
+export async function getClaimStatusByToken(claimToken: string): Promise<{ agent_name: string; claim: ClaimState }> {
+    const token = (claimToken || '').trim();
+    if (!token) {
+        throw new AuthError('claim token is required', 400);
+    }
+    const { rows } = await pool.query(
+        `SELECT agent_name, claim_status, claim_token, claim_code, claim_expires_at, claimed_at
+         FROM agents
+         WHERE claim_token = $1`,
+        [token]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Claim token not found', 404);
+    }
+    const row = rows[0];
+    if (row.claim_status === 'pending_claim' && isClaimExpired(row.claim_expires_at ? new Date(row.claim_expires_at).toISOString() : null)) {
+        throw new AuthError('Claim token expired', 410);
+    }
+    return {
+        agent_name: row.agent_name,
+        claim: toClaimState(row),
+    };
+}
+
+export async function completeClaimByToken(claimToken: string, verificationCode: string): Promise<{
+    agent_name: string;
+    claim: ClaimState;
+}> {
+    const token = (claimToken || '').trim();
+    const normalized = (verificationCode || '').trim().toUpperCase();
+    if (!token) throw new AuthError('claim token is required', 400);
+    if (!normalized) throw new AuthError('verification_code is required', 400);
+
+    const { rows } = await pool.query(
+        `SELECT id, agent_name, claim_status, claim_code, claim_expires_at
+         FROM agents
+         WHERE claim_token = $1`,
+        [token]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Claim token not found', 404);
+    }
+    const row = rows[0];
+
+    if (row.claim_status !== 'pending_claim') {
+        return {
+            agent_name: row.agent_name,
+            claim: { claim_status: 'claimed', claimed_at: new Date().toISOString() },
+        };
+    }
+
+    if (isClaimExpired(row.claim_expires_at ? new Date(row.claim_expires_at).toISOString() : null)) {
+        throw new AuthError('Claim token expired', 410);
+    }
+    const expected = String(row.claim_code || '').trim().toUpperCase();
+    if (!expected || expected !== normalized) {
+        throw new AuthError('Invalid verification_code', 400);
+    }
+
+    const updated = await pool.query(
+        `UPDATE agents
+         SET claim_status = 'claimed',
+             claimed_at = NOW(),
+             claim_token = NULL,
+             claim_code = NULL,
+             claim_expires_at = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING agent_name, claim_status, claim_expires_at, claimed_at`,
+        [row.id]
+    );
+
+    return {
+        agent_name: updated.rows[0].agent_name,
+        claim: toClaimState(updated.rows[0]),
     };
 }
 

@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { pool } from '../db/pool.js';
 import { redis } from './redis.js';
 import { config } from '../config.js';
+import { purgeExpiredRelayUploads } from '../modules/upload/upload.service.js';
 
 export interface TtlCleanupHandle {
     stop: () => void;
@@ -73,6 +74,12 @@ export function startTtlCleanup(): TtlCleanupHandle {
             } while (cursor !== '0');
 
             console.log(`[TTL] Trimmed ${streamCount} Redis streams`);
+
+            // 4. Purge expired relay uploads (local-first attachment temp relay).
+            const relayPurged = await purgeExpiredRelayUploads(1000);
+            if (relayPurged > 0) {
+                console.log(`[TTL] Purged ${relayPurged} expired relay uploads`);
+            }
         } catch (err) {
             console.error('[TTL] Cleanup error:', err);
         }

@@ -5,7 +5,8 @@ Usage:
     from agent_social import AgentSocialClient
 
     client = AgentSocialClient("http://localhost:3000")
-    client.register("my_agent", "secret123")
+    client.register("my_agent", "Secret123")
+    client.ensure_claimed()
     client.send_dm(peer_agent_id="<uuid>", content="Hello!")
     client.send_tool_call(conv_id, name="search", arguments={"q": "test"})
     client.listen_inbox(callback=lambda msg: print(msg))
@@ -88,6 +89,24 @@ class AgentSocialClient:
         result = self._api("POST", "/api/v1/auth/rotate-token")
         self.token = result["token"]
         return self.token
+
+    def get_claim_status(self) -> dict:
+        return self._api("GET", "/api/v1/auth/claim-status")
+
+    def complete_claim(self, verification_code: str) -> dict:
+        return self._api("POST", "/api/v1/auth/claim/complete", {
+            "verification_code": verification_code,
+        })
+
+    def ensure_claimed(self) -> dict:
+        status = self.get_claim_status()
+        claim = status.get("claim", {})
+        if claim.get("claim_status") == "pending_claim":
+            code = claim.get("verification_code")
+            if not code:
+                raise ValueError("verification_code missing in claim status response")
+            return self.complete_claim(code)
+        return status
 
     # ── Profile & Presence ──
 
@@ -207,7 +226,7 @@ class AgentSocialClient:
         """Send media envelope referencing an uploaded file URL."""
         payload = {
             "type": "media",
-            "content": caption or "收到一个附件",
+            "content": caption or "Received one attachment",
             "data": {
                 "attachments": [
                     {

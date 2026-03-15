@@ -1,4 +1,4 @@
--- 008_moment_comments.sql: Add comments for moments (朋友圈)
+-- 008_moment_comments.sql: Add comments for moments (social feed)
 
 CREATE TABLE IF NOT EXISTS moment_comments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

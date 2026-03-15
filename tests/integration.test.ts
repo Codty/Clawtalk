@@ -32,24 +32,51 @@ afterAll(async () => {
 // ═══════════════════════════════════════
 describe('Auth', () => {
     let wsTokenForA: string;
+    it('should reject invalid username/password format on register', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'BadName', password: 'abcdef' },
+        });
+        expect(res.statusCode).toBe(400);
+    });
+
     it('should register agent_a', async () => {
         const res = await app.inject({
             method: 'POST', url: '/api/v1/auth/register',
-            payload: { agent_name: 'test_agent_a', password: 'password123' },
+            payload: { agent_name: 'test_agent_a', password: 'Password123' },
         });
         expect(res.statusCode).toBe(201);
         agentAToken = res.json().token;
         agentAId = res.json().agent.id;
+
+        const claimCode = res.json().claim?.verification_code;
+        const claim = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { verification_code: claimCode },
+        });
+        expect(claim.statusCode).toBe(200);
     });
 
     it('should register agent_b', async () => {
         const res = await app.inject({
             method: 'POST', url: '/api/v1/auth/register',
-            payload: { agent_name: 'test_agent_b', password: 'password456' },
+            payload: { agent_name: 'test_agent_b', password: 'Password456' },
         });
         expect(res.statusCode).toBe(201);
         agentBToken = res.json().token;
         agentBId = res.json().agent.id;
+
+        const claimCode = res.json().claim?.verification_code;
+        const claim = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentBToken}` },
+            payload: { verification_code: claimCode },
+        });
+        expect(claim.statusCode).toBe(200);
     });
 
     it('should rotate token and invalidate old', async () => {
@@ -95,7 +122,7 @@ describe('Auth', () => {
 
         const blocked = await app.inject({
             method: 'POST', url: '/api/v1/auth/login',
-            payload: { agent_name: 'test_agent_a', password: 'password123' },
+            payload: { agent_name: 'test_agent_a', password: 'Password123' },
         });
         expect(blocked.statusCode).toBe(429);
         expect(blocked.json().retry_after_sec).toBeGreaterThan(0);
@@ -526,20 +553,34 @@ describe('Friend Requests', () => {
         const c = await app.inject({
             method: 'POST',
             url: '/api/v1/auth/register',
-            payload: { agent_name: 'test_agent_c', password: 'password789' },
+            payload: { agent_name: 'test_agent_c', password: 'Password789' },
         });
         expect(c.statusCode).toBe(201);
         agentCToken = c.json().token;
         agentCId = c.json().agent.id;
+        const claimC = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentCToken}` },
+            payload: { verification_code: c.json().claim?.verification_code },
+        });
+        expect(claimC.statusCode).toBe(200);
 
         const d = await app.inject({
             method: 'POST',
             url: '/api/v1/auth/register',
-            payload: { agent_name: 'test_agent_d', password: 'password987' },
+            payload: { agent_name: 'test_agent_d', password: 'Password987' },
         });
         expect(d.statusCode).toBe(201);
         agentDToken = d.json().token;
         agentDId = d.json().agent.id;
+        const claimD = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentDToken}` },
+            payload: { verification_code: d.json().claim?.verification_code },
+        });
+        expect(claimD.statusCode).toBe(200);
     });
 
     it('agent C should send friend request to agent D', async () => {

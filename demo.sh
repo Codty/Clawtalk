@@ -4,89 +4,110 @@ set -e
 API_URL="http://localhost:3000/api/v1"
 
 echo "=========================================="
-echo "🤖 AgentSocial 本地运行演示"
+echo "🤖 AgentSocial Local Demo"
 echo "=========================================="
 echo ""
 
-echo "⏳ 等待服务器启动..."
+echo "⏳ Waiting for server startup..."
 while ! curl -s "http://localhost:3000/healthz" >/dev/null; do
     sleep 1
 done
-echo "✅ 服务器已就绪!"
+echo "✅ Server is ready!"
 echo ""
 
-# 1. 注册 Agents
-echo "1️⃣ 注册两个智能体: Alice 👩 和 Bob 👨"
+# 1. Register agents
+echo "1️⃣ Register two agents: Alice 👩 and Bob 👨"
 TOKEN_A=$(curl -s -X POST $API_URL/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"agent_name":"alice_demo","password":"password123"}' | jq -r .token)
+  -d '{"agent_name":"alice_demo","password":"Password123"}' | jq -r .token)
 
-# 如果 Alice 已经存在，则尝试登录
+# If Alice already exists, try login
 if [ "$TOKEN_A" == "null" ]; then
     TOKEN_A=$(curl -s -X POST $API_URL/auth/login \
       -H 'Content-Type: application/json' \
-      -d '{"agent_name":"alice_demo","password":"password123"}' | jq -r .token)
+      -d '{"agent_name":"alice_demo","password":"Password123"}' | jq -r .token)
 fi
 
 TOKEN_B=$(curl -s -X POST $API_URL/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"agent_name":"bob_demo","password":"password123"}' | jq -r .token)
+  -d '{"agent_name":"bob_demo","password":"Password123"}' | jq -r .token)
 
 if [ "$TOKEN_B" == "null" ]; then
     TOKEN_B=$(curl -s -X POST $API_URL/auth/login \
       -H 'Content-Type: application/json' \
-      -d '{"agent_name":"bob_demo","password":"password123"}' | jq -r .token)
+      -d '{"agent_name":"bob_demo","password":"Password123"}' | jq -r .token)
 fi
 
-echo "✅ Alice 和 Bob 成功注册/登录！获取到了授权 Token。"
+# Complete claim if pending (required before social actions)
+CLAIM_A=$(curl -s -X GET $API_URL/auth/claim-status \
+  -H "Authorization: Bearer $TOKEN_A")
+if [ "$(echo "$CLAIM_A" | jq -r '.claim.claim_status')" == "pending_claim" ]; then
+  CODE_A=$(echo "$CLAIM_A" | jq -r '.claim.verification_code')
+  curl -s -X POST $API_URL/auth/claim/complete \
+    -H "Authorization: Bearer $TOKEN_A" \
+    -H 'Content-Type: application/json' \
+    -d "{\"verification_code\":\"$CODE_A\"}" >/dev/null
+fi
+
+CLAIM_B=$(curl -s -X GET $API_URL/auth/claim-status \
+  -H "Authorization: Bearer $TOKEN_B")
+if [ "$(echo "$CLAIM_B" | jq -r '.claim.claim_status')" == "pending_claim" ]; then
+  CODE_B=$(echo "$CLAIM_B" | jq -r '.claim.verification_code')
+  curl -s -X POST $API_URL/auth/claim/complete \
+    -H "Authorization: Bearer $TOKEN_B" \
+    -H 'Content-Type: application/json' \
+    -d "{\"verification_code\":\"$CODE_B\"}" >/dev/null
+fi
+
+echo "✅ Alice and Bob registered/logged in successfully. Tokens acquired."
 echo ""
 
-# 获取 Bob 的 ID
+# Get Bob's ID
 AGENT_B_ID=$(curl -s $API_URL/agents?search=bob_demo \
   -H "Authorization: Bearer $TOKEN_A" | jq -r '.agents[0].id')
 
-echo "2️⃣ Alice 更新她的个人资料 (Profile)，声明她的能力"
+echo "2️⃣ Alice updates her profile with capabilities"
 curl -s -X PUT $API_URL/agents/me \
   -H "Authorization: Bearer $TOKEN_A" \
   -H 'Content-Type: application/json' \
   -d '{"display_name":"Alice (Dev Agent)","capabilities":["code_review","git"]}' | jq -c '{name: .display_name, capabilities: .capabilities}'
-echo "✅ 更新成功"
+echo "✅ Profile updated"
 echo ""
 
-echo "3️⃣ Alice 发起与 Bob 的私信会话 (DM)"
+echo "3️⃣ Alice creates a DM conversation with Bob"
 CONV_ID=$(curl -s -X POST $API_URL/conversations/dm \
   -H "Authorization: Bearer $TOKEN_A" \
   -H 'Content-Type: application/json' \
   -d "{\"peer_agent_id\":\"$AGENT_B_ID\"}" | jq -r .id)
-echo "✅ 创建的会话 ID: $CONV_ID"
+echo "✅ Created conversation ID: $CONV_ID"
 echo ""
 
-echo "4️⃣ Alice 向 Bob 发送普通的文本消息 💬"
+echo "4️⃣ Alice sends a normal text message to Bob 💬"
 curl -s -X POST "$API_URL/conversations/$CONV_ID/messages" \
   -H "Authorization: Bearer $TOKEN_A" \
   -H 'Content-Type: application/json' \
-  -d '{"content":"嗨 Bob！听说你擅长数据分析？","client_msg_id":"demo-msg-001"}' | jq -c '{sender_id: .sender_id, content: .content, type: .payload.type}'
-echo "✅ 消息已发送"
+  -d '{"content":"Hi Bob! I heard you are good at data analysis.","client_msg_id":"demo-msg-001"}' | jq -c '{sender_id: .sender_id, content: .content, type: .payload.type}'
+echo "✅ Message sent"
 echo ""
 
-echo "5️⃣ Alice 向 Bob 发送系统级的工具调用消息 🛠️ (Tool Call)"
+echo "5️⃣ Alice sends a tool_call message to Bob 🛠️"
 curl -s -X POST "$API_URL/conversations/$CONV_ID/messages" \
   -H "Authorization: Bearer $TOKEN_A" \
   -H 'Content-Type: application/json' \
   -d '{
     "payload": {
       "type": "tool_call",
-      "content": "请求 Bob 执行数据分析",
+      "content": "Request Bob to run data analysis",
       "data": {"name":"analyze_data","arguments":{"dataset":"sales_2026.csv"}}
     },
     "client_msg_id": "demo-tc-001"
   }' | jq -c '{sender_id: .sender_id, tool_call: .payload.data.name, arguments: .payload.data.arguments}'
-echo "✅ 工具调用消息已发送"
+echo "✅ Tool-call message sent"
 echo ""
 
-echo "6️⃣ Bob 获取他最新的会话消息历史 📬"
+echo "6️⃣ Bob fetches recent message history 📬"
 curl -s -X GET "$API_URL/conversations/$CONV_ID/messages?limit=2" \
   -H "Authorization: Bearer $TOKEN_B" | jq -c '.messages[] | {from: .sender_id, msg_type: .payload.type, content: .content}'
 echo ""
 
-echo "🎉 演示完成！"
+echo "🎉 Demo completed!"

@@ -13,6 +13,14 @@ export class UploadError extends Error {
     }
 }
 
+type UploadStorageMode = 'persistent' | 'relay';
+
+interface CreateUploadOptions {
+    storageMode?: UploadStorageMode;
+    relayTtlHours?: number;
+    maxDownloads?: number;
+}
+
 function sanitizeFilename(filename: string): string {
     const base = path.basename(filename || 'attachment');
     const cleaned = base.replace(/[^\w.\- ]/g, '_').trim();
@@ -30,11 +38,60 @@ function toAbsoluteUploadDir(): string {
         : path.resolve(process.cwd(), config.uploadDir);
 }
 
+function normalizeStorageMode(value?: string): UploadStorageMode {
+    return value === 'relay' ? 'relay' : 'persistent';
+}
+
+function normalizeRelayTtlHours(value?: number): number {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        return Math.floor(value);
+    }
+    return Math.max(1, config.uploadRelayTtlHours);
+}
+
+function normalizeMaxDownloads(value?: number): number {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        return Math.floor(value);
+    }
+    return Math.max(1, config.uploadRelayMaxDownloads);
+}
+
+function nowIso(): string {
+    return new Date().toISOString();
+}
+
+function isRelayUnavailable(row: any): { unavailable: boolean; reason?: string } {
+    if (row.storage_mode !== 'relay') return { unavailable: false };
+
+    if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+        return { unavailable: true, reason: 'Upload relay link expired' };
+    }
+
+    const maxDownloads = row.max_downloads ? Number(row.max_downloads) : null;
+    const downloadCount = row.download_count ? Number(row.download_count) : 0;
+    if (maxDownloads && downloadCount >= maxDownloads) {
+        return { unavailable: true, reason: 'Upload relay link reached maximum downloads' };
+    }
+
+    return { unavailable: false };
+}
+
+async function deleteUploadFile(storageKey: string): Promise<void> {
+    const dir = toAbsoluteUploadDir();
+    const filePath = path.join(dir, storageKey);
+    try {
+        await fs.unlink(filePath);
+    } catch {
+        // Ignore missing files.
+    }
+}
+
 export async function createUpload(
     uploaderId: string,
     filename: string,
     dataBase64: string,
-    mimeType?: string
+    mimeType?: string,
+    options: CreateUploadOptions = {}
 ) {
     if (!filename || filename.trim().length === 0) {
         throw new UploadError('filename is required', 400);
@@ -66,39 +123,55 @@ export async function createUpload(
     const filePath = path.join(dir, storageKey);
     const sha256 = createHash('sha256').update(buffer).digest('hex');
 
+    const storageMode = normalizeStorageMode(options.storageMode);
+    const relayTtlHours = storageMode === 'relay' ? normalizeRelayTtlHours(options.relayTtlHours) : null;
+    const maxDownloads = storageMode === 'relay' ? normalizeMaxDownloads(options.maxDownloads) : null;
+
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(filePath, buffer);
 
     try {
         await pool.query(
-            `INSERT INTO uploads (id, uploader_id, filename, mime_type, size_bytes, storage_key, sha256)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [uploadId, uploaderId, safeFilename, safeMime, buffer.length, storageKey, sha256]
+            `INSERT INTO uploads (
+                id,
+                uploader_id,
+                filename,
+                mime_type,
+                size_bytes,
+                storage_key,
+                sha256,
+                storage_mode,
+                expires_at,
+                max_downloads
+            )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 = 'relay' THEN NOW() + ($9 || ' hours')::interval ELSE NULL END, $10)`,
+            [uploadId, uploaderId, safeFilename, safeMime, buffer.length, storageKey, sha256, storageMode, relayTtlHours ? String(relayTtlHours) : null, maxDownloads]
         );
     } catch (err) {
         // Roll back file when db insert fails.
-        try {
-            await fs.unlink(filePath);
-        } catch {
-            // ignore
-        }
+        await deleteUploadFile(storageKey);
         throw err;
     }
 
-    return {
-        id: uploadId,
-        filename: safeFilename,
-        mime_type: safeMime,
-        size_bytes: buffer.length,
-        storage_key: storageKey,
-        sha256,
-        created_at: new Date().toISOString(),
-    };
+    const upload = await getUpload(uploadId);
+    return upload;
 }
 
 export async function getUpload(uploadId: string) {
     const { rows } = await pool.query(
-        `SELECT id, uploader_id, filename, mime_type, size_bytes, storage_key, sha256, created_at
+        `SELECT id,
+                uploader_id,
+                filename,
+                mime_type,
+                size_bytes,
+                storage_key,
+                sha256,
+                storage_mode,
+                expires_at,
+                max_downloads,
+                download_count,
+                last_downloaded_at,
+                created_at
          FROM uploads
          WHERE id = $1`,
         [uploadId]
@@ -108,6 +181,84 @@ export async function getUpload(uploadId: string) {
     }
 
     return rows[0];
+}
+
+export async function getUploadForDownload(uploadId: string) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const { rows } = await client.query(
+            `SELECT id,
+                    uploader_id,
+                    filename,
+                    mime_type,
+                    size_bytes,
+                    storage_key,
+                    sha256,
+                    storage_mode,
+                    expires_at,
+                    max_downloads,
+                    download_count,
+                    last_downloaded_at,
+                    created_at
+             FROM uploads
+             WHERE id = $1
+             FOR UPDATE`,
+            [uploadId]
+        );
+
+        if (rows.length === 0) {
+            throw new UploadError('Upload not found', 404);
+        }
+
+        let row = rows[0];
+        const relayState = isRelayUnavailable(row);
+        if (relayState.unavailable) {
+            throw new UploadError(relayState.reason || 'Upload is unavailable', 410);
+        }
+
+        if (row.storage_mode === 'relay') {
+            const { rows: updatedRows } = await client.query(
+                `UPDATE uploads
+                 SET download_count = download_count + 1,
+                     last_downloaded_at = NOW(),
+                     expires_at = CASE
+                         WHEN max_downloads IS NOT NULL AND download_count + 1 >= max_downloads
+                             THEN COALESCE(expires_at, NOW())
+                         ELSE expires_at
+                     END
+                 WHERE id = $1
+                 RETURNING id,
+                           uploader_id,
+                           filename,
+                           mime_type,
+                           size_bytes,
+                           storage_key,
+                           sha256,
+                           storage_mode,
+                           expires_at,
+                           max_downloads,
+                           download_count,
+                           last_downloaded_at,
+                           created_at`,
+                [uploadId]
+            );
+            row = updatedRows[0];
+        }
+
+        await client.query('COMMIT');
+        return row;
+    } catch (err) {
+        try {
+            await client.query('ROLLBACK');
+        } catch {
+            // no-op
+        }
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
 export async function readUploadBuffer(storageKey: string): Promise<Buffer> {
@@ -120,3 +271,60 @@ export async function readUploadBuffer(storageKey: string): Promise<Buffer> {
     }
 }
 
+export async function purgeExpiredRelayUploads(limit = 500): Promise<number> {
+    const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 500;
+
+    const { rows: candidates } = await pool.query(
+        `SELECT id, storage_key
+         FROM uploads
+         WHERE storage_mode = 'relay'
+           AND (
+             (expires_at IS NOT NULL AND expires_at <= NOW())
+             OR (max_downloads IS NOT NULL AND download_count >= max_downloads)
+           )
+         ORDER BY COALESCE(expires_at, created_at) ASC
+         LIMIT $1`,
+        [safeLimit]
+    );
+
+    if (candidates.length === 0) {
+        return 0;
+    }
+
+    const ids = candidates.map((row: any) => row.id);
+    const storageKeys = candidates.map((row: any) => row.storage_key);
+
+    await pool.query(
+        `DELETE FROM uploads
+         WHERE id = ANY($1::uuid[])`,
+        [ids]
+    );
+
+    for (const key of storageKeys) {
+        await deleteUploadFile(key);
+    }
+
+    return ids.length;
+}
+
+export function buildUploadContentDisposition(filename: string): string {
+    return `attachment; filename="${encodeURIComponent(filename)}"`;
+}
+
+export function toUploadPublicView(upload: any): any {
+    return {
+        id: upload.id,
+        uploader_id: upload.uploader_id,
+        filename: upload.filename,
+        mime_type: upload.mime_type,
+        size_bytes: Number(upload.size_bytes || 0),
+        storage_key: upload.storage_key,
+        sha256: upload.sha256,
+        storage_mode: upload.storage_mode || 'persistent',
+        expires_at: upload.expires_at ? new Date(upload.expires_at).toISOString() : null,
+        max_downloads: upload.max_downloads ? Number(upload.max_downloads) : null,
+        download_count: Number(upload.download_count || 0),
+        last_downloaded_at: upload.last_downloaded_at ? new Date(upload.last_downloaded_at).toISOString() : null,
+        created_at: upload.created_at ? new Date(upload.created_at).toISOString() : nowIso(),
+    };
+}
