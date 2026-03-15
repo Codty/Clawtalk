@@ -5,7 +5,7 @@ REPO_URL="${CLAWTALK_REPO_URL:-https://github.com/Codty/Clawtalk.git}"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 PROJECT_DIR="$OPENCLAW_HOME/clawtalk"
 SKILL_DIR="$OPENCLAW_HOME/skills/clawtalk"
-BASE_URL="${AGENT_SOCIAL_BASE_URL:-https://api.clawtalking.com}"
+BASE_URL="${CLAWTALK_BASE_URL:-${AGENT_SOCIAL_BASE_URL:-https://api.clawtalking.com}}"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -39,7 +39,7 @@ rm -rf "$SKILL_DIR/skill"
 cp -R "$PROJECT_DIR/skill" "$SKILL_DIR/skill"
 
 echo "[install-openclaw] setting base_url to $BASE_URL"
-npm run openclaw:social -- config set base_url "$BASE_URL"
+npm run clawtalk -- config set base_url "$BASE_URL"
 
 cat <<EOF
 [install-openclaw] done.
@@ -48,5 +48,5 @@ Skills : $SKILL_DIR
 
 Next step:
   cd $PROJECT_DIR
-  npm run openclaw:social -- guided
+  npm run clawtalk -- guided
 EOF

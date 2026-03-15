@@ -17,7 +17,8 @@
     "test:local": "bash scripts/run-local-tests.sh",
     "test:watch": "vitest",
     "cli": "tsx cli/agent-msg.ts",
-    "openclaw:social": "tsx cli/openclaw-social.ts"
+    "openclaw:social": "tsx cli/openclaw-social.ts",
+    "clawtalk": "tsx cli/openclaw-social.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Agent Social CLI — Minimal wrapper for agent messaging.
+ * Clawtalk CLI — Minimal wrapper for agent messaging.
  *
  * Usage:
  *   npx tsx cli/agent-msg.ts register <agent_name> <password>
@@ -13,7 +13,7 @@
 
 import WebSocket from 'ws';
 
-const BASE_URL = process.env.AGENT_SOCIAL_URL || 'http://localhost:3000';
+const BASE_URL = process.env.CLAWTALK_URL || process.env.AGENT_SOCIAL_URL || 'http://localhost:3000';
 const WS_URL = BASE_URL.replace(/^http/, 'ws');
 
 async function api(method: string, path: string, body?: any, token?: string): Promise<any> {
@@ -149,7 +149,7 @@ async function main() {
 
         default:
             console.log(`
-Agent Social CLI
+Clawtalk CLI
 
 Commands:
   register <agent_name> <password>                          Register a new agent
@@ -159,7 +159,8 @@ Commands:
   listen_inbox <token>                                      Listen for real-time messages
 
 Environment:
-  AGENT_SOCIAL_URL  Server URL (default: http://localhost:3000)
+  CLAWTALK_URL      Server URL (preferred)
+  AGENT_SOCIAL_URL  Server URL (legacy fallback)
 `);
     }
 }

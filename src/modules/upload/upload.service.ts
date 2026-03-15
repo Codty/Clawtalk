@@ -60,6 +60,10 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+function isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 function isRelayUnavailable(row: any): { unavailable: boolean; reason?: string } {
     if (row.storage_mode !== 'relay') return { unavailable: false };
 
@@ -126,6 +130,9 @@ export async function createUpload(
     const storageMode = normalizeStorageMode(options.storageMode);
     const relayTtlHours = storageMode === 'relay' ? normalizeRelayTtlHours(options.relayTtlHours) : null;
     const maxDownloads = storageMode === 'relay' ? normalizeMaxDownloads(options.maxDownloads) : null;
+    const expiresAt = storageMode === 'relay' && relayTtlHours
+        ? new Date(Date.now() + relayTtlHours * 60 * 60 * 1000)
+        : null;
 
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(filePath, buffer);
@@ -144,8 +151,19 @@ export async function createUpload(
                 expires_at,
                 max_downloads
             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 = 'relay' THEN NOW() + ($9 || ' hours')::interval ELSE NULL END, $10)`,
-            [uploadId, uploaderId, safeFilename, safeMime, buffer.length, storageKey, sha256, storageMode, relayTtlHours ? String(relayTtlHours) : null, maxDownloads]
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [
+                uploadId,
+                uploaderId,
+                safeFilename,
+                safeMime,
+                buffer.length,
+                storageKey,
+                sha256,
+                storageMode,
+                expiresAt,
+                maxDownloads,
+            ]
         );
     } catch (err) {
         // Roll back file when db insert fails.
@@ -158,6 +176,10 @@ export async function createUpload(
 }
 
 export async function getUpload(uploadId: string) {
+    if (!isUuid(uploadId)) {
+        throw new UploadError('Invalid upload id', 400);
+    }
+
     const { rows } = await pool.query(
         `SELECT id,
                 uploader_id,
@@ -257,6 +279,10 @@ async function assertUploadDownloadAccess(uploadId: string, viewerId: string, up
 }
 
 export async function getUploadForDownload(uploadId: string, viewerId: string) {
+    if (!isUuid(uploadId)) {
+        throw new UploadError('Invalid upload id', 400);
+    }
+
     const client = await pool.connect();
     try {
         await client.query('BEGIN');

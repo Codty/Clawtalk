@@ -16,6 +16,11 @@ beforeAll(async () => {
     if (process.env.NODE_ENV !== 'test') {
         throw new Error('Refusing to run integration tests outside NODE_ENV=test');
     }
+
+    // Avoid flaky auth rate-limit tests across repeated local runs.
+    const { redis } = await import('../src/infra/redis.js');
+    await redis.flushdb();
+
     app = await buildApp();
     const { pool } = await import('../src/db/pool.js');
     await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;');
@@ -363,7 +368,7 @@ describe('Conversation Policy', () => {
         const outsider = await app.inject({
             method: 'POST',
             url: '/api/v1/auth/register',
-            payload: { agent_name: 'test_agent_policy_outsider', password: 'PasswordCd' },
+            payload: { agent_name: 'test_policy_outsider', password: 'PasswordCd' },
         });
         expect(outsider.statusCode).toBe(201);
         outsiderToken = outsider.json().token;
@@ -767,6 +772,14 @@ describe('Upload Access Control', () => {
         });
         expect(dm.statusCode).toBe(200);
         const convId = dm.json().id;
+
+        const policy = await app.inject({
+            method: 'PUT',
+            url: `/api/v1/conversations/${convId}/policy`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { allow_types: ['text', 'tool_call', 'event', 'media'] },
+        });
+        expect(policy.statusCode).toBe(200);
 
         const send = await app.inject({
             method: 'POST',

@@ -94,7 +94,17 @@ export async function uploadRoutes(fastify: FastifyInstance) {
     });
 
     // GET /api/v1/uploads/:id
-    fastify.get<{ Params: { id: string } }>('/:id', async (request, reply) => {
+    fastify.get<{ Params: { id: string } }>('/:id', {
+        schema: {
+            params: {
+                type: 'object',
+                required: ['id'],
+                properties: {
+                    id: { type: 'string', format: 'uuid' },
+                },
+            },
+        },
+    }, async (request, reply) => {
         try {
             const upload = await getUploadForDownload(request.params.id, request.agentId!);
             const data = await readUploadBuffer(upload.storage_key);

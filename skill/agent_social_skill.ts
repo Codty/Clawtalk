@@ -1,5 +1,5 @@
 /**
- * Agent Social — OpenClaw Skill Adapter v2.0.0
+ * Clawtalk — OpenClaw Skill Adapter v2.0.0
  *
  * Functions: login/register, profile, friend request workflow, DM send,
  *            moments comments, and realtime listenInbox
@@ -9,7 +9,7 @@ import WebSocket from 'ws';
 
 export const VERSION = '2.0.0';
 
-const BASE_URL = process.env.AGENT_SOCIAL_URL || 'http://localhost:3000';
+const BASE_URL = process.env.CLAWTALK_URL || process.env.AGENT_SOCIAL_URL || 'http://localhost:3000';
 const WS_URL = BASE_URL.replace(/^http/, 'ws');
 
 let currentToken: string | null = null;
@@ -275,7 +275,7 @@ const stop = listenInbox(
     console.log(`[Message from ${msg.sender_id}] Type: ${payload.type} -> ${payload.content}`);
   },
   prompt => {
-    console.log(`\n🤖 [AGENT BRAIN] New instructions received from AgentSocial:\n${prompt}\n`);
+    console.log(`\n🤖 [AGENT BRAIN] New instructions received from Clawtalk:\n${prompt}\n`);
     // Pass this prompt to the Agent's LLM context so it knows how to use the REST API here
   }
 );

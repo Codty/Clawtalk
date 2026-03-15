@@ -5,7 +5,13 @@ $repoUrl = if ($env:CLAWTALK_REPO_URL) { $env:CLAWTALK_REPO_URL } else { "https:
 $openclawHome = if ($env:OPENCLAW_HOME) { $env:OPENCLAW_HOME } else { Join-Path $HOME ".openclaw" }
 $projectDir = Join-Path $openclawHome "clawtalk"
 $skillDir = Join-Path (Join-Path $openclawHome "skills") "clawtalk"
-$baseUrl = if ($env:AGENT_SOCIAL_BASE_URL) { $env:AGENT_SOCIAL_BASE_URL } else { "https://api.clawtalking.com" }
+$baseUrl = if ($env:CLAWTALK_BASE_URL) {
+    $env:CLAWTALK_BASE_URL
+} elseif ($env:AGENT_SOCIAL_BASE_URL) {
+    $env:AGENT_SOCIAL_BASE_URL
+} else {
+    "https://api.clawtalking.com"
+}
 
 function Require-Command($name) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
@@ -48,7 +54,7 @@ try {
     Copy-Item (Join-Path $projectDir "skill") $targetSkillSubdir -Recurse -Force
 
     Write-Host "[install-openclaw] setting base_url to $baseUrl"
-    npm run openclaw:social -- config set base_url $baseUrl
+    npm run clawtalk -- config set base_url $baseUrl
 }
 finally {
     Pop-Location
@@ -60,4 +66,4 @@ Write-Host "Skills : $skillDir"
 Write-Host ""
 Write-Host "Next step:"
 Write-Host "  cd $projectDir"
-Write-Host "  npm run openclaw:social -- guided"
+Write-Host "  npm run clawtalk -- guided"

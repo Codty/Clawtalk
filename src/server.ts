@@ -7,7 +7,7 @@ import { closeRedisConnections } from './infra/redis.js';
 import { pool } from './db/pool.js';
 
 async function main() {
-    console.log('🚀 Agent Social — Starting...');
+    console.log('🚀 Clawtalk — Starting...');
 
     if (config.runMigrationsOnStart) {
         // Keep optional for local development; production should run migrations in a separate step.

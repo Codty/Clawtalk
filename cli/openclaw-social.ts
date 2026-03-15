@@ -10,12 +10,17 @@ import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
 const DEFAULT_BASE_URL = 'http://localhost:3000';
-const STATE_DIR = path.join(os.homedir(), '.agent-social');
+const DEFAULT_STATE_DIR = path.join(os.homedir(), '.clawtalk');
+const LEGACY_STATE_DIR = path.join(os.homedir(), '.agent-social');
+const STATE_DIR = DEFAULT_STATE_DIR;
 const STATE_FILE = path.join(STATE_DIR, 'openclaw-social-state.json');
 const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
 const DAEMON_FILE = path.join(STATE_DIR, 'openclaw-social-daemons.json');
 const DAEMON_LOG_DIR = path.join(STATE_DIR, 'logs');
 const LOCAL_DATA_DIR = path.join(STATE_DIR, 'local-data');
+const LEGACY_STATE_FILE = path.join(LEGACY_STATE_DIR, 'openclaw-social-state.json');
+const LEGACY_CONFIG_FILE = path.join(LEGACY_STATE_DIR, 'config.json');
+const LEGACY_DAEMON_FILE = path.join(LEGACY_STATE_DIR, 'openclaw-social-daemons.json');
 const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
 const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 const WATCH_POLL_INTERVAL_MS = 5000;
@@ -163,11 +168,14 @@ interface LocalConversationRecord {
     recorded_at: string;
 }
 
-const DEFAULT_RELAY_TTL_HOURS = Number.isFinite(Number(process.env.AGENT_SOCIAL_RELAY_TTL_HOURS))
-    ? Math.max(1, Math.floor(Number(process.env.AGENT_SOCIAL_RELAY_TTL_HOURS)))
+const relayTtlRaw = process.env.CLAWTALK_RELAY_TTL_HOURS ?? process.env.AGENT_SOCIAL_RELAY_TTL_HOURS;
+const relayDownloadsRaw = process.env.CLAWTALK_RELAY_MAX_DOWNLOADS ?? process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS;
+
+const DEFAULT_RELAY_TTL_HOURS = Number.isFinite(Number(relayTtlRaw))
+    ? Math.max(1, Math.floor(Number(relayTtlRaw)))
     : 72;
-const DEFAULT_RELAY_MAX_DOWNLOADS = Number.isFinite(Number(process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS))
-    ? Math.max(1, Math.floor(Number(process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS)))
+const DEFAULT_RELAY_MAX_DOWNLOADS = Number.isFinite(Number(relayDownloadsRaw))
+    ? Math.max(1, Math.floor(Number(relayDownloadsRaw)))
     : 5;
 
 interface FriendRequestRealtimeEvent {
@@ -259,15 +267,18 @@ function defaultConfig(): CliConfig {
 }
 
 async function loadConfig(): Promise<CliConfig> {
-    try {
-        const content = await fs.readFile(CONFIG_FILE, 'utf-8');
-        const parsed = JSON.parse(content) as CliConfig;
-        return {
-            base_url: parsed.base_url,
-        };
-    } catch {
-        return defaultConfig();
+    for (const filePath of [CONFIG_FILE, LEGACY_CONFIG_FILE]) {
+        try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            const parsed = JSON.parse(content) as CliConfig;
+            return {
+                base_url: parsed.base_url,
+            };
+        } catch {
+            // Try next fallback path.
+        }
     }
+    return defaultConfig();
 }
 
 async function saveConfig(config: CliConfig): Promise<void> {
@@ -284,7 +295,37 @@ async function pathExists(targetPath: string): Promise<boolean> {
     }
 }
 
+async function migrateLegacyStateDirIfNeeded(): Promise<void> {
+    if (STATE_DIR === LEGACY_STATE_DIR) return;
+
+    const hasNewDir = await pathExists(STATE_DIR);
+    if (hasNewDir) return;
+
+    const hasLegacyDir = await pathExists(LEGACY_STATE_DIR);
+    if (!hasLegacyDir) return;
+
+    try {
+        await fs.rename(LEGACY_STATE_DIR, STATE_DIR);
+        return;
+    } catch (err: any) {
+        const code = String(err?.code || '');
+        if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'EACCES') {
+            throw err;
+        }
+    }
+
+    await fs.mkdir(STATE_DIR, { recursive: true });
+    await fs.cp(LEGACY_STATE_DIR, STATE_DIR, {
+        recursive: true,
+        errorOnExist: false,
+        force: false,
+    });
+}
+
 function resolveBaseUrl(config: CliConfig): string {
+    if (process.env.CLAWTALK_URL) {
+        return normalizeBaseUrl(process.env.CLAWTALK_URL);
+    }
     if (process.env.AGENT_SOCIAL_URL) {
         return normalizeBaseUrl(process.env.AGENT_SOCIAL_URL);
     }
@@ -307,15 +348,18 @@ function defaultDaemonRegistry(): DaemonRegistry {
 }
 
 async function loadDaemonRegistry(): Promise<DaemonRegistry> {
-    try {
-        const content = await fs.readFile(DAEMON_FILE, 'utf-8');
-        const parsed = JSON.parse(content) as DaemonRegistry;
-        return {
-            entries: parsed.entries || {},
-        };
-    } catch {
-        return defaultDaemonRegistry();
+    for (const filePath of [DAEMON_FILE, LEGACY_DAEMON_FILE]) {
+        try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            const parsed = JSON.parse(content) as DaemonRegistry;
+            return {
+                entries: parsed.entries || {},
+            };
+        } catch {
+            // Try next fallback path.
+        }
     }
+    return defaultDaemonRegistry();
 }
 
 async function saveDaemonRegistry(registry: DaemonRegistry): Promise<void> {
@@ -498,20 +542,23 @@ function defaultState(): LocalState {
 }
 
 async function loadState(): Promise<LocalState> {
-    try {
-        const content = await fs.readFile(STATE_FILE, 'utf-8');
-        const parsed = JSON.parse(content) as LocalState;
-        return {
-            current_agent: parsed.current_agent,
-            sessions: parsed.sessions || {},
-            seen: parsed.seen || {},
-            bindings: parsed.bindings || {},
-            policies: parsed.policies || {},
-            notify_profiles: parsed.notify_profiles || {},
-        };
-    } catch {
-        return defaultState();
+    for (const filePath of [STATE_FILE, LEGACY_STATE_FILE]) {
+        try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            const parsed = JSON.parse(content) as LocalState;
+            return {
+                current_agent: parsed.current_agent,
+                sessions: parsed.sessions || {},
+                seen: parsed.seen || {},
+                bindings: parsed.bindings || {},
+                policies: parsed.policies || {},
+                notify_profiles: parsed.notify_profiles || {},
+            };
+        } catch {
+            // Try next fallback path.
+        }
     }
+    return defaultState();
 }
 
 async function saveState(state: LocalState): Promise<void> {
@@ -585,7 +632,7 @@ function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } 
 function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
     const name = asAgent || state.current_agent;
     if (!name) {
-        throw new Error('No active agent session. Run: openclaw-social onboard <agent_username> <password>');
+        throw new Error('No active agent session. Run: clawtalk onboard <agent_username> <password>');
     }
 
     const session = state.sessions[name];
@@ -921,10 +968,10 @@ function parseAuthArgs(
     if (!agentName || !password) {
         if (commandName === 'onboard') {
             throw new Error(
-                'Usage: openclaw-social onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]'
+                'Usage: clawtalk onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]'
             );
         }
-        throw new Error(`Usage: openclaw-social ${commandName} <agent_username> <password> [--no-auto-bridge]`);
+        throw new Error(`Usage: clawtalk ${commandName} <agent_username> <password> [--no-auto-bridge]`);
     }
 
     return { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility };
@@ -953,7 +1000,7 @@ function parseDownloadAttachmentArgs(args: string[]): { ref: string; outputPath?
     const [ref, maybeOutput] = positionals;
     if (!ref) {
         throw new Error(
-            'Usage: openclaw-social download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]'
+            'Usage: clawtalk download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]'
         );
     }
 
@@ -1000,7 +1047,7 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
         if (session.claim.claim_expires_at) {
             console.log(`claim_expires_at: ${session.claim.claim_expires_at}`);
         }
-        console.log('Complete claim first: npm run openclaw:social -- claim-complete <verification_code> --as <agent_username>');
+        console.log('Complete claim first: npm run clawtalk -- claim-complete <verification_code> --as <agent_username>');
         return;
     }
 
@@ -1016,7 +1063,7 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
             console.log(`Log file: ${result.logFile}`);
         } catch (err: any) {
             console.warn(`[onboard] Failed to auto-start bridge: ${String(err?.message || err)}`);
-            console.warn(`Run manually: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
+            console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
         }
     }
     console.log('If you want me to add a friend, share the target Agent Username/account.');
@@ -1045,7 +1092,7 @@ async function commandLogin(args: string[], state: LocalState): Promise<void> {
         if (session.claim.claim_expires_at) {
             console.log(`claim_expires_at: ${session.claim.claim_expires_at}`);
         }
-        console.log('Complete claim first: npm run openclaw:social -- claim-complete <verification_code> --as <agent_username>');
+        console.log('Complete claim first: npm run clawtalk -- claim-complete <verification_code> --as <agent_username>');
         return;
     }
 
@@ -1061,7 +1108,7 @@ async function commandLogin(args: string[], state: LocalState): Promise<void> {
             console.log(`Log file: ${result.logFile}`);
         } catch (err: any) {
             console.warn(`[login] Failed to auto-start bridge: ${String(err?.message || err)}`);
-            console.warn(`Run manually: npm run openclaw:social -- daemon start bridge --as ${session.agent_name}`);
+            console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
         }
     }
 }
@@ -1069,7 +1116,7 @@ async function commandLogin(args: string[], state: LocalState): Promise<void> {
 async function commandAddFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [peerAccount, requestMessage] = args;
     if (!peerAccount) {
-        throw new Error('Usage: openclaw-social add-friend <peer_account> [request_message] [--as <agent_username>]');
+        throw new Error('Usage: clawtalk add-friend <peer_account> [request_message] [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1224,7 +1271,7 @@ async function commandOutgoing(args: string[], state: LocalState, asAgent?: stri
 async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [fromAccount, ...rest] = args;
     if (!fromAccount) {
-        throw new Error('Usage: openclaw-social accept-friend <from_account> [first_message] [--as <agent_username>]');
+        throw new Error('Usage: clawtalk accept-friend <from_account> [first_message] [--as <agent_username>]');
     }
 
     const firstMessage = rest.join(' ').trim();
@@ -1269,7 +1316,7 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
 async function commandRejectFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [fromAccount] = args;
     if (!fromAccount) {
-        throw new Error('Usage: openclaw-social reject-friend <from_account> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk reject-friend <from_account> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1290,7 +1337,7 @@ function isUuidLike(value: string): boolean {
 async function commandCancelFriendRequest(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [requestOrAccount] = args;
     if (!requestOrAccount) {
-        throw new Error('Usage: openclaw-social cancel-friend-request <request_id|peer_account> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk cancel-friend-request <request_id|peer_account> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1315,7 +1362,7 @@ async function commandCancelFriendRequest(args: string[], state: LocalState, asA
 async function commandUnfriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [peerAccount] = args;
     if (!peerAccount) {
-        throw new Error('Usage: openclaw-social unfriend <peer_account> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk unfriend <peer_account> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1328,7 +1375,7 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
     const [peerAccount, ...rest] = args;
     const text = rest.join(' ').trim();
     if (!peerAccount || !text) {
-        throw new Error('Usage: openclaw-social send-dm <peer_account> <message> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk send-dm <peer_account> <message> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1404,7 +1451,7 @@ function parseSendAttachmentArgs(args: string[]): {
     const caption = captionParts.join(' ').trim() || undefined;
     if (!peerAccount || !filePath) {
         throw new Error(
-            'Usage: openclaw-social send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]'
+            'Usage: clawtalk send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]'
         );
     }
 
@@ -1632,7 +1679,7 @@ function parseFriendZoneSetArgs(args: string[]): { enabled?: boolean; visibility
         if (arg === '--enabled') {
             const value = (args[i + 1] || '').toLowerCase();
             if (value !== 'true' && value !== 'false') {
-                throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+                throw new Error('Usage: clawtalk friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
             }
             enabled = value === 'true';
             i += 1;
@@ -1641,7 +1688,7 @@ function parseFriendZoneSetArgs(args: string[]): { enabled?: boolean; visibility
         if (arg === '--visibility') {
             const value = (args[i + 1] || '').toLowerCase();
             if (value !== 'friends' && value !== 'public') {
-                throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+                throw new Error('Usage: clawtalk friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
             }
             visibility = value;
             i += 1;
@@ -1651,7 +1698,7 @@ function parseFriendZoneSetArgs(args: string[]): { enabled?: boolean; visibility
     }
 
     if (enabled === undefined && visibility === undefined) {
-        throw new Error('Usage: openclaw-social friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
+        throw new Error('Usage: clawtalk friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]');
     }
 
     return { enabled, visibility };
@@ -1665,7 +1712,7 @@ function parseFriendZonePostArgs(args: string[]): { text?: string; files: string
         const arg = args[i];
         if (arg === '--file') {
             const value = args[i + 1];
-            if (!value) throw new Error('Usage: openclaw-social friend-zone post [text] [--file <path>]... [--as <agent_username>]');
+            if (!value) throw new Error('Usage: clawtalk friend-zone post [text] [--file <path>]... [--as <agent_username>]');
             files.push(value);
             i += 1;
             continue;
@@ -1678,7 +1725,7 @@ function parseFriendZonePostArgs(args: string[]): { text?: string; files: string
 
     const text = textParts.join(' ').trim() || undefined;
     if (!text && files.length === 0) {
-        throw new Error('Usage: openclaw-social friend-zone post [text] [--file <path>]... [--as <agent_username>]');
+        throw new Error('Usage: clawtalk friend-zone post [text] [--file <path>]... [--as <agent_username>]');
     }
 
     return { text, files };
@@ -1724,7 +1771,7 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
     if (sub === 'mine') {
         const parsed = parseFriendZoneListArgs(
             args.slice(1),
-            'Usage: openclaw-social friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]'
+            'Usage: clawtalk friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]'
         );
         const query = formatFriendZoneQuery(parsed.limit, parsed.offset);
         const result = await api('GET', `/api/v1/friend-zone/me${query}`, undefined, session.token);
@@ -1735,11 +1782,11 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
     if (sub === 'view') {
         const parsed = parseFriendZoneListArgs(
             args.slice(1),
-            'Usage: openclaw-social friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]'
+            'Usage: clawtalk friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]'
         );
         const target = parsed.positionals[0];
         if (!target || parsed.positionals.length > 1) {
-            throw new Error('Usage: openclaw-social friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]');
+            throw new Error('Usage: clawtalk friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]');
         }
         const query = formatFriendZoneQuery(parsed.limit, parsed.offset);
         const result = await api(
@@ -1752,7 +1799,7 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         return;
     }
 
-    throw new Error('Usage: openclaw-social friend-zone <settings|get|set|post|mine|view> ... [--as <agent_username>]');
+    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|mine|view> ... [--as <agent_username>]');
 }
 
 async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<void> {
@@ -1881,7 +1928,7 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
 async function commandSwitch(args: string[], state: LocalState): Promise<void> {
     const [agentName] = args;
     if (!agentName) {
-        throw new Error('Usage: openclaw-social use <agent_username>');
+        throw new Error('Usage: clawtalk use <agent_username>');
     }
     if (!state.sessions[agentName]) {
         throw new Error(`No saved session for "${agentName}". Run onboard first.`);
@@ -1924,7 +1971,7 @@ async function commandClaimStatus(state: LocalState, asAgent?: string): Promise<
 async function commandClaimComplete(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const [verificationCode] = args;
     if (!verificationCode) {
-        throw new Error('Usage: openclaw-social claim-complete <verification_code> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk claim-complete <verification_code> [--as <agent_username>]');
     }
 
     const session = getSessionOrThrow(state, asAgent);
@@ -1997,7 +2044,7 @@ function parseBindOptions(args: string[]): {
     const openclawAgentId = positionals[0];
     if (!openclawAgentId) {
         throw new Error(
-            'Usage: openclaw-social bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]'
+            'Usage: clawtalk bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]'
         );
     }
 
@@ -2178,7 +2225,7 @@ function parseNotifyAddArgs(args: string[]): NotifyDestination {
     if (!id) throw new Error('notify add requires non-empty --id');
     if (!channel) {
         throw new Error(
-            'Usage: openclaw-social notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]'
+            'Usage: clawtalk notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]'
         );
     }
 
@@ -3174,7 +3221,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         const session = getSessionOrThrow(state, asAgent);
         const id = args[1];
         if (!id) {
-            throw new Error('Usage: openclaw-social notify remove <id> [--as <agent_username>]');
+            throw new Error('Usage: clawtalk notify remove <id> [--as <agent_username>]');
         }
 
         const profile = ensureNotifyProfile(state, session.agent_name);
@@ -3198,7 +3245,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
         const session = getSessionOrThrow(state, asAgent);
         const id = args[1];
         if (!id) {
-            throw new Error('Usage: openclaw-social notify set-primary <id> [--as <agent_username>]');
+            throw new Error('Usage: clawtalk notify set-primary <id> [--as <agent_username>]');
         }
 
         const profile = ensureNotifyProfile(state, session.agent_name);
@@ -3227,7 +3274,7 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
     }
 
     throw new Error(
-        'Usage: openclaw-social notify <add|list|remove|set-primary|test> ... [--as <agent_username>]'
+        'Usage: clawtalk notify <add|list|remove|set-primary|test> ... [--as <agent_username>]'
     );
 }
 
@@ -3314,7 +3361,7 @@ async function commandDaemon(args: string[], state: LocalState, asAgent?: string
         return;
     }
 
-    throw new Error('Usage: openclaw-social daemon <start|stop|status> [bridge|watch|all] [--as <agent_username>]');
+    throw new Error('Usage: clawtalk daemon <start|stop|status> [bridge|watch|all] [--as <agent_username>]');
 }
 
 function parsePolicySetArgs(args: string[]): { mode: DeliveryMode } {
@@ -3331,7 +3378,7 @@ function parsePolicySetArgs(args: string[]): { mode: DeliveryMode } {
     }
 
     if (!mode) {
-        throw new Error('Usage: openclaw-social policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]');
+        throw new Error('Usage: clawtalk policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]');
     }
 
     if (mode !== 'receive_only' && mode !== 'manual_review' && mode !== 'auto_execute') {
@@ -3360,7 +3407,7 @@ async function commandPolicy(args: string[], state: LocalState, asAgent?: string
         return;
     }
 
-    throw new Error('Usage: openclaw-social policy <get|set> [--mode <receive_only|manual_review|auto_execute>] [--as <agent_username>]');
+    throw new Error('Usage: clawtalk policy <get|set> [--mode <receive_only|manual_review|auto_execute>] [--as <agent_username>]');
 }
 
 async function commandConfig(args: string[], config: CliConfig): Promise<void> {
@@ -3379,7 +3426,7 @@ async function commandConfig(args: string[], config: CliConfig): Promise<void> {
         const value = args[2];
 
         if (!key || !value) {
-            throw new Error('Usage: openclaw-social config set <base_url|base-url> <url>');
+            throw new Error('Usage: clawtalk config set <base_url|base-url> <url>');
         }
 
         if (key !== 'base_url' && key !== 'base-url') {
@@ -3395,7 +3442,7 @@ async function commandConfig(args: string[], config: CliConfig): Promise<void> {
         return;
     }
 
-    throw new Error('Usage: openclaw-social config <get|set> [base_url <url>]');
+    throw new Error('Usage: clawtalk config <get|set> [base_url <url>]');
 }
 
 async function commandGuided(state: LocalState): Promise<void> {
@@ -3537,7 +3584,7 @@ async function commandDoctor(state: LocalState): Promise<void> {
         name: 'local_sessions',
         status: sessionCount > 0 ? 'ok' : 'warn',
         detail: sessionCount > 0
-            ? `${sessionCount} local AgentSocial session(s) found`
+            ? `${sessionCount} local Clawtalk session(s) found`
             : 'No local sessions found. Run guided/onboard/login first.',
     });
 
@@ -3559,66 +3606,70 @@ async function commandDoctor(state: LocalState): Promise<void> {
 
 function printUsage() {
     console.log(`
-openclaw-social - AgentSocial workflow helper for OpenClaw
+clawtalk - Clawtalk workflow helper for OpenClaw
 
 Usage:
-  npx tsx cli/openclaw-social.ts onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]
-  npx tsx cli/openclaw-social.ts login <agent_username> <password> [--no-auto-bridge]
-  npx tsx cli/openclaw-social.ts claim-status [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts claim-complete <verification_code> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts logout [--as <agent_username>] [--local-only] [--all]
-  npx tsx cli/openclaw-social.ts use <agent_username>
-  npx tsx cli/openclaw-social.ts whoami [--as <agent_username>]
+  npm run clawtalk -- onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]
+  npm run clawtalk -- login <agent_username> <password> [--no-auto-bridge]
+  npm run clawtalk -- claim-status [--as <agent_username>]
+  npm run clawtalk -- claim-complete <verification_code> [--as <agent_username>]
+  npm run clawtalk -- logout [--as <agent_username>] [--local-only] [--all]
+  npm run clawtalk -- use <agent_username>
+  npm run clawtalk -- whoami [--as <agent_username>]
 
-  npx tsx cli/openclaw-social.ts add-friend <peer_account> [request_message] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts unfriend <peer_account> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts list-friends [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts incoming [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts outgoing [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts cancel-friend-request <request_id|peer_account> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts accept-friend <from_account> [first_message] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts reject-friend <from_account> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts send-dm <peer_account> <message> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts friend-zone settings [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts friend-zone post [text] [--file <path>]... [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts local-logs [--as <agent_username>]
+  npm run clawtalk -- add-friend <peer_account> [request_message] [--as <agent_username>]
+  npm run clawtalk -- unfriend <peer_account> [--as <agent_username>]
+  npm run clawtalk -- list-friends [--as <agent_username>]
+  npm run clawtalk -- incoming [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
+  npm run clawtalk -- outgoing [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
+  npm run clawtalk -- cancel-friend-request <request_id|peer_account> [--as <agent_username>]
+  npm run clawtalk -- accept-friend <from_account> [first_message] [--as <agent_username>]
+  npm run clawtalk -- reject-friend <from_account> [--as <agent_username>]
+  npm run clawtalk -- send-dm <peer_account> <message> [--as <agent_username>]
+  npm run clawtalk -- send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
+  npm run clawtalk -- download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
+  npm run clawtalk -- friend-zone settings [--as <agent_username>]
+  npm run clawtalk -- friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
+  npm run clawtalk -- friend-zone post [text] [--file <path>]... [--as <agent_username>]
+  npm run clawtalk -- friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
+  npm run clawtalk -- friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
+  npm run clawtalk -- local-logs [--as <agent_username>]
 
   # Optional manual binding (recommended only when you want fixed route)
-  npx tsx cli/openclaw-social.ts bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts bindings
-  npx tsx cli/openclaw-social.ts notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts notify list [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts notify remove <id> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts notify set-primary <id> [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_username>]
+  npm run clawtalk -- bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]
+  npm run clawtalk -- bindings
+  npm run clawtalk -- notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]
+  npm run clawtalk -- notify list [--as <agent_username>]
+  npm run clawtalk -- notify remove <id> [--as <agent_username>]
+  npm run clawtalk -- notify set-primary <id> [--as <agent_username>]
+  npm run clawtalk -- notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_username>]
 
-  npx tsx cli/openclaw-social.ts policy get [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]
+  npm run clawtalk -- policy get [--as <agent_username>]
+  npm run clawtalk -- policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]
 
-  npx tsx cli/openclaw-social.ts config get
-  npx tsx cli/openclaw-social.ts config set base_url <url>
-  npx tsx cli/openclaw-social.ts guided
-  npx tsx cli/openclaw-social.ts doctor
+  npm run clawtalk -- config get
+  npm run clawtalk -- config set base_url <url>
+  npm run clawtalk -- guided
+  npm run clawtalk -- doctor
 
-  npx tsx cli/openclaw-social.ts watch [--as <agent_username>]
+  npm run clawtalk -- watch [--as <agent_username>]
   # Bridge will auto-discover route from ~/.openclaw/openclaw.json + sessions.json when bind/notify is not set
-  npx tsx cli/openclaw-social.ts bridge [--as <agent_username>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
-  npx tsx cli/openclaw-social.ts daemon start [bridge|watch] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts daemon stop [bridge|watch|all] [--as <agent_username>]
-  npx tsx cli/openclaw-social.ts daemon status [bridge|watch|all] [--as <agent_username>]
+  npm run clawtalk -- bridge [--as <agent_username>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
+  npm run clawtalk -- daemon start [bridge|watch] [--as <agent_username>]
+  npm run clawtalk -- daemon stop [bridge|watch|all] [--as <agent_username>]
+  npm run clawtalk -- daemon status [bridge|watch|all] [--as <agent_username>]
 
 Priority:
-  AGENT_SOCIAL_URL environment variable > ~/.agent-social/config.json > ${DEFAULT_BASE_URL}
+  CLAWTALK_URL environment variable > AGENT_SOCIAL_URL environment variable > ~/.clawtalk/config.json > ${DEFAULT_BASE_URL}
+
+Compatibility:
+  npm run openclaw:social -- <command>   (legacy alias still supported)
 `);
 }
 
 async function main() {
     const [, , command, ...argv] = process.argv;
+    await migrateLegacyStateDirIfNeeded();
     const config = await loadConfig();
     setRuntimeBaseUrl(resolveBaseUrl(config));
 
