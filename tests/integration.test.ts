@@ -182,6 +182,28 @@ describe('Message Envelope', () => {
         textMessageId = body.id;
         expect(body.payload.type).toBe('text');
         expect(body.payload.content).toBe('Hello!');
+        expect(body.is_sender_first_message).toBe(true);
+    });
+
+    it('should preserve delivery metadata for mailbox mode', async () => {
+        const res = await app.inject({
+            method: 'POST', url: `/api/v1/conversations/${dmConvId}/messages`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                payload: {
+                    type: 'text',
+                    content: 'Mailbox hello',
+                    data: { delivery_mode: 'mailbox', priority: 'high' },
+                },
+                client_msg_id: 'env-mailbox-001',
+            },
+        });
+        expect(res.statusCode).toBe(201);
+        const body = res.json();
+        expect(body.payload.type).toBe('text');
+        expect(body.payload.data.delivery_mode).toBe('mailbox');
+        expect(body.payload.data.priority).toBe('high');
+        expect(body.is_sender_first_message).toBe(false);
     });
 
     it('should send tool_call envelope', async () => {
@@ -875,6 +897,27 @@ describe('Upload Access Control', () => {
 });
 
 // ═══════════════════════════════════════
+// Product Funnel Telemetry
+// ═══════════════════════════════════════
+describe('Product Funnel Telemetry', () => {
+    it('should accept anonymous funnel events', async () => {
+        const readmeRes = await app.inject({
+            method: 'POST',
+            url: '/api/v1/product/funnel-events',
+            payload: { stage: 'readme_visit', install_id: 'it-install-001', source: 'integration_test' },
+        });
+        expect(readmeRes.statusCode).toBe(201);
+
+        const installRes = await app.inject({
+            method: 'POST',
+            url: '/api/v1/product/funnel-events',
+            payload: { stage: 'install_complete', install_id: 'it-install-001', source: 'integration_test' },
+        });
+        expect(installRes.statusCode).toBe(201);
+    });
+});
+
+// ═══════════════════════════════════════
 // Admin Controls
 // ═══════════════════════════════════════
 describe('Admin Controls', () => {
@@ -950,6 +993,27 @@ describe('Admin Controls', () => {
             headers: { authorization: `Bearer ${agentAToken}` },
         });
         expect(del.statusCode).toBe(200);
+    });
+
+    it('admin should read funnel summary', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/admin/funnel?since_days=90',
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        const body = res.json();
+        expect(body.since_days).toBe(90);
+        expect(Array.isArray(body.stages)).toBe(true);
+        const readme = body.stages.find((s: any) => s.stage === 'readme_visit');
+        const install = body.stages.find((s: any) => s.stage === 'install_complete');
+        const firstMessage = body.stages.find((s: any) => s.stage === 'first_message');
+        expect(readme).toBeDefined();
+        expect(install).toBeDefined();
+        expect(firstMessage).toBeDefined();
+        expect(readme.count).toBeGreaterThan(0);
+        expect(install.count).toBeGreaterThan(0);
+        expect(firstMessage.count).toBeGreaterThan(0);
     });
 });
 

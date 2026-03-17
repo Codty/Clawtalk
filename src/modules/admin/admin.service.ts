@@ -10,6 +10,19 @@ export class AdminError extends Error {
     }
 }
 
+export interface FunnelStageMetric {
+    stage: 'readme_visit' | 'install_complete' | 'register_or_claim' | 'first_friend' | 'first_message' | 'retained_day_7';
+    count: number;
+    conversion_from_previous: number | null;
+}
+
+export interface FunnelSummary {
+    since_days: number;
+    window_start: string;
+    generated_at: string;
+    stages: FunnelStageMetric[];
+}
+
 function parseUntilIso(until?: string): string | null {
     if (!until) return null;
     const date = new Date(until);
@@ -100,6 +113,153 @@ export async function listAuditLogs(options: {
     );
 
     return rows;
+}
+
+function clampSinceDays(value?: number): number {
+    if (!value || !Number.isFinite(value)) return 30;
+    return Math.min(Math.max(Math.floor(value), 1), 365);
+}
+
+async function countFunnelTelemetry(stage: 'readme_visit' | 'install_complete', sinceDays: number): Promise<number> {
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT COALESCE(NULLIF(al.metadata->>'install_id', ''), al.id::text))::int AS count
+         FROM audit_logs al
+         WHERE al.action = 'product.funnel_event'
+           AND al.metadata->>'stage' = $1
+           AND al.created_at >= NOW() - ($2::int * INTERVAL '1 day')`,
+        [stage, sinceDays]
+    );
+    return Number(rows[0]?.count || 0);
+}
+
+async function countRegisterOrClaim(sinceDays: number): Promise<number> {
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT al.agent_id)::int AS count
+         FROM audit_logs al
+         WHERE al.action IN ('auth.register', 'auth.claim_complete')
+           AND al.agent_id IS NOT NULL
+           AND al.created_at >= NOW() - ($1::int * INTERVAL '1 day')`,
+        [sinceDays]
+    );
+    return Number(rows[0]?.count || 0);
+}
+
+async function countFirstFriend(sinceDays: number): Promise<number> {
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT f.agent_id)::int AS count
+         FROM friendships f
+         WHERE f.created_at >= NOW() - ($1::int * INTERVAL '1 day')`,
+        [sinceDays]
+    );
+    return Number(rows[0]?.count || 0);
+}
+
+async function countFirstMessage(sinceDays: number): Promise<number> {
+    if (config.messageStorageMode === 'local_only') {
+        const { rows } = await pool.query(
+            `SELECT COUNT(DISTINCT al.agent_id)::int AS count
+             FROM audit_logs al
+             WHERE al.action = 'message.send'
+               AND al.agent_id IS NOT NULL
+               AND al.created_at >= NOW() - ($1::int * INTERVAL '1 day')`,
+            [sinceDays]
+        );
+        return Number(rows[0]?.count || 0);
+    }
+
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT m.sender_id)::int AS count
+         FROM messages m
+         WHERE m.created_at >= NOW() - ($1::int * INTERVAL '1 day')`,
+        [sinceDays]
+    );
+    return Number(rows[0]?.count || 0);
+}
+
+async function countRetainedDay7(sinceDays: number): Promise<number> {
+    if (config.messageStorageMode === 'local_only') {
+        const { rows } = await pool.query(
+            `SELECT COUNT(*)::int AS count
+             FROM agents a
+             WHERE a.created_at >= NOW() - ($1::int * INTERVAL '1 day')
+               AND EXISTS (
+                   SELECT 1
+                   FROM audit_logs al
+                   WHERE al.agent_id = a.id
+                     AND al.action = 'message.send'
+                     AND al.created_at >= a.created_at + INTERVAL '7 day'
+               )`,
+            [sinceDays]
+        );
+        return Number(rows[0]?.count || 0);
+    }
+
+    const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM agents a
+         WHERE a.created_at >= NOW() - ($1::int * INTERVAL '1 day')
+           AND EXISTS (
+               SELECT 1
+               FROM messages m
+               WHERE m.sender_id = a.id
+                 AND m.created_at >= a.created_at + INTERVAL '7 day'
+           )`,
+        [sinceDays]
+    );
+    return Number(rows[0]?.count || 0);
+}
+
+function conversion(prev: number, current: number): number | null {
+    if (!prev) return null;
+    const value = (current / prev) * 100;
+    return Math.round(value * 100) / 100;
+}
+
+export async function getFunnelSummary(options: { sinceDays?: number } = {}): Promise<FunnelSummary> {
+    const sinceDays = clampSinceDays(options.sinceDays);
+
+    const readmeVisit = await countFunnelTelemetry('readme_visit', sinceDays);
+    const installComplete = await countFunnelTelemetry('install_complete', sinceDays);
+    const registerOrClaim = await countRegisterOrClaim(sinceDays);
+    const firstFriend = await countFirstFriend(sinceDays);
+    const firstMessage = await countFirstMessage(sinceDays);
+    const retainedDay7 = await countRetainedDay7(sinceDays);
+
+    const stages: FunnelStageMetric[] = [
+        { stage: 'readme_visit', count: readmeVisit, conversion_from_previous: null },
+        {
+            stage: 'install_complete',
+            count: installComplete,
+            conversion_from_previous: conversion(readmeVisit, installComplete),
+        },
+        {
+            stage: 'register_or_claim',
+            count: registerOrClaim,
+            conversion_from_previous: conversion(installComplete, registerOrClaim),
+        },
+        {
+            stage: 'first_friend',
+            count: firstFriend,
+            conversion_from_previous: conversion(registerOrClaim, firstFriend),
+        },
+        {
+            stage: 'first_message',
+            count: firstMessage,
+            conversion_from_previous: conversion(firstFriend, firstMessage),
+        },
+        {
+            stage: 'retained_day_7',
+            count: retainedDay7,
+            conversion_from_previous: conversion(firstMessage, retainedDay7),
+        },
+    ];
+
+    return {
+        since_days: sinceDays,
+        window_start: new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString(),
+        generated_at: new Date().toISOString(),
+        stages,
+    };
 }
 
 export async function addRiskWhitelistIp(ip: string, createdBy: string, note?: string) {

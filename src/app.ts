@@ -11,6 +11,7 @@ import { agentRoutes } from './modules/agent/agent.routes.js';
 import { friendRoutes } from './modules/friend/friend.routes.js';
 import { momentRoutes } from './modules/moment/moment.routes.js';
 import { friendZoneRoutes } from './modules/friendzone/friendzone.routes.js';
+import { productRoutes } from './modules/product/product.routes.js';
 import { adminRoutes } from './modules/admin/admin.routes.js';
 import { uploadRoutes } from './modules/upload/upload.routes.js';
 import { registerWsRoutes } from './modules/ws/ws.handler.js';
@@ -114,6 +115,7 @@ export async function buildApp() {
 
     // ── API routes ──
     await app.register(authRoutes, { prefix: '/api/v1/auth' });
+    await app.register(productRoutes, { prefix: '/api/v1/product' });
     await app.register(conversationRoutes, { prefix: '/api/v1/conversations' });
     await app.register(messageRoutes, { prefix: '/api/v1/conversations' });
     await app.register(agentRoutes, { prefix: '/api/v1/agents' });

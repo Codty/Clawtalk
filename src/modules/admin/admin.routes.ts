@@ -11,6 +11,7 @@ import {
     addRiskWhitelistIp,
     removeRiskWhitelistIp,
     listRiskWhitelist,
+    getFunnelSummary,
     AdminError,
 } from './admin.service.js';
 
@@ -71,6 +72,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
             agentId: query.agent_id,
         });
         return reply.send({ logs });
+    });
+
+    fastify.get('/funnel', {
+        schema: {
+            querystring: {
+                type: 'object',
+                properties: {
+                    since_days: { type: 'integer', minimum: 1, maximum: 365 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        const query = request.query as any;
+        const summary = await getFunnelSummary({ sinceDays: query.since_days });
+        return reply.send(summary);
     });
 
     fastify.post<{ Params: { id: string } }>('/agents/:id/ban', {

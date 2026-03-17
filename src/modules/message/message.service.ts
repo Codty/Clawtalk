@@ -38,6 +38,7 @@ export interface MessageRow {
     read_at?: string | null;
     read_count?: number;
     attachments?: any[];
+    is_sender_first_message?: boolean;
 }
 
 function toIsoOrNull(value: string | null | undefined): string | null {
@@ -251,6 +252,7 @@ function buildLocalOnlyMessageRow(
     content: string,
     envelope: MessageEnvelope,
     attachments: AttachmentInput[],
+    isSenderFirstMessage: boolean,
     clientMsgId?: string
 ): MessageRow {
     const now = new Date().toISOString();
@@ -263,6 +265,7 @@ function buildLocalOnlyMessageRow(
         client_msg_id: clientMsgId || null,
         created_at: now,
         read_count: 0,
+        is_sender_first_message: isSenderFirstMessage,
         attachments: attachments.map((item) => ({
             id: randomUUID(),
             url: item.url,
@@ -271,6 +274,33 @@ function buildLocalOnlyMessageRow(
             metadata: item.metadata || {},
             created_at: now,
         })),
+    };
+}
+
+async function computeLocalOnlyFirstMessage(senderId: string): Promise<boolean> {
+    const key = `milestone:first_message:${senderId}`;
+    try {
+        const result = await redis.set(key, '1', 'NX');
+        return result === 'OK';
+    } catch (err) {
+        // Milestone signal should not break message delivery in local_only mode.
+        console.error('Failed to compute local-only first-message milestone:', err);
+        return false;
+    }
+}
+
+async function markSenderFirstMessageFlag(message: MessageRow): Promise<MessageRow> {
+    const { rows } = await pool.query(
+        `SELECT EXISTS(
+             SELECT 1 FROM messages
+             WHERE sender_id = $1 AND id <> $2
+         ) AS has_previous`,
+        [message.sender_id, message.id]
+    );
+    const hasPrevious = !!rows[0]?.has_previous;
+    return {
+        ...message,
+        is_sender_first_message: !hasPrevious,
     };
 }
 
@@ -321,12 +351,14 @@ export async function sendMessage(
     }
 
     if (config.messageStorageMode === 'local_only') {
+        const isSenderFirstMessage = await computeLocalOnlyFirstMessage(senderId);
         const message = buildLocalOnlyMessageRow(
             conversationId,
             senderId,
             content,
             envelope,
             attachments,
+            isSenderFirstMessage,
             clientMsgId
         );
 
@@ -367,7 +399,8 @@ export async function sendMessage(
                 if (existing.length === 0) {
                     throw new MessageError('Failed to resolve idempotent message', 409);
                 }
-                return getMessageForViewer(existing[0].id, senderId);
+                const hydrated = await getMessageForViewer(existing[0].id, senderId);
+                return markSenderFirstMessageFlag(hydrated);
             }
             message = rows[0];
         } else {
@@ -415,7 +448,8 @@ export async function sendMessage(
         message.created_at
     );
 
-    return getMessageForViewer(message.id, senderId);
+    const hydrated = await getMessageForViewer(message.id, senderId);
+    return markSenderFirstMessageFlag(hydrated);
 }
 
 /**

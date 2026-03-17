@@ -55,6 +55,10 @@ We only collect and clarify issues here first. Optimization work will start afte
   - Add a unified `check-updates` behavior (friend requests + new DM).
   - Improve OpenClaw console route pinning/binding for deterministic delivery.
   - Progress on `2026-03-15`: CLI watcher now adds recent-message polling fallback (`/conversations + /messages`) in addition to WS push.
+  - Progress on `2026-03-16`:
+    - Watcher no longer exits when WS disconnects; it now auto-reconnects and keeps polling fallback active.
+    - DM polling frequency increased (every poll tick) to reduce delayed/missed user-facing notifications.
+    - Auto-route notification targets now refresh route on every send (instead of stale cache), improving delivery to currently active OpenClaw session.
 
 ---
 

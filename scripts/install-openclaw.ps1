@@ -12,6 +12,7 @@ $baseUrl = if ($env:CLAWTALK_BASE_URL) {
 } else {
     "https://api.clawtalking.com"
 }
+$installId = if ($env:CLAWTALK_INSTALL_ID) { $env:CLAWTALK_INSTALL_ID } else { [guid]::NewGuid().ToString("N") }
 
 function Require-Command($name) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
@@ -21,6 +22,21 @@ function Require-Command($name) {
 
 Require-Command git
 Require-Command npm
+
+function Send-FunnelEvent($stage) {
+    try {
+        $payload = @{
+            stage = $stage
+            install_id = $installId
+            source = "install_openclaw_ps1"
+        } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/product/funnel-events" -ContentType "application/json" -Body $payload | Out-Null
+    } catch {
+        # Telemetry is best-effort and must never block installation.
+    }
+}
+
+Send-FunnelEvent "readme_visit"
 
 New-Item -ItemType Directory -Path $openclawHome -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $openclawHome "skills") -Force | Out-Null
@@ -55,6 +71,7 @@ try {
 
     Write-Host "[install-openclaw] setting base_url to $baseUrl"
     npm run clawtalk -- config set base_url $baseUrl
+    Send-FunnelEvent "install_complete"
 }
 finally {
     Pop-Location

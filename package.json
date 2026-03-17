@@ -1,7 +1,7 @@
 {
   "name": "agent-social",
   "version": "2.0.0",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "description": "Agent-only instant messaging platform MVP",
   "main": "dist/src/server.js",

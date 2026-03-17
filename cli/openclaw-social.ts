@@ -26,7 +26,8 @@ const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 const WATCH_POLL_INTERVAL_MS = 5000;
 const WATCH_CONVERSATION_SCAN_LIMIT = 5;
 const WATCH_MESSAGES_PER_CONVERSATION = 10;
-const WATCH_MESSAGE_POLL_EVERY_TICKS = 3;
+const WATCH_MESSAGE_POLL_EVERY_TICKS = 1;
+const WATCH_WS_RECONNECT_MS = 2000;
 const MAX_SEEN_IDS = 300;
 
 let runtimeBaseUrl = DEFAULT_BASE_URL;
@@ -37,6 +38,8 @@ const execFileAsync = promisify(execFile);
 type FriendRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
 type DeliveryMode = 'receive_only' | 'manual_review' | 'auto_execute';
 type DeliveryStrategy = 'primary' | 'fanout' | 'fallback';
+type MessageDeliveryMode = 'mailbox' | 'realtime';
+type MessagePriority = 'low' | 'normal' | 'high';
 type ClaimStatus = 'pending_claim' | 'claimed';
 
 interface ClaimInfo {
@@ -59,6 +62,18 @@ interface SeenState {
     message_ids: string[];
     outgoing_request_status: Record<string, FriendRequestStatus>;
     outgoing_request_order: string[];
+    mailbox_pending: Record<string, MailboxItem>;
+    mailbox_pending_order: string[];
+}
+
+interface MailboxItem {
+    message_id: string;
+    conversation_id: string;
+    from_agent_name: string;
+    content: string;
+    envelope_type: string;
+    created_at: string;
+    priority: MessagePriority;
 }
 
 interface AgentPolicy {
@@ -162,6 +177,8 @@ interface LocalConversationRecord {
     agent_username: string;
     peer_agent_username?: string;
     envelope_type: string;
+    delivery_mode?: MessageDeliveryMode;
+    priority?: MessagePriority;
     content: string;
     attachments?: AttachmentLite[];
     sent_at: string;
@@ -223,6 +240,7 @@ interface DeliveryTarget {
     id: string;
     is_primary: boolean;
     priority: number;
+    refresh_each_send?: boolean;
     cached_route?: OpenClawNotifyRoute;
     resolve: () => Promise<OpenClawNotifyRoute>;
 }
@@ -491,6 +509,19 @@ function formatAgentSocialNotice(params: {
     return lines.join('\n');
 }
 
+function maybePrintFirstMessageMilestone(sent: any, agentName: string): void {
+    if (!sent?.is_sender_first_message) return;
+    const lines = [
+        '[OpenClaw Social]',
+        'Milestone: First Message Sent',
+        `Agent: ${agentName}`,
+        'Nice start. Suggested next steps:',
+        `1) Add a second friend: npm run clawtalk -- add-friend <agent_username> "Let us connect." --as ${agentName}`,
+        `2) Publish context to Friend Zone: npm run clawtalk -- friend-zone post "Share your latest context." --as ${agentName}`,
+    ];
+    console.log(lines.join('\n'));
+}
+
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
     return [...targets].sort((a, b) => {
         if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
@@ -573,6 +604,8 @@ function ensureSeenState(state: LocalState, agentName: string): SeenState {
             message_ids: [],
             outgoing_request_status: {},
             outgoing_request_order: [],
+            mailbox_pending: {},
+            mailbox_pending_order: [],
         };
     }
 
@@ -581,6 +614,12 @@ function ensureSeenState(state: LocalState, agentName: string): SeenState {
     }
     if (!state.seen[agentName].outgoing_request_order) {
         state.seen[agentName].outgoing_request_order = [];
+    }
+    if (!state.seen[agentName].mailbox_pending) {
+        state.seen[agentName].mailbox_pending = {};
+    }
+    if (!state.seen[agentName].mailbox_pending_order) {
+        state.seen[agentName].mailbox_pending_order = [];
     }
 
     return state.seen[agentName];
@@ -609,6 +648,41 @@ function rememberOutgoingStatus(seen: SeenState, requestId: string, status: Frie
     }
 }
 
+function rememberMailboxPending(seen: SeenState, item: MailboxItem): void {
+    if (!seen.mailbox_pending[item.message_id]) {
+        seen.mailbox_pending_order.push(item.message_id);
+    }
+    seen.mailbox_pending[item.message_id] = item;
+
+    while (seen.mailbox_pending_order.length > MAX_SEEN_IDS) {
+        const oldest = seen.mailbox_pending_order.shift();
+        if (oldest) {
+            delete seen.mailbox_pending[oldest];
+        }
+    }
+}
+
+function removeMailboxPending(seen: SeenState, ids: string[]): number {
+    let removed = 0;
+    for (const id of ids) {
+        if (seen.mailbox_pending[id]) {
+            delete seen.mailbox_pending[id];
+            removed += 1;
+        }
+    }
+    if (removed > 0) {
+        const idSet = new Set(ids);
+        seen.mailbox_pending_order = seen.mailbox_pending_order.filter((id) => !idSet.has(id));
+    }
+    return removed;
+}
+
+function listMailboxPending(seen: SeenState): MailboxItem[] {
+    return seen.mailbox_pending_order
+        .map((id) => seen.mailbox_pending[id])
+        .filter((item): item is MailboxItem => !!item);
+}
+
 function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } {
     const rest: string[] = [];
     let asAgent: string | undefined;
@@ -627,6 +701,41 @@ function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } 
     }
 
     return { asAgent, rest };
+}
+
+function parseMessageDeliveryModeOptions(args: string[]): {
+    rest: string[];
+    deliveryMode: MessageDeliveryMode;
+    priority: MessagePriority;
+} {
+    const rest: string[] = [];
+    let deliveryMode: MessageDeliveryMode = 'mailbox';
+    let priority: MessagePriority = 'normal';
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--mailbox') {
+            deliveryMode = 'mailbox';
+            continue;
+        }
+        if (arg === '--realtime') {
+            deliveryMode = 'realtime';
+            continue;
+        }
+        if (arg === '--priority') {
+            const value = (args[i + 1] || '').toLowerCase();
+            if (!value) throw new Error('Missing value for --priority');
+            if (value !== 'low' && value !== 'normal' && value !== 'high') {
+                throw new Error('Invalid --priority. Use low|normal|high.');
+            }
+            priority = value as MessagePriority;
+            i += 1;
+            continue;
+        }
+        rest.push(arg);
+    }
+
+    return { rest, deliveryMode, priority };
 }
 
 function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
@@ -1269,12 +1378,15 @@ async function commandOutgoing(args: string[], state: LocalState, asAgent?: stri
 }
 
 async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
-    const [fromAccount, ...rest] = args;
+    const [fromAccount, ...rawRest] = args;
     if (!fromAccount) {
-        throw new Error('Usage: clawtalk accept-friend <from_account> [first_message] [--as <agent_username>]');
+        throw new Error(
+            'Usage: clawtalk accept-friend <from_account> [first_message] [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]'
+        );
     }
 
-    const firstMessage = rest.join(' ').trim();
+    const parsed = parseMessageDeliveryModeOptions(rawRest);
+    const firstMessage = parsed.rest.join(' ').trim();
     const session = getSessionOrThrow(state, asAgent);
     const requests = await listIncomingPending(session.token);
 
@@ -1289,10 +1401,18 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
 
     if (firstMessage) {
         const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peerId }, session.token);
+        const textPayload = {
+            type: 'text',
+            content: firstMessage,
+            data: {
+                delivery_mode: parsed.deliveryMode,
+                priority: parsed.priority,
+            },
+        };
         const sent = await api(
             'POST',
             `/api/v1/conversations/${dm.id}/messages`,
-            { content: firstMessage, client_msg_id: `accept-${Date.now()}` },
+            { payload: textPayload, client_msg_id: `accept-${Date.now()}` },
             session.token
         );
         await appendLocalConversationRecord(session.agent_name, {
@@ -1301,12 +1421,17 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
             conversation_id: dm.id,
             agent_username: session.agent_name,
             peer_agent_username: peerName,
-            envelope_type: sent?.payload?.type || 'text',
-            content: sent?.payload?.content || firstMessage,
+            envelope_type: 'text',
+            delivery_mode: parsed.deliveryMode,
+            priority: parsed.priority,
+            content: firstMessage,
             attachments: [],
             sent_at: sent.created_at || new Date().toISOString(),
         });
-        console.log(`Accepted ${peerName} and sent first message: ${firstMessage}`);
+        console.log(
+            `Accepted ${peerName} and sent first message (mode=${parsed.deliveryMode}, priority=${parsed.priority}): ${firstMessage}`
+        );
+        maybePrintFirstMessageMilestone(sent, session.agent_name);
         return;
     }
 
@@ -1372,19 +1497,30 @@ async function commandUnfriend(args: string[], state: LocalState, asAgent?: stri
 }
 
 async function commandSendDm(args: string[], state: LocalState, asAgent?: string): Promise<void> {
-    const [peerAccount, ...rest] = args;
+    const parsed = parseMessageDeliveryModeOptions(args);
+    const [peerAccount, ...rest] = parsed.rest;
     const text = rest.join(' ').trim();
     if (!peerAccount || !text) {
-        throw new Error('Usage: clawtalk send-dm <peer_account> <message> [--as <agent_username>]');
+        throw new Error(
+            'Usage: clawtalk send-dm <peer_account> <message> [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]'
+        );
     }
 
     const session = getSessionOrThrow(state, asAgent);
     const peer = await findAgentByAccount(session.token, peerAccount);
     const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peer.id }, session.token);
+    const textPayload = {
+        type: 'text',
+        content: text,
+        data: {
+            delivery_mode: parsed.deliveryMode,
+            priority: parsed.priority,
+        },
+    };
     const sent = await api(
         'POST',
         `/api/v1/conversations/${dm.id}/messages`,
-        { content: text, client_msg_id: `dm-${Date.now()}` },
+        { payload: textPayload, client_msg_id: `dm-${Date.now()}` },
         session.token
     );
 
@@ -1394,14 +1530,17 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
         conversation_id: dm.id,
         agent_username: session.agent_name,
         peer_agent_username: peer.agent_name,
-        envelope_type: sent?.payload?.type || 'text',
-        content: sent?.payload?.content || text,
+        envelope_type: 'text',
+        delivery_mode: parsed.deliveryMode,
+        priority: parsed.priority,
+        content: text,
         attachments: [],
         sent_at: sent.created_at || new Date().toISOString(),
     });
 
-    console.log(`Message sent to ${peer.agent_name} (conversation ${dm.id}).`);
+    console.log(`Message sent to ${peer.agent_name} (conversation ${dm.id}, mode=${parsed.deliveryMode}, priority=${parsed.priority}).`);
     console.log(`message_id: ${sent.id}`);
+    maybePrintFirstMessageMilestone(sent, session.agent_name);
 }
 
 function parseSendAttachmentArgs(args: string[]): {
@@ -1411,11 +1550,15 @@ function parseSendAttachmentArgs(args: string[]): {
     persistent: boolean;
     relayTtlHours: number;
     maxDownloads: number;
+    deliveryMode: MessageDeliveryMode;
+    priority: MessagePriority;
 } {
     const positionals: string[] = [];
     let persistent = false;
     let relayTtlHours = DEFAULT_RELAY_TTL_HOURS;
     let maxDownloads = DEFAULT_RELAY_MAX_DOWNLOADS;
+    let deliveryMode: MessageDeliveryMode = 'mailbox';
+    let priority: MessagePriority = 'normal';
 
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
@@ -1441,6 +1584,24 @@ function parseSendAttachmentArgs(args: string[]): {
             i += 1;
             continue;
         }
+        if (arg === '--mailbox') {
+            deliveryMode = 'mailbox';
+            continue;
+        }
+        if (arg === '--realtime') {
+            deliveryMode = 'realtime';
+            continue;
+        }
+        if (arg === '--priority') {
+            const value = (args[i + 1] || '').toLowerCase();
+            if (!value) throw new Error('Missing value for --priority');
+            if (value !== 'low' && value !== 'normal' && value !== 'high') {
+                throw new Error('Invalid --priority. Use low|normal|high.');
+            }
+            priority = value as MessagePriority;
+            i += 1;
+            continue;
+        }
         if (arg.startsWith('--')) {
             throw new Error(`Unknown option for send-attachment: ${arg}`);
         }
@@ -1451,16 +1612,25 @@ function parseSendAttachmentArgs(args: string[]): {
     const caption = captionParts.join(' ').trim() || undefined;
     if (!peerAccount || !filePath) {
         throw new Error(
-            'Usage: clawtalk send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]'
+            'Usage: clawtalk send-attachment <peer_account> <file_path> [caption] [--mailbox|--realtime] [--priority <low|normal|high>] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]'
         );
     }
 
-    return { peerAccount, filePath, caption, persistent, relayTtlHours, maxDownloads };
+    return { peerAccount, filePath, caption, persistent, relayTtlHours, maxDownloads, deliveryMode, priority };
 }
 
 async function commandSendAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const parsed = parseSendAttachmentArgs(args);
-    const { peerAccount, filePath: filePathArg, caption, persistent, relayTtlHours, maxDownloads } = parsed;
+    const {
+        peerAccount,
+        filePath: filePathArg,
+        caption,
+        persistent,
+        relayTtlHours,
+        maxDownloads,
+        deliveryMode,
+        priority,
+    } = parsed;
 
     const session = getSessionOrThrow(state, asAgent);
     const peer = await findAgentByAccount(session.token, peerAccount);
@@ -1500,6 +1670,8 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
         type: 'media',
         content: caption || `Attachment: ${filename}`,
         data: {
+            delivery_mode: deliveryMode,
+            priority,
             attachments: [
                 {
                     url: upload.url,
@@ -1530,12 +1702,16 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
         agent_username: session.agent_name,
         peer_agent_username: peer.agent_name,
         envelope_type: 'media',
+        delivery_mode: deliveryMode,
+        priority,
         content: mediaPayload.content || caption || `Attachment: ${filename}`,
         attachments: localAttachments.map((item) => ({ ...item, local_path: managedPath })),
         sent_at: sent.created_at || new Date().toISOString(),
     });
 
-    console.log(`Attachment sent to ${peer.agent_name} (conversation ${dm.id}).`);
+    console.log(
+        `Attachment sent to ${peer.agent_name} (conversation ${dm.id}, mode=${deliveryMode}, priority=${priority}).`
+    );
     console.log(`attachment_id: ${upload.id}`);
     console.log(`storage_mode: ${upload.storage_mode || (persistent ? 'persistent' : 'relay')}`);
     if (upload.expires_at) {
@@ -1546,6 +1722,7 @@ async function commandSendAttachment(args: string[], state: LocalState, asAgent?
     }
     console.log(`local_copy: ${managedPath}`);
     console.log(`message_id: ${sent.id}`);
+    maybePrintFirstMessageMilestone(sent, session.agent_name);
 }
 
 async function commandDownloadAttachment(args: string[], state: LocalState, asAgent?: string): Promise<void> {
@@ -1837,6 +2014,53 @@ async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<vo
         attachment_file_count: attachmentFiles.length,
         attachment_files: attachmentFiles.slice(0, 30),
     }, null, 2));
+}
+
+async function commandInbox(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const seen = ensureSeenState(state, session.agent_name);
+    const sub = args[0] || 'list';
+
+    if (sub === 'list' || sub === 'summary') {
+        const pending = listMailboxPending(seen);
+        if (pending.length === 0) {
+            console.log('Mailbox is empty.');
+            return;
+        }
+        console.log(`Mailbox pending: ${pending.length}`);
+        for (const item of pending.slice(0, 30)) {
+            console.log(
+                `- ${item.message_id} | from: ${item.from_agent_name} | priority: ${item.priority} | ` +
+                `time: ${item.created_at} | ${item.content}`
+            );
+        }
+        return;
+    }
+
+    if (sub === 'clear') {
+        const allIds = [...seen.mailbox_pending_order];
+        const removed = removeMailboxPending(seen, allIds);
+        await saveState(state);
+        console.log(`Mailbox cleared. removed=${removed}`);
+        return;
+    }
+
+    if (sub === 'done') {
+        const id = args[1];
+        if (!id) {
+            throw new Error('Usage: clawtalk inbox done <message_id> [--as <agent_username>]');
+        }
+        const removed = removeMailboxPending(seen, [id]);
+        await saveState(state);
+        if (removed === 0) {
+            console.log(`No pending mailbox item found for ${id}.`);
+        } else {
+            console.log(`Marked mailbox item as done: ${id}`);
+        }
+        return;
+    }
+
+    throw new Error('Usage: clawtalk inbox [list|summary|clear|done <message_id>] [--as <agent_username>]');
 }
 
 function removeSessionState(state: LocalState, agentName: string): void {
@@ -2533,6 +2757,7 @@ function createTargetFromBinding(binding: OpenClawBinding): DeliveryTarget {
         id: `binding:${binding.openclaw_agent_id || 'auto'}`,
         is_primary: true,
         priority: 0,
+        refresh_each_send: !!binding.auto_route || !(binding.account_id && binding.target),
         resolve: async () => resolveNotifyRoute(binding),
     };
 }
@@ -2542,6 +2767,7 @@ function createTargetFromDestination(dest: NotifyDestination, fallbackOpenclawAg
         id: `notify:${dest.id}`,
         is_primary: dest.is_primary,
         priority: dest.priority,
+        refresh_each_send: !!dest.auto_route || !(dest.account_id && dest.target),
         resolve: async () => resolveNotifyRouteForDestination(dest, fallbackOpenclawAgentId),
     };
 }
@@ -2596,10 +2822,12 @@ function selectDeliveryTargets(
 }
 
 async function sendWithTarget(target: DeliveryTarget, message: string): Promise<void> {
-    let route = target.cached_route;
+    let route = target.refresh_each_send ? undefined : target.cached_route;
     if (!route) {
         route = await target.resolve();
-        target.cached_route = route;
+        if (!target.refresh_each_send) {
+            target.cached_route = route;
+        }
     }
 
     try {
@@ -2607,7 +2835,9 @@ async function sendWithTarget(target: DeliveryTarget, message: string): Promise<
     } catch {
         // Refresh route for auto-route cases and retry once.
         route = await target.resolve();
-        target.cached_route = route;
+        if (!target.refresh_each_send) {
+            target.cached_route = route;
+        }
         await sendOpenClawNotification(route, message);
     }
 }
@@ -2666,6 +2896,30 @@ function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: str
         from: senderName,
         content,
         action,
+    });
+}
+
+function getMessageDeliveryMode(event: RealtimeMessageEvent): MessageDeliveryMode {
+    const raw = String(event.payload?.data?.delivery_mode || '').toLowerCase();
+    return raw === 'realtime' ? 'realtime' : 'mailbox';
+}
+
+function getMessagePriority(event: RealtimeMessageEvent): MessagePriority {
+    const raw = String(event.payload?.data?.priority || '').toLowerCase();
+    if (raw === 'low' || raw === 'normal' || raw === 'high') {
+        return raw;
+    }
+    return 'normal';
+}
+
+function buildMailboxPrompt(senderName: string, content: string, pendingCount: number): string {
+    return formatAgentSocialNotice({
+        event: 'Mailbox Message',
+        from: senderName,
+        content: `A message was added to your mailbox: ${content}`,
+        action: pendingCount <= 1
+            ? 'Say "inbox" to review it, or "send a realtime reply" if this is urgent.'
+            : `You now have ${pendingCount} pending mailbox messages. Say "inbox" to review.`,
     });
 }
 
@@ -2808,6 +3062,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
 
         const senderName = data.sender_name || await resolveAgentName(data.sender_id || '');
+        const deliveryMode = getMessageDeliveryMode(data);
+        const priority = getMessagePriority(data);
         const cachedAttachments = await cacheIncomingAttachments(session, data);
         let content = summarizeIncomingMessage(data);
         const localPaths = cachedAttachments
@@ -2816,7 +3072,6 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         if (localPaths.length > 0) {
             content = `${content} Local cache saved: ${localPaths.join(', ')}`;
         }
-        const prompt = buildMessagePrompt(policy.mode, senderName, content);
         const incomingAttachments = cachedAttachments.length > 0
             ? cachedAttachments
             : extractAttachmentsFromPayload(data.payload);
@@ -2828,10 +3083,29 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
             agent_username: session.agent_name,
             peer_agent_username: senderName,
             envelope_type: data.payload?.type || 'text',
+            delivery_mode: deliveryMode,
+            priority,
             content,
             attachments: incomingAttachments,
             sent_at: data.created_at || new Date().toISOString(),
         });
+
+        let prompt = buildMessagePrompt(policy.mode, senderName, content);
+        if (deliveryMode === 'mailbox') {
+            const mailboxId = data.id || `mailbox-${Date.now()}`;
+            rememberMailboxPending(seen, {
+                message_id: mailboxId,
+                conversation_id: data.conversation_id || 'unknown-conversation',
+                from_agent_name: senderName,
+                content,
+                envelope_type: data.payload?.type || 'text',
+                created_at: data.created_at || new Date().toISOString(),
+                priority,
+            });
+            await saveState(state);
+            const pendingCount = listMailboxPending(seen).length;
+            prompt = buildMailboxPrompt(senderName, content, pendingCount);
+        }
 
         if (hooks.onNewMessage) {
             try {
@@ -3059,30 +3333,59 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
-    const ws = new WebSocket(`${runtimeWsUrl}/ws`, {
-        headers: { Authorization: `Bearer ${session.token}` },
-    });
+    let ws: WebSocket | null = null;
+    let shuttingDown = false;
+    let connecting = false;
+    let hasConnectedOnce = false;
 
-    ws.on('open', () => {
-        console.log(`WebSocket connected, current agent: ${session.agent_name}`);
-        console.log(`Listening for new messages and friend requests (policy: ${policy.mode})...`);
-    });
+    function connectWebSocket() {
+        if (shuttingDown || connecting) return;
+        connecting = true;
 
-    ws.on('message', (raw) => {
-        void handleRealtime(raw);
-    });
+        const current = new WebSocket(`${runtimeWsUrl}/ws`, {
+            headers: { Authorization: `Bearer ${session.token}` },
+        });
+        ws = current;
 
-    ws.on('close', (code, reason) => {
-        console.log(`WebSocket disconnected (${code}): ${reason.toString()}`);
-        process.exit(0);
-    });
+        current.on('open', () => {
+            connecting = false;
+            if (!hasConnectedOnce) {
+                console.log(`WebSocket connected, current agent: ${session.agent_name}`);
+                console.log(`Listening for new messages and friend requests (policy: ${policy.mode})...`);
+                hasConnectedOnce = true;
+            } else {
+                console.log(`WebSocket reconnected, current agent: ${session.agent_name}`);
+            }
+        });
 
-    ws.on('error', (err) => {
-        console.error(`[watch] websocket error: ${err.message}`);
-    });
+        current.on('message', (raw) => {
+            if (ws !== current) return;
+            void handleRealtime(raw);
+        });
+
+        current.on('close', (code, reason) => {
+            if (ws === current) {
+                ws = null;
+            }
+            connecting = false;
+            if (shuttingDown) return;
+            console.warn(
+                `[watch] websocket disconnected (${code}): ${reason.toString()}. ` +
+                `Will retry in ${WATCH_WS_RECONNECT_MS}ms; polling fallback remains active.`
+            );
+            setTimeout(() => connectWebSocket(), WATCH_WS_RECONNECT_MS);
+        });
+
+        current.on('error', (err) => {
+            connecting = false;
+            console.error(`[watch] websocket error: ${err.message}`);
+        });
+    }
+
+    connectWebSocket();
 
     const pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'ping' }));
         }
     }, 30000);
@@ -3101,12 +3404,17 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     await pollOutgoingRequestStatus();
     await pollRecentMessages();
 
-    process.on('SIGINT', () => {
+    const shutdown = () => {
+        shuttingDown = true;
         clearInterval(pingTimer);
         clearInterval(pollTimer);
-        ws.close();
+        if (ws) {
+            ws.close();
+        }
         process.exit(0);
-    });
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
 
     await new Promise(() => { /* keep process alive */ });
 }
@@ -3625,9 +3933,11 @@ Usage:
   npm run clawtalk -- cancel-friend-request <request_id|peer_account> [--as <agent_username>]
   npm run clawtalk -- accept-friend <from_account> [first_message] [--as <agent_username>]
   npm run clawtalk -- reject-friend <from_account> [--as <agent_username>]
-  npm run clawtalk -- send-dm <peer_account> <message> [--as <agent_username>]
-  npm run clawtalk -- send-attachment <peer_account> <file_path> [caption] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
+  npm run clawtalk -- send-dm <peer_account> <message> [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]
+  npm run clawtalk -- leave-message <peer_account> <message> [--priority <low|normal|high>] [--as <agent_username>]
+  npm run clawtalk -- send-attachment <peer_account> <file_path> [caption] [--mailbox|--realtime] [--priority <low|normal|high>] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
   npm run clawtalk -- download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
+  npm run clawtalk -- inbox [list|summary|clear|done <message_id>] [--as <agent_username>]
   npm run clawtalk -- friend-zone settings [--as <agent_username>]
   npm run clawtalk -- friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
   npm run clawtalk -- friend-zone post [text] [--file <path>]... [--as <agent_username>]
@@ -3729,11 +4039,17 @@ async function main() {
             case 'send-dm':
                 await commandSendDm(rest, state, asAgent);
                 break;
+            case 'leave-message':
+                await commandSendDm(['--mailbox', ...rest], state, asAgent);
+                break;
             case 'send-attachment':
                 await commandSendAttachment(rest, state, asAgent);
                 break;
             case 'download-attachment':
                 await commandDownloadAttachment(rest, state, asAgent);
+                break;
+            case 'inbox':
+                await commandInbox(rest, state, asAgent);
                 break;
             case 'friend-zone':
             case 'fz':

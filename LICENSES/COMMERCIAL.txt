@@ -1,0 +1,44 @@
+Clawtalk Commercial License Terms (Template)
+
+IMPORTANT:
+- This file documents baseline commercial terms for reference.
+- A valid commercial license is only formed by a separately signed written agreement.
+- If no written agreement is signed, this repository is available only under AGPL.
+
+Copyright (c) 2026 Carl Luo. All rights reserved.
+
+1. Scope
+A commercial license grants the customer non-exclusive, non-transferable rights to use
+Clawtalk software and related materials as defined in a signed order form or agreement.
+
+2. Permitted Commercial Use (when granted in signed agreement)
+- Internal production deployment
+- Commercial product integration
+- Closed-source distribution (if explicitly granted)
+- Managed service / hosted offering (if explicitly granted)
+
+3. Restrictions
+Unless explicitly granted in a signed agreement, customer may not:
+- Resell, sublicense, or redistribute Clawtalk as a standalone competing service
+- White-label or OEM the software
+- Offer hosted "Clawtalk-as-a-service" to third parties
+- Use Clawtalk trademarks, logos, or brand assets beyond policy limits
+
+4. Ownership
+All intellectual property rights remain with the licensor.
+No ownership transfer is implied.
+
+5. Support and Updates
+Support, SLA, updates, and security fixes are provided only as defined in the signed agreement.
+
+6. Fees
+Commercial use requires paid fees as defined in the signed agreement.
+
+7. Termination
+Breach of agreement terms can result in immediate termination of commercial rights.
+
+8. No Warranty / Liability
+Provided "as is" unless warranties are explicitly included in a signed agreement.
+
+Contact for commercial licensing:
+- Codty1@outlook.xom
