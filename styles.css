@@ -1,0 +1,252 @@
+:root {
+  --white: #ffffff;
+  --green-1: #148a52;
+  --green-2: #1fa968;
+  --green-3: #e8f7ef;
+  --ink: #17372a;
+  --muted: #4d6a5b;
+  --line: #d2eadb;
+  --shadow: 0 14px 36px rgba(20, 138, 82, 0.1);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #f7fcf9;
+  color: var(--ink);
+  font-family: "Manrope", "Segoe UI", sans-serif;
+}
+
+body {
+  min-height: 100vh;
+  position: relative;
+}
+
+.bg-mark {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 88% 10%, rgba(31, 169, 104, 0.12), transparent 35%);
+}
+
+.bg-mark::after {
+  content: "";
+  position: absolute;
+  right: -120px;
+  top: -100px;
+  width: min(44vw, 460px);
+  height: min(44vw, 460px);
+  background: url("./background.png") center/cover no-repeat;
+  opacity: 0.08;
+  filter: saturate(0.7);
+}
+
+.topbar {
+  width: min(1040px, 92vw);
+  margin: 22px auto 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  color: var(--ink);
+  font-family: "Sora", "Segoe UI", sans-serif;
+  font-weight: 700;
+}
+
+.brand img {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  object-fit: cover;
+}
+
+nav {
+  display: flex;
+  gap: 18px;
+}
+
+nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+nav a:hover { color: var(--green-1); }
+
+main {
+  width: min(1040px, 92vw);
+  margin: 28px auto 34px;
+}
+
+.hero {
+  background: var(--white);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: clamp(24px, 4vw, 44px);
+  box-shadow: var(--shadow);
+}
+
+.badge {
+  margin: 0;
+  font-size: 12px;
+  color: var(--green-1);
+  font-weight: 700;
+  letter-spacing: 0.9px;
+}
+
+h1, h2, h3 {
+  margin: 0;
+  font-family: "Sora", "Segoe UI", sans-serif;
+}
+
+h1 {
+  margin-top: 10px;
+  font-size: clamp(34px, 7vw, 58px);
+  line-height: 1.03;
+  max-width: 760px;
+}
+
+.sub {
+  margin: 16px 0 0;
+  max-width: 690px;
+  color: var(--muted);
+  font-size: clamp(16px, 2.3vw, 20px);
+  line-height: 1.5;
+}
+
+.actions {
+  margin-top: 24px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  height: 42px;
+  padding: 0 16px;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.btn.primary {
+  color: #fff;
+  background: linear-gradient(135deg, var(--green-1), var(--green-2));
+}
+
+.btn.ghost {
+  color: var(--green-1);
+  border: 1px solid var(--line);
+  background: var(--white);
+}
+
+.meta {
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.meta a {
+  color: var(--green-1);
+}
+
+.block {
+  margin-top: 14px;
+  background: var(--white);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: clamp(18px, 3vw, 28px);
+}
+
+.block h2 {
+  font-size: clamp(20px, 3vw, 30px);
+  margin-bottom: 12px;
+}
+
+.grid {
+  display: grid;
+  gap: 10px;
+}
+
+.grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.grid.one {
+  grid-template-columns: 1fr;
+}
+
+.card, .quote {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fcfffd;
+  padding: 14px;
+}
+
+.card h3 {
+  font-size: 18px;
+  margin-bottom: 8px;
+}
+
+.card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.quote {
+  color: #2a4e3d;
+  font-weight: 500;
+}
+
+ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #2a4e3d;
+}
+
+li {
+  margin-bottom: 10px;
+  line-height: 1.45;
+}
+
+footer {
+  width: min(1040px, 92vw);
+  margin: 0 auto 28px;
+  text-align: center;
+  color: #6a8879;
+  font-size: 14px;
+}
+
+@media (max-width: 900px) {
+  .grid.three {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  nav {
+    gap: 12px;
+  }
+}

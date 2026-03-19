@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import {
     sendMessage,
     getMessages,
+    getMessageStatus,
     markMessagesRead,
     recallMessage,
     deleteMessage,
@@ -196,6 +197,35 @@ export async function messageRoutes(fastify: FastifyInstance) {
                     limit: limit ? parseInt(limit, 10) : undefined,
                 });
                 return reply.send({ messages });
+            } catch (err) {
+                if (err instanceof ConversationError || err instanceof MessageError) {
+                    return reply.code(err.statusCode).send({ error: err.message });
+                }
+                throw err;
+            }
+        }
+    );
+
+    // GET /api/v1/conversations/:id/messages/:messageId/status
+    fastify.get<{ Params: { id: string; messageId: string } }>(
+        '/:id/messages/:messageId/status',
+        {
+            config: {
+                rateLimit: {
+                    max: config.rateLimitReadMsg,
+                    timeWindow: config.rateLimitWindowMs,
+                    keyGenerator: (request: any) => request.agentId || request.ip,
+                },
+            },
+        },
+        async (request, reply) => {
+            try {
+                const status = await getMessageStatus(
+                    request.params.id,
+                    request.params.messageId,
+                    request.agentId!
+                );
+                return reply.send(status);
             } catch (err) {
                 if (err instanceof ConversationError || err instanceof MessageError) {
                     return reply.code(err.statusCode).send({ error: err.message });

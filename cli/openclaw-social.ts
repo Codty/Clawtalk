@@ -3,188 +3,103 @@
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
-const DEFAULT_BASE_URL = 'http://localhost:3000';
-const DEFAULT_STATE_DIR = path.join(os.homedir(), '.clawtalk');
-const LEGACY_STATE_DIR = path.join(os.homedir(), '.agent-social');
-const STATE_DIR = DEFAULT_STATE_DIR;
-const STATE_FILE = path.join(STATE_DIR, 'openclaw-social-state.json');
-const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
-const DAEMON_FILE = path.join(STATE_DIR, 'openclaw-social-daemons.json');
-const DAEMON_LOG_DIR = path.join(STATE_DIR, 'logs');
-const LOCAL_DATA_DIR = path.join(STATE_DIR, 'local-data');
-const LEGACY_STATE_FILE = path.join(LEGACY_STATE_DIR, 'openclaw-social-state.json');
-const LEGACY_CONFIG_FILE = path.join(LEGACY_STATE_DIR, 'config.json');
-const LEGACY_DAEMON_FILE = path.join(LEGACY_STATE_DIR, 'openclaw-social-daemons.json');
-const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
-const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
-const WATCH_POLL_INTERVAL_MS = 5000;
-const WATCH_CONVERSATION_SCAN_LIMIT = 5;
-const WATCH_MESSAGES_PER_CONVERSATION = 10;
-const WATCH_MESSAGE_POLL_EVERY_TICKS = 1;
-const WATCH_WS_RECONNECT_MS = 2000;
-const MAX_SEEN_IDS = 300;
+import {
+    DAEMON_LOG_DIR,
+    DEFAULT_BASE_URL,
+    LOCAL_DATA_DIR,
+    OPENCLAW_CONFIG_PATH,
+    OPENCLAW_HOME,
+    WATCH_CONVERSATION_SCAN_LIMIT,
+    WATCH_MESSAGE_POLL_EVERY_TICKS,
+    WATCH_MESSAGES_PER_CONVERSATION,
+    WATCH_NOTIFY_RETRY_MAX_ATTEMPTS,
+    WATCH_NOTIFY_RETRY_SCAN_MS,
+    WATCH_POLL_INTERVAL_MS,
+    WATCH_WS_RECONNECT_MS,
+} from './openclaw-social/constants.js';
+import {
+    daemonKey,
+    defaultNotifyPreference,
+    defaultPolicy,
+    getNotifyDestinations,
+    getNotifyPreference,
+    getPolicy,
+    isProcessRunning,
+    loadConfig,
+    loadDaemonRegistry,
+    loadState,
+    migrateLegacyStateDirIfNeeded,
+    normalizeBaseUrl,
+    pathExists,
+    pruneStoppedDaemons,
+    resolveBaseUrl,
+    saveConfig,
+    saveDaemonRegistry,
+    saveState,
+} from './openclaw-social/persistence.js';
+import {
+    addSeenId,
+    buildMessageDeliveryKey,
+    ensureSeenState,
+    getNotificationRetry,
+    isNotificationAcked,
+    listMailboxPending,
+    markNotificationAck,
+    rememberMailboxPending,
+    rememberOutgoingStatus,
+    removeMailboxPending,
+    removeNotificationRetry,
+    upsertNotificationRetry,
+} from './openclaw-social/seen-state.js';
+import {
+    getMailboxReminderWindow,
+    nextMailboxReminderReason,
+    shouldNotifyFriendRequest,
+    shouldNotifyFriendRequestStatus,
+    shouldNotifyMailboxReminder,
+    shouldNotifyRealtimeDm,
+} from './openclaw-social/watcher-preferences.js';
+import { dispatchCommand } from './openclaw-social/dispatcher.js';
+import { printUsage as printUsageShared } from './openclaw-social/usage.js';
+import type {
+    AgentLite,
+    AgentSession,
+    AttachmentLite,
+    CliConfig,
+    ConversationRow,
+    DaemonRegistry,
+    DeliveryMode,
+    DeliveryStrategy,
+    DeliveryTarget,
+    FriendRequestRealtimeEvent,
+    FriendRequestRow,
+    FriendRequestStatus,
+    FriendRow,
+    LocalConversationRecord,
+    LocalState,
+    MailboxItem,
+    MessageDeliveryMode,
+    MessagePriority,
+    NotifyDestination,
+    NotifyPreference,
+    OpenClawBinding,
+    OpenClawConfigBinding,
+    OpenClawConfig,
+    OpenClawNotifyRoute,
+    RealtimeMessageEvent,
+    SessionRouteCandidate,
+    WatchHooks,
+} from './openclaw-social/types.js';
 
 let runtimeBaseUrl = DEFAULT_BASE_URL;
 let runtimeWsUrl = DEFAULT_BASE_URL.replace(/^http/, 'ws');
 
 const execFileAsync = promisify(execFile);
-
-type FriendRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
-type DeliveryMode = 'receive_only' | 'manual_review' | 'auto_execute';
-type DeliveryStrategy = 'primary' | 'fanout' | 'fallback';
-type MessageDeliveryMode = 'mailbox' | 'realtime';
-type MessagePriority = 'low' | 'normal' | 'high';
-type ClaimStatus = 'pending_claim' | 'claimed';
-
-interface ClaimInfo {
-    claim_status: ClaimStatus;
-    verification_code?: string;
-    claim_expires_at?: string | null;
-    claim_url?: string;
-    claimed_at?: string | null;
-}
-
-interface AgentSession {
-    agent_name: string;
-    agent_id: string;
-    token: string;
-    claim?: ClaimInfo;
-}
-
-interface SeenState {
-    friend_request_ids: string[];
-    message_ids: string[];
-    outgoing_request_status: Record<string, FriendRequestStatus>;
-    outgoing_request_order: string[];
-    mailbox_pending: Record<string, MailboxItem>;
-    mailbox_pending_order: string[];
-}
-
-interface MailboxItem {
-    message_id: string;
-    conversation_id: string;
-    from_agent_name: string;
-    content: string;
-    envelope_type: string;
-    created_at: string;
-    priority: MessagePriority;
-}
-
-interface AgentPolicy {
-    mode: DeliveryMode;
-}
-
-interface OpenClawBinding {
-    openclaw_agent_id?: string;
-    channel: string;
-    account_id?: string;
-    target?: string;
-    auto_route: boolean;
-    dry_run?: boolean;
-}
-
-interface NotifyDestination {
-    id: string;
-    channel: string;
-    account_id?: string;
-    target?: string;
-    auto_route: boolean;
-    openclaw_agent_id?: string;
-    dry_run?: boolean;
-    enabled: boolean;
-    priority: number;
-    is_primary: boolean;
-}
-
-interface LocalState {
-    current_agent?: string;
-    sessions: Record<string, AgentSession>;
-    seen: Record<string, SeenState>;
-    bindings: Record<string, OpenClawBinding>;
-    policies: Record<string, AgentPolicy>;
-    notify_profiles: Record<string, NotifyDestination[]>;
-}
-
-interface CliConfig {
-    base_url?: string;
-}
-
-interface FriendRequestRow {
-    id: string;
-    from_agent_id: string;
-    from_agent_name?: string;
-    to_agent_id: string;
-    to_agent_name?: string;
-    status: FriendRequestStatus;
-    created_at: string;
-}
-
-interface FriendRow {
-    id: string;
-    agent_name: string;
-    display_name?: string | null;
-    friends_since?: string;
-}
-
-interface ConversationRow {
-    id: string;
-    type?: string;
-    name?: string | null;
-    created_at?: string;
-}
-
-interface AgentLite {
-    id: string;
-    agent_name: string;
-    display_name?: string | null;
-}
-
-interface RealtimeMessageEvent {
-    id?: string;
-    conversation_id?: string;
-    sender_id?: string;
-    sender_name?: string;
-    created_at?: string;
-    payload?: {
-        type?: string;
-        content?: string;
-        data?: any;
-    };
-    content?: string;
-}
-
-interface AttachmentLite {
-    url?: string;
-    filename?: string;
-    upload_id?: string;
-    mime_type?: string;
-    size_bytes?: number;
-    local_path?: string;
-}
-
-interface LocalConversationRecord {
-    schema_version: 1;
-    record_type: 'message';
-    direction: 'incoming' | 'outgoing';
-    message_id: string;
-    conversation_id: string;
-    agent_username: string;
-    peer_agent_username?: string;
-    envelope_type: string;
-    delivery_mode?: MessageDeliveryMode;
-    priority?: MessagePriority;
-    content: string;
-    attachments?: AttachmentLite[];
-    sent_at: string;
-    recorded_at: string;
-}
-
 const relayTtlRaw = process.env.CLAWTALK_RELAY_TTL_HOURS ?? process.env.AGENT_SOCIAL_RELAY_TTL_HOURS;
 const relayDownloadsRaw = process.env.CLAWTALK_RELAY_MAX_DOWNLOADS ?? process.env.AGENT_SOCIAL_RELAY_MAX_DOWNLOADS;
 
@@ -195,215 +110,9 @@ const DEFAULT_RELAY_MAX_DOWNLOADS = Number.isFinite(Number(relayDownloadsRaw))
     ? Math.max(1, Math.floor(Number(relayDownloadsRaw)))
     : 5;
 
-interface FriendRequestRealtimeEvent {
-    event?: 'received' | 'status_changed';
-    request_id?: string;
-    from_agent_id?: string;
-    to_agent_id?: string;
-    request_message?: string | null;
-    status?: FriendRequestStatus;
-    responded_by?: string;
-    responded_at?: string;
-    created_at?: string;
-}
-
-interface OpenClawNotifyRoute {
-    channel: string;
-    account_id: string;
-    target: string;
-    dry_run: boolean;
-}
-
-interface OpenClawConfigBindingMatch {
-    channel?: string;
-    accountId?: string;
-}
-
-interface OpenClawConfigBinding {
-    agentId?: string;
-    match?: OpenClawConfigBindingMatch;
-}
-
-interface OpenClawConfig {
-    bindings?: OpenClawConfigBinding[];
-}
-
-interface SessionRouteCandidate {
-    agentId: string;
-    channel: string;
-    accountId: string;
-    target: string;
-    updatedAt: number;
-}
-
-interface DeliveryTarget {
-    id: string;
-    is_primary: boolean;
-    priority: number;
-    refresh_each_send?: boolean;
-    cached_route?: OpenClawNotifyRoute;
-    resolve: () => Promise<OpenClawNotifyRoute>;
-}
-
-interface DaemonEntry {
-    pid: number;
-    agent_name: string;
-    mode: 'watch' | 'bridge';
-    started_at: string;
-    cwd: string;
-    log_file: string;
-}
-
-interface DaemonRegistry {
-    entries: Record<string, DaemonEntry>;
-}
-
-interface WatchHooks {
-    onFriendRequest?: (ctx: { request: FriendRequestRow; fromName: string; prompt: string }) => Promise<void>;
-    onFriendRequestStatusChange?: (ctx: { request: FriendRequestRow; prompt: string }) => Promise<void>;
-    onNewMessage?: (ctx: { event: RealtimeMessageEvent; senderName: string; prompt: string }) => Promise<void>;
-    echoConsole?: boolean;
-}
-
-function normalizeBaseUrl(value: string): string {
-    const trimmed = value.trim().replace(/\/+$/, '');
-    if (!trimmed) throw new Error('base_url cannot be empty');
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new Error('base_url must start with http:// or https://');
-    }
-    return parsed.toString().replace(/\/+$/, '');
-}
-
 function setRuntimeBaseUrl(baseUrl: string): void {
     runtimeBaseUrl = normalizeBaseUrl(baseUrl);
     runtimeWsUrl = runtimeBaseUrl.replace(/^http/, 'ws');
-}
-
-function defaultConfig(): CliConfig {
-    return {};
-}
-
-async function loadConfig(): Promise<CliConfig> {
-    for (const filePath of [CONFIG_FILE, LEGACY_CONFIG_FILE]) {
-        try {
-            const content = await fs.readFile(filePath, 'utf-8');
-            const parsed = JSON.parse(content) as CliConfig;
-            return {
-                base_url: parsed.base_url,
-            };
-        } catch {
-            // Try next fallback path.
-        }
-    }
-    return defaultConfig();
-}
-
-async function saveConfig(config: CliConfig): Promise<void> {
-    await fs.mkdir(STATE_DIR, { recursive: true });
-    await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
-}
-
-async function pathExists(targetPath: string): Promise<boolean> {
-    try {
-        await fs.access(targetPath);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-async function migrateLegacyStateDirIfNeeded(): Promise<void> {
-    if (STATE_DIR === LEGACY_STATE_DIR) return;
-
-    const hasNewDir = await pathExists(STATE_DIR);
-    if (hasNewDir) return;
-
-    const hasLegacyDir = await pathExists(LEGACY_STATE_DIR);
-    if (!hasLegacyDir) return;
-
-    try {
-        await fs.rename(LEGACY_STATE_DIR, STATE_DIR);
-        return;
-    } catch (err: any) {
-        const code = String(err?.code || '');
-        if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'EACCES') {
-            throw err;
-        }
-    }
-
-    await fs.mkdir(STATE_DIR, { recursive: true });
-    await fs.cp(LEGACY_STATE_DIR, STATE_DIR, {
-        recursive: true,
-        errorOnExist: false,
-        force: false,
-    });
-}
-
-function resolveBaseUrl(config: CliConfig): string {
-    if (process.env.CLAWTALK_URL) {
-        return normalizeBaseUrl(process.env.CLAWTALK_URL);
-    }
-    if (process.env.AGENT_SOCIAL_URL) {
-        return normalizeBaseUrl(process.env.AGENT_SOCIAL_URL);
-    }
-    if (config.base_url) {
-        return normalizeBaseUrl(config.base_url);
-    }
-    return DEFAULT_BASE_URL;
-}
-
-function defaultPolicy(): AgentPolicy {
-    return { mode: 'receive_only' };
-}
-
-function daemonKey(agentName: string, mode: 'watch' | 'bridge'): string {
-    return `${agentName}:${mode}`;
-}
-
-function defaultDaemonRegistry(): DaemonRegistry {
-    return { entries: {} };
-}
-
-async function loadDaemonRegistry(): Promise<DaemonRegistry> {
-    for (const filePath of [DAEMON_FILE, LEGACY_DAEMON_FILE]) {
-        try {
-            const content = await fs.readFile(filePath, 'utf-8');
-            const parsed = JSON.parse(content) as DaemonRegistry;
-            return {
-                entries: parsed.entries || {},
-            };
-        } catch {
-            // Try next fallback path.
-        }
-    }
-    return defaultDaemonRegistry();
-}
-
-async function saveDaemonRegistry(registry: DaemonRegistry): Promise<void> {
-    await fs.mkdir(STATE_DIR, { recursive: true });
-    await fs.writeFile(DAEMON_FILE, JSON.stringify(registry, null, 2));
-}
-
-function isProcessRunning(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-function pruneStoppedDaemons(registry: DaemonRegistry): boolean {
-    let changed = false;
-    for (const [key, entry] of Object.entries(registry.entries)) {
-        if (!isProcessRunning(entry.pid)) {
-            delete registry.entries[key];
-            changed = true;
-        }
-    }
-    return changed;
 }
 
 async function startDaemonForAgent(
@@ -460,14 +169,6 @@ async function startDaemonForAgent(
         pid: child.pid,
         logFile,
     };
-}
-
-function getPolicy(state: LocalState, agentName: string): AgentPolicy {
-    return state.policies[agentName] || defaultPolicy();
-}
-
-function getNotifyDestinations(state: LocalState, agentName: string): NotifyDestination[] {
-    return (state.notify_profiles[agentName] || []).filter((dest) => dest.enabled !== false);
 }
 
 function parseDeliveryStrategy(value: string): DeliveryStrategy {
@@ -560,127 +261,6 @@ async function api(method: string, route: string, body?: any, token?: string): P
         throw new Error(`[${res.status}] ${data.error || data.raw || 'Request failed'}`);
     }
     return data;
-}
-
-function defaultState(): LocalState {
-    return {
-        sessions: {},
-        seen: {},
-        bindings: {},
-        policies: {},
-        notify_profiles: {},
-    };
-}
-
-async function loadState(): Promise<LocalState> {
-    for (const filePath of [STATE_FILE, LEGACY_STATE_FILE]) {
-        try {
-            const content = await fs.readFile(filePath, 'utf-8');
-            const parsed = JSON.parse(content) as LocalState;
-            return {
-                current_agent: parsed.current_agent,
-                sessions: parsed.sessions || {},
-                seen: parsed.seen || {},
-                bindings: parsed.bindings || {},
-                policies: parsed.policies || {},
-                notify_profiles: parsed.notify_profiles || {},
-            };
-        } catch {
-            // Try next fallback path.
-        }
-    }
-    return defaultState();
-}
-
-async function saveState(state: LocalState): Promise<void> {
-    await fs.mkdir(STATE_DIR, { recursive: true });
-    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
-}
-
-function ensureSeenState(state: LocalState, agentName: string): SeenState {
-    if (!state.seen[agentName]) {
-        state.seen[agentName] = {
-            friend_request_ids: [],
-            message_ids: [],
-            outgoing_request_status: {},
-            outgoing_request_order: [],
-            mailbox_pending: {},
-            mailbox_pending_order: [],
-        };
-    }
-
-    if (!state.seen[agentName].outgoing_request_status) {
-        state.seen[agentName].outgoing_request_status = {};
-    }
-    if (!state.seen[agentName].outgoing_request_order) {
-        state.seen[agentName].outgoing_request_order = [];
-    }
-    if (!state.seen[agentName].mailbox_pending) {
-        state.seen[agentName].mailbox_pending = {};
-    }
-    if (!state.seen[agentName].mailbox_pending_order) {
-        state.seen[agentName].mailbox_pending_order = [];
-    }
-
-    return state.seen[agentName];
-}
-
-function addSeenId(ids: string[], id: string): void {
-    if (!id) return;
-    if (ids.includes(id)) return;
-    ids.push(id);
-    while (ids.length > MAX_SEEN_IDS) {
-        ids.shift();
-    }
-}
-
-function rememberOutgoingStatus(seen: SeenState, requestId: string, status: FriendRequestStatus): void {
-    if (!seen.outgoing_request_status[requestId]) {
-        seen.outgoing_request_order.push(requestId);
-    }
-    seen.outgoing_request_status[requestId] = status;
-
-    while (seen.outgoing_request_order.length > MAX_SEEN_IDS) {
-        const oldest = seen.outgoing_request_order.shift();
-        if (oldest) {
-            delete seen.outgoing_request_status[oldest];
-        }
-    }
-}
-
-function rememberMailboxPending(seen: SeenState, item: MailboxItem): void {
-    if (!seen.mailbox_pending[item.message_id]) {
-        seen.mailbox_pending_order.push(item.message_id);
-    }
-    seen.mailbox_pending[item.message_id] = item;
-
-    while (seen.mailbox_pending_order.length > MAX_SEEN_IDS) {
-        const oldest = seen.mailbox_pending_order.shift();
-        if (oldest) {
-            delete seen.mailbox_pending[oldest];
-        }
-    }
-}
-
-function removeMailboxPending(seen: SeenState, ids: string[]): number {
-    let removed = 0;
-    for (const id of ids) {
-        if (seen.mailbox_pending[id]) {
-            delete seen.mailbox_pending[id];
-            removed += 1;
-        }
-    }
-    if (removed > 0) {
-        const idSet = new Set(ids);
-        seen.mailbox_pending_order = seen.mailbox_pending_order.filter((id) => !idSet.has(id));
-    }
-    return removed;
-}
-
-function listMailboxPending(seen: SeenState): MailboxItem[] {
-    return seen.mailbox_pending_order
-        .map((id) => seen.mailbox_pending[id])
-        .filter((item): item is MailboxItem => !!item);
 }
 
 function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } {
@@ -1543,6 +1123,23 @@ async function commandSendDm(args: string[], state: LocalState, asAgent?: string
     maybePrintFirstMessageMilestone(sent, session.agent_name);
 }
 
+async function commandMessageStatus(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [conversationId, messageId] = args;
+    if (!conversationId || !messageId) {
+        throw new Error('Usage: clawtalk message-status <conversation_id> <message_id> [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const status = await api(
+        'GET',
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/status`,
+        undefined,
+        session.token
+    );
+
+    console.log(JSON.stringify(status, null, 2));
+}
+
 function parseSendAttachmentArgs(args: string[]): {
     peerAccount: string;
     filePath: string;
@@ -2016,6 +1613,214 @@ async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<vo
     }, null, 2));
 }
 
+type InboxDigestOptions = {
+    sinceHours?: number;
+    maxItems: number;
+};
+
+type ScoredMailboxItem = MailboxItem & {
+    score: number;
+    ageHours: number;
+};
+
+function parseInboxDigestOptions(args: string[]): InboxDigestOptions {
+    let sinceHours: number | undefined;
+    let maxItems = 200;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--since-hours') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --since-hours');
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+                throw new Error('Invalid --since-hours. Use number > 0.');
+            }
+            sinceHours = parsed;
+            i += 1;
+            continue;
+        }
+        if (arg === '--max') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --max');
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+                throw new Error('Invalid --max. Use integer > 0.');
+            }
+            maxItems = Math.min(1000, Math.floor(parsed));
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for inbox digest: ${arg}`);
+    }
+
+    return { sinceHours, maxItems };
+}
+
+function priorityWeight(priority: MessagePriority): number {
+    if (priority === 'high') return 3;
+    if (priority === 'normal') return 2;
+    return 1;
+}
+
+function higherPriority(a: MessagePriority, b: MessagePriority): MessagePriority {
+    return priorityWeight(a) >= priorityWeight(b) ? a : b;
+}
+
+function asTimestamp(input: string): number {
+    const ts = new Date(input).getTime();
+    if (!Number.isFinite(ts)) return Date.now();
+    return ts;
+}
+
+function truncateForDigest(input: string, maxLen = 120): string {
+    const text = (input || '').replace(/\s+/g, ' ').trim();
+    if (text.length <= maxLen) return text;
+    return `${text.slice(0, maxLen - 1)}...`;
+}
+
+function formatDurationHours(hours: number): string {
+    if (hours < 1) return `${Math.max(1, Math.round(hours * 60))}m`;
+    if (hours < 48) return `${Math.round(hours)}h`;
+    return `${Math.round(hours / 24)}d`;
+}
+
+function buildInboxDigest(pending: MailboxItem[], options: InboxDigestOptions): string {
+    const now = Date.now();
+    const senderCounts = new Map<string, number>();
+    for (const item of pending) {
+        const key = item.from_agent_name || 'unknown-agent';
+        senderCounts.set(key, (senderCounts.get(key) || 0) + 1);
+    }
+
+    const scored: ScoredMailboxItem[] = pending.map((item) => {
+        const ageHours = Math.max(0, (now - asTimestamp(item.created_at)) / (1000 * 60 * 60));
+        const ageBoost = Math.min(72, Math.round(ageHours));
+        const senderBurst = Math.max(0, (senderCounts.get(item.from_agent_name) || 1) - 1);
+        const score = priorityWeight(item.priority) * 100 + ageBoost + senderBurst * 10;
+        return { ...item, score, ageHours };
+    });
+
+    scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return asTimestamp(b.created_at) - asTimestamp(a.created_at);
+    });
+
+    const urgent = scored.slice(0, 5);
+    const highCount = scored.filter((item) => item.priority === 'high').length;
+    const normalCount = scored.filter((item) => item.priority === 'normal').length;
+    const lowCount = scored.filter((item) => item.priority === 'low').length;
+
+    const threads = new Map<string, {
+        threadKey: string;
+        conversationId: string;
+        sender: string;
+        pendingCount: number;
+        maxPriority: MessagePriority;
+        lastAtTs: number;
+        lastAtIso: string;
+        topScore: number;
+        lastPreview: string;
+    }>();
+
+    for (const item of scored) {
+        const conversationId = item.conversation_id || 'unknown-conversation';
+        const sender = item.from_agent_name || 'unknown-agent';
+        const key = `${conversationId}::${sender}`;
+        const ts = asTimestamp(item.created_at);
+        const existing = threads.get(key);
+        if (!existing) {
+            threads.set(key, {
+                threadKey: key,
+                conversationId,
+                sender,
+                pendingCount: 1,
+                maxPriority: item.priority,
+                lastAtTs: ts,
+                lastAtIso: item.created_at || new Date(ts).toISOString(),
+                topScore: item.score,
+                lastPreview: truncateForDigest(item.content),
+            });
+            continue;
+        }
+        existing.pendingCount += 1;
+        existing.maxPriority = higherPriority(existing.maxPriority, item.priority);
+        if (ts > existing.lastAtTs) {
+            existing.lastAtTs = ts;
+            existing.lastAtIso = item.created_at || new Date(ts).toISOString();
+            existing.lastPreview = truncateForDigest(item.content);
+        }
+        if (item.score > existing.topScore) existing.topScore = item.score;
+    }
+
+    const rankedThreads = [...threads.values()].sort((a, b) => {
+        const prioDelta = priorityWeight(b.maxPriority) - priorityWeight(a.maxPriority);
+        if (prioDelta !== 0) return prioDelta;
+        if (b.topScore !== a.topScore) return b.topScore - a.topScore;
+        if (b.lastAtTs !== a.lastAtTs) return b.lastAtTs - a.lastAtTs;
+        return b.pendingCount - a.pendingCount;
+    });
+
+    const lines: string[] = [];
+    lines.push('[OpenClaw Social]');
+    lines.push('Event: Inbox Digest');
+    lines.push(`Generated: ${formatNoticeTime()}`);
+    lines.push(
+        `Overview: pending=${scored.length}, high=${highCount}, normal=${normalCount}, low=${lowCount}, threads=${rankedThreads.length}`
+    );
+    lines.push(
+        `Window: ${options.sinceHours ? `last ${options.sinceHours}h` : 'all pending'} | max_items=${options.maxItems}`
+    );
+    lines.push('');
+
+    lines.push('Top Urgent (rule-only):');
+    if (urgent.length === 0) {
+        lines.push('- none');
+    } else {
+        urgent.forEach((item, index) => {
+            lines.push(
+                `${index + 1}. [${item.priority.toUpperCase()} | score=${item.score}] ` +
+                `from=${item.from_agent_name} conv=${item.conversation_id} age=${formatDurationHours(item.ageHours)}`
+            );
+            lines.push(`   ${truncateForDigest(item.content, 160)}`);
+        });
+    }
+    lines.push('');
+
+    lines.push('Thread Summary:');
+    if (rankedThreads.length === 0) {
+        lines.push('- none');
+    } else {
+        rankedThreads.slice(0, 10).forEach((thread, index) => {
+            const lastAgeHours = Math.max(0, (now - thread.lastAtTs) / (1000 * 60 * 60));
+            lines.push(
+                `${index + 1}. conv=${thread.conversationId} sender=${thread.sender} pending=${thread.pendingCount} ` +
+                `max_priority=${thread.maxPriority} last_time=${thread.lastAtIso} (${formatDurationHours(lastAgeHours)} ago)`
+            );
+            lines.push(`   last_summary: ${thread.lastPreview}`);
+        });
+    }
+    lines.push('');
+
+    lines.push('Suggested Next Actions:');
+    if (urgent.length > 0) {
+        lines.push(`1) Handle urgent item first: ${urgent[0].message_id} (from ${urgent[0].from_agent_name}).`);
+    } else {
+        lines.push('1) No urgent mailbox item found right now.');
+    }
+    if (rankedThreads.length > 0) {
+        lines.push(
+            `2) Review top thread first: conversation=${rankedThreads[0].conversationId}, sender=${rankedThreads[0].sender}; ` +
+            'then mark handled items with inbox done <message_id>.'
+        );
+    } else {
+        lines.push('2) Keep watch/bridge running for new mailbox arrivals.');
+    }
+    lines.push('3) Note: digest is advisory only; no action is auto-executed.');
+
+    return lines.join('\n');
+}
+
 async function commandInbox(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
     const seen = ensureSeenState(state, session.agent_name);
@@ -2034,6 +1839,30 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
                 `time: ${item.created_at} | ${item.content}`
             );
         }
+        return;
+    }
+
+    if (sub === 'digest') {
+        const options = parseInboxDigestOptions(args.slice(1));
+        const now = Date.now();
+        const minTs = options.sinceHours
+            ? now - options.sinceHours * 60 * 60 * 1000
+            : Number.NEGATIVE_INFINITY;
+
+        const pending = listMailboxPending(seen)
+            .filter((item) => asTimestamp(item.created_at) >= minTs)
+            .sort((a, b) => asTimestamp(b.created_at) - asTimestamp(a.created_at))
+            .slice(0, options.maxItems);
+
+        if (pending.length === 0) {
+            console.log('[OpenClaw Social]');
+            console.log('Event: Inbox Digest');
+            console.log(`Generated: ${formatNoticeTime()}`);
+            console.log('Overview: no pending mailbox messages in current filter window.');
+            return;
+        }
+
+        console.log(buildInboxDigest(pending, options));
         return;
     }
 
@@ -2060,7 +1889,7 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
         return;
     }
 
-    throw new Error('Usage: clawtalk inbox [list|summary|clear|done <message_id>] [--as <agent_username>]');
+    throw new Error('Usage: clawtalk inbox [list|summary|digest [--since-hours <n>] [--max <n>]|clear|done <message_id>] [--as <agent_username>]');
 }
 
 function removeSessionState(state: LocalState, agentName: string): void {
@@ -2172,6 +2001,7 @@ async function commandWhoami(state: LocalState, asAgent?: string): Promise<void>
         policy: getPolicy(state, session.agent_name),
         binding: state.bindings[session.agent_name] || null,
         notify_destinations: state.notify_profiles[session.agent_name] || [],
+        notify_preference: getNotifyPreference(state, session.agent_name),
     }, null, 2));
 }
 
@@ -2449,7 +2279,7 @@ function parseNotifyAddArgs(args: string[]): NotifyDestination {
     if (!id) throw new Error('notify add requires non-empty --id');
     if (!channel) {
         throw new Error(
-            'Usage: clawtalk notify add --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]'
+            'Usage: clawtalk notify add --id <id> --channel <channel> [--account <id> --target <dest>] [--openclaw-agent <id>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]'
         );
     }
 
@@ -2912,14 +2742,22 @@ function getMessagePriority(event: RealtimeMessageEvent): MessagePriority {
     return 'normal';
 }
 
-function buildMailboxPrompt(senderName: string, content: string, pendingCount: number): string {
+function buildMailboxPrompt(
+    senderName: string,
+    content: string,
+    pendingCount: number,
+    reason: 'interval' | 'threshold',
+    thresholdStep: number,
+    intervalHours: number
+): string {
+    const reasonLine = reason === 'threshold'
+        ? `Pending mailbox reached ${thresholdStep}+ items.`
+        : `Scheduled mailbox reminder (${intervalHours}h interval).`;
     return formatAgentSocialNotice({
-        event: 'Mailbox Message',
+        event: 'Mailbox Reminder',
         from: senderName,
-        content: `A message was added to your mailbox: ${content}`,
-        action: pendingCount <= 1
-            ? 'Say "inbox" to review it, or "send a realtime reply" if this is urgent.'
-            : `You now have ${pendingCount} pending mailbox messages. Say "inbox" to review.`,
+        content: `${reasonLine} Pending mailbox messages: ${pendingCount}. Latest: ${truncateForDigest(content, 160)}`,
+        action: 'Say "inbox digest" to review by thread, then use "inbox done <message_id>" after handling.',
     });
 }
 
@@ -3025,7 +2863,45 @@ function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName
 async function runWatcher(state: LocalState, session: AgentSession, hooks: WatchHooks): Promise<void> {
     const seen = ensureSeenState(state, session.agent_name);
     const policy = getPolicy(state, session.agent_name);
+    const NOTIFY_PREF_REFRESH_MS = 2000;
+    let notifyPref = getNotifyPreference(state, session.agent_name);
+    let notifyPrefLastRefreshAt = 0;
     const idToName = new Map<string, string>();
+    let retryWorkerRunning = false;
+
+    function currentNotifyPref(): NotifyPreference {
+        return notifyPref;
+    }
+
+    async function refreshNotifyPrefIfNeeded(force = false): Promise<void> {
+        const now = Date.now();
+        if (!force && now - notifyPrefLastRefreshAt < NOTIFY_PREF_REFRESH_MS) {
+            return;
+        }
+        notifyPrefLastRefreshAt = now;
+        try {
+            const latest = await loadState();
+            notifyPref = getNotifyPreference(latest, session.agent_name);
+        } catch {
+            // Keep current in-memory preference when state file is temporarily unavailable.
+        }
+    }
+
+    async function persistWatcherState(): Promise<void> {
+        // Persist watcher-owned seen state while preserving other state parts
+        // that might be concurrently changed by another CLI process.
+        try {
+            const latest = await loadState();
+            latest.seen = latest.seen || {};
+            latest.seen[session.agent_name] = seen;
+            await saveState(latest);
+            notifyPref = getNotifyPreference(latest, session.agent_name);
+            notifyPrefLastRefreshAt = Date.now();
+        } catch {
+            state.seen[session.agent_name] = seen;
+            await saveState(state);
+        }
+    }
 
     async function resolveAgentName(agentId: string): Promise<string> {
         if (!agentId) return 'unknown-agent';
@@ -3040,7 +2916,201 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         }
     }
 
+    async function deliverNewMessageWithReliability(payload: {
+        key: string;
+        event: RealtimeMessageEvent;
+        senderName: string;
+        prompt: string;
+    }, source: 'incoming' | 'retry'): Promise<void> {
+        const retryState = getNotificationRetry(seen, payload.key);
+        const previousAttempts = retryState?.attempts || 0;
+
+        if (isNotificationAcked(seen, payload.key)) {
+            removeNotificationRetry(seen, payload.key);
+            return;
+        }
+
+        if (!hooks.onNewMessage) {
+            markNotificationAck(seen, payload.key, 'new_message', previousAttempts);
+            removeNotificationRetry(seen, payload.key);
+            await persistWatcherState();
+            return;
+        }
+
+        try {
+            await hooks.onNewMessage({ event: payload.event, senderName: payload.senderName, prompt: payload.prompt });
+            markNotificationAck(seen, payload.key, 'new_message', previousAttempts + 1);
+            removeNotificationRetry(seen, payload.key);
+            await persistWatcherState();
+
+            if (source === 'retry') {
+                console.log(`[watch] retry delivered: key=${payload.key}, attempts=${previousAttempts + 1}`);
+            }
+            return;
+        } catch (err: any) {
+            const attempts = previousAttempts + 1;
+            const errorText = String(err?.message || err);
+
+            if (attempts >= WATCH_NOTIFY_RETRY_MAX_ATTEMPTS) {
+                removeNotificationRetry(seen, payload.key);
+                // Mark as terminally handled to avoid duplicate re-delivery loops.
+                markNotificationAck(seen, payload.key, 'new_message', attempts);
+                await persistWatcherState();
+
+                console.error(
+                    `[watch] notification dropped after ${attempts} attempts: key=${payload.key}; last_error=${errorText}`
+                );
+                if (hooks.echoConsole !== false) {
+                    const failurePrompt = formatAgentSocialNotice({
+                        event: 'Delivery Failed',
+                        from: payload.senderName,
+                        content: 'A peer message could not be forwarded after max retries.',
+                        action: 'Please check local logs and decide whether to manually notify/reply.',
+                    });
+                    console.log(`\n${failurePrompt}`);
+                }
+                return;
+            }
+
+            const retryItem = upsertNotificationRetry(seen, {
+                key: payload.key,
+                type: 'new_message',
+                event: payload.event,
+                sender_name: payload.senderName,
+                prompt: payload.prompt,
+                attempts,
+                created_at: retryState?.created_at || new Date().toISOString(),
+                last_error: errorText,
+            });
+            await persistWatcherState();
+            console.warn(
+                `[watch] message callback failed (attempt=${attempts}/${WATCH_NOTIFY_RETRY_MAX_ATTEMPTS}), ` +
+                `retry_at=${retryItem.next_retry_at}, key=${payload.key}, error=${errorText}`
+            );
+        }
+    }
+
+    async function processNotificationRetryQueue(): Promise<void> {
+        if (retryWorkerRunning || shuttingDown) return;
+        retryWorkerRunning = true;
+        try {
+            const now = Date.now();
+            const due = seen.notification_retry_queue
+                .filter((item) => {
+                    const at = new Date(item.next_retry_at).getTime();
+                    if (!Number.isFinite(at)) return true;
+                    return at <= now;
+                })
+                .sort((a, b) => {
+                    const aTs = new Date(a.next_retry_at).getTime();
+                    const bTs = new Date(b.next_retry_at).getTime();
+                    return (Number.isFinite(aTs) ? aTs : 0) - (Number.isFinite(bTs) ? bTs : 0);
+                });
+
+            for (const item of due) {
+                await deliverNewMessageWithReliability(
+                    {
+                        key: item.key,
+                        event: item.event,
+                        senderName: item.sender_name,
+                        prompt: item.prompt,
+                    },
+                    'retry'
+                );
+            }
+        } finally {
+            retryWorkerRunning = false;
+        }
+    }
+
+    async function maybeNotifyMailboxReminder(ctx?: {
+        event?: RealtimeMessageEvent;
+        senderName?: string;
+        content?: string;
+    }): Promise<void> {
+        await refreshNotifyPrefIfNeeded();
+        const pref = currentNotifyPref();
+        if (!shouldNotifyMailboxReminder(pref)) return;
+
+        const pending = listMailboxPending(seen);
+        const pendingCount = pending.length;
+        if (pendingCount <= 0) {
+            seen.mailbox_last_threshold_bucket = 0;
+            return;
+        }
+
+        const reminderWindow = getMailboxReminderWindow(pref);
+        const { thresholdStep, intervalHours, intervalMs } = reminderWindow;
+        const nowTs = Date.now();
+        const reason = nextMailboxReminderReason(seen, pendingCount, nowTs, pref);
+        if (!reason) return;
+
+        const latest = pending[pending.length - 1];
+        const senderSet = new Set(
+            pending
+                .map((item) => (item.from_agent_name || '').trim())
+                .filter((name) => name.length > 0)
+        );
+        const fallbackSender = latest?.from_agent_name || ctx?.senderName || 'peer-agent';
+        const senderName = senderSet.size <= 1
+            ? fallbackSender
+            : `${fallbackSender} (+${Math.max(1, senderSet.size - 1)} others)`;
+        const content = latest?.content || ctx?.content || 'You have pending mailbox messages.';
+        const prompt = buildMailboxPrompt(senderName, content, pendingCount, reason, thresholdStep, intervalHours);
+
+        const slot = reason === 'threshold'
+            ? Math.floor(pendingCount / thresholdStep)
+            : Math.floor(nowTs / intervalMs);
+        const reminderKey = `mailbox-reminder:${reason}:${slot}`;
+        if (isNotificationAcked(seen, reminderKey)) return;
+        const existingRetry = getNotificationRetry(seen, reminderKey);
+        if (existingRetry) {
+            const retryAt = new Date(existingRetry.next_retry_at).getTime();
+            if (Number.isFinite(retryAt) && retryAt > nowTs) return;
+        }
+
+        const reminderEvent: RealtimeMessageEvent = ctx?.event || {
+            id: `mailbox-reminder-${slot}`,
+            conversation_id: latest?.conversation_id || 'mailbox',
+            sender_name: senderName,
+            created_at: new Date(nowTs).toISOString(),
+            payload: {
+                type: 'event',
+                content: prompt,
+                data: {
+                    delivery_mode: 'mailbox',
+                    priority: 'normal',
+                    mailbox_pending: pendingCount,
+                    reminder_reason: reason,
+                },
+            },
+        };
+
+        await deliverNewMessageWithReliability(
+            {
+                key: reminderKey,
+                event: reminderEvent,
+                senderName,
+                prompt,
+            },
+            'incoming'
+        );
+
+        if (isNotificationAcked(seen, reminderKey)) {
+            seen.mailbox_last_notified_at = new Date(nowTs).toISOString();
+            seen.mailbox_last_threshold_bucket = Math.floor(
+                pendingCount / thresholdStep
+            );
+            await persistWatcherState();
+            if (hooks.echoConsole !== false) {
+                console.log(`\n${prompt}`);
+            }
+        }
+    }
+
     async function handleIncomingMessageEvent(data: RealtimeMessageEvent): Promise<void> {
+        await refreshNotifyPrefIfNeeded();
+        const pref = currentNotifyPref();
         const messageId = data.id;
 
         if (messageId && seen.message_ids.includes(messageId)) {
@@ -3051,14 +3121,27 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         if (data.sender_id && data.sender_id === session.agent_id) {
             if (messageId) {
                 addSeenId(seen.message_ids, messageId);
-                await saveState(state);
+                await persistWatcherState();
             }
             return;
         }
 
+        const deliveryKey = buildMessageDeliveryKey(data);
+        if (isNotificationAcked(seen, deliveryKey)) {
+            return;
+        }
+
+        const existingRetry = getNotificationRetry(seen, deliveryKey);
+        if (existingRetry) {
+            const retryAt = new Date(existingRetry.next_retry_at).getTime();
+            if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+                return;
+            }
+        }
+
         if (messageId) {
             addSeenId(seen.message_ids, messageId);
-            await saveState(state);
+            await persistWatcherState();
         }
 
         const senderName = data.sender_name || await resolveAgentName(data.sender_id || '');
@@ -3102,18 +3185,32 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 created_at: data.created_at || new Date().toISOString(),
                 priority,
             });
-            await saveState(state);
-            const pendingCount = listMailboxPending(seen).length;
-            prompt = buildMailboxPrompt(senderName, content, pendingCount);
+            await persistWatcherState();
+            if (!messageId) {
+                markNotificationAck(seen, deliveryKey, 'new_message', 0);
+                removeNotificationRetry(seen, deliveryKey);
+                await persistWatcherState();
+            }
+            await maybeNotifyMailboxReminder({ event: data, senderName, content });
+            return;
         }
 
-        if (hooks.onNewMessage) {
-            try {
-                await hooks.onNewMessage({ event: data, senderName, prompt });
-            } catch (err: any) {
-                console.error(`[watch] message callback error: ${err.message}`);
-            }
+        if (!shouldNotifyRealtimeDm(pref)) {
+            markNotificationAck(seen, deliveryKey, 'new_message', 0);
+            removeNotificationRetry(seen, deliveryKey);
+            await persistWatcherState();
+            return;
         }
+
+        await deliverNewMessageWithReliability(
+            {
+                key: deliveryKey,
+                event: data,
+                senderName,
+                prompt,
+            },
+            'incoming'
+        );
 
         if (hooks.echoConsole !== false) {
             console.log(`\n${prompt}`);
@@ -3122,6 +3219,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
     async function pollIncomingFriendRequests() {
         try {
+            await refreshNotifyPrefIfNeeded();
+            const pref = currentNotifyPref();
             const requests = await listIncomingPending(session.token);
             let changed = false;
 
@@ -3139,7 +3238,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     at: req.created_at,
                 });
 
-                if (hooks.onFriendRequest) {
+                if (shouldNotifyFriendRequest(pref) && hooks.onFriendRequest) {
                     try {
                         await hooks.onFriendRequest({ request: req, fromName, prompt });
                     } catch (err: any) {
@@ -3147,13 +3246,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     }
                 }
 
-                if (hooks.echoConsole !== false) {
+                if (shouldNotifyFriendRequest(pref) && hooks.echoConsole !== false) {
                     console.log(`\n${prompt}`);
                 }
             }
 
             if (changed) {
-                await saveState(state);
+                await persistWatcherState();
             }
         } catch (err: any) {
             console.error(`[watch] poll incoming friend requests failed: ${err.message}`);
@@ -3162,6 +3261,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
     async function pollOutgoingRequestStatus() {
         try {
+            await refreshNotifyPrefIfNeeded();
+            const pref = currentNotifyPref();
             const requests = await listOutgoingAll(session.token);
             let changed = false;
 
@@ -3183,7 +3284,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 const prompt = buildOutgoingStatusPrompt(req);
                 if (!prompt) continue;
 
-                if (hooks.onFriendRequestStatusChange) {
+                if (shouldNotifyFriendRequestStatus(pref) && hooks.onFriendRequestStatusChange) {
                     try {
                         await hooks.onFriendRequestStatusChange({ request: req, prompt });
                     } catch (err: any) {
@@ -3191,13 +3292,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     }
                 }
 
-                if (hooks.echoConsole !== false) {
+                if (shouldNotifyFriendRequestStatus(pref) && hooks.echoConsole !== false) {
                     console.log(`\n${prompt}`);
                 }
             }
 
             if (changed) {
-                await saveState(state);
+                await persistWatcherState();
             }
         } catch (err: any) {
             console.error(`[watch] poll outgoing request status failed: ${err.message}`);
@@ -3231,6 +3332,8 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
     async function handleRealtime(raw: WebSocket.RawData) {
         try {
+            await refreshNotifyPrefIfNeeded();
+            const pref = currentNotifyPref();
             const msg = JSON.parse(raw.toString());
 
             if (msg.type === 'connected') {
@@ -3253,7 +3356,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     }
 
                     addSeenId(seen.friend_request_ids, requestId);
-                    await saveState(state);
+                    await persistWatcherState();
 
                     const fromName = await resolveAgentName(data.from_agent_id || '');
                     const prompt = formatAgentSocialNotice({
@@ -3273,7 +3376,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                         created_at: data.created_at || new Date().toISOString(),
                     };
 
-                    if (hooks.onFriendRequest) {
+                    if (shouldNotifyFriendRequest(pref) && hooks.onFriendRequest) {
                         try {
                             await hooks.onFriendRequest({ request: req, fromName, prompt });
                         } catch (err: any) {
@@ -3281,7 +3384,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                         }
                     }
 
-                    if (hooks.echoConsole !== false) {
+                    if (shouldNotifyFriendRequest(pref) && hooks.echoConsole !== false) {
                         console.log(`\n${prompt}`);
                     }
                     return;
@@ -3294,7 +3397,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     }
 
                     rememberOutgoingStatus(seen, requestId, data.status);
-                    await saveState(state);
+                    await persistWatcherState();
 
                     const peerId = data.from_agent_id === session.agent_id ? data.to_agent_id : data.from_agent_id;
                     const peerName = peerId ? await resolveAgentName(peerId) : 'peer-agent';
@@ -3310,7 +3413,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                         created_at: data.created_at || new Date().toISOString(),
                     };
 
-                    if (hooks.onFriendRequestStatusChange) {
+                    if (shouldNotifyFriendRequestStatus(pref) && hooks.onFriendRequestStatusChange) {
                         try {
                             await hooks.onFriendRequestStatusChange({ request: req, prompt });
                         } catch (err: any) {
@@ -3318,7 +3421,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                         }
                     }
 
-                    if (hooks.echoConsole !== false) {
+                    if (shouldNotifyFriendRequestStatus(pref) && hooks.echoConsole !== false) {
                         console.log(`\n${prompt}`);
                     }
                     return;
@@ -3350,8 +3453,14 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         current.on('open', () => {
             connecting = false;
             if (!hasConnectedOnce) {
+                const pref = currentNotifyPref();
                 console.log(`WebSocket connected, current agent: ${session.agent_name}`);
-                console.log(`Listening for new messages and friend requests (policy: ${policy.mode})...`);
+                console.log(
+                    `Listening for events (policy: ${policy.mode}, dm_realtime=${pref.dm_realtime_enabled ? 'on' : 'off'}, ` +
+                    `friend_request=${pref.friend_request_enabled ? 'on' : 'off'}, ` +
+                    `friend_status=${pref.friend_request_status_enabled ? 'on' : 'off'}, ` +
+                    `mailbox_reminder=${pref.mailbox_reminder_enabled ? 'on' : 'off'})...`
+                );
                 hasConnectedOnce = true;
             } else {
                 console.log(`WebSocket reconnected, current agent: ${session.agent_name}`);
@@ -3395,10 +3504,15 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         pollTick += 1;
         void pollIncomingFriendRequests();
         void pollOutgoingRequestStatus();
+        void maybeNotifyMailboxReminder();
         if (pollTick % WATCH_MESSAGE_POLL_EVERY_TICKS === 0) {
             void pollRecentMessages();
         }
     }, WATCH_POLL_INTERVAL_MS);
+
+    const retryTimer = setInterval(() => {
+        void processNotificationRetryQueue();
+    }, WATCH_NOTIFY_RETRY_SCAN_MS);
 
     await pollIncomingFriendRequests();
     await pollOutgoingRequestStatus();
@@ -3408,6 +3522,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         shuttingDown = true;
         clearInterval(pingTimer);
         clearInterval(pollTimer);
+        clearInterval(retryTimer);
         if (ws) {
             ws.close();
         }
@@ -3583,6 +3698,127 @@ async function commandNotify(args: string[], state: LocalState, asAgent?: string
 
     throw new Error(
         'Usage: clawtalk notify <add|list|remove|set-primary|test> ... [--as <agent_username>]'
+    );
+}
+
+function parseOnOff(value: string, flag: string): boolean {
+    const normalized = (value || '').trim().toLowerCase();
+    if (normalized === 'on' || normalized === 'true') return true;
+    if (normalized === 'off' || normalized === 'false') return false;
+    throw new Error(`Invalid ${flag} value: ${value}. Use on|off.`);
+}
+
+function parsePositiveInteger(value: string, flag: string, min: number, max?: number): number {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        throw new Error(`Invalid ${flag} value: ${value}. Use an integer.`);
+    }
+    if (parsed < min) {
+        throw new Error(`Invalid ${flag} value: ${value}. Must be >= ${min}.`);
+    }
+    if (typeof max === 'number' && parsed > max) {
+        throw new Error(`Invalid ${flag} value: ${value}. Must be <= ${max}.`);
+    }
+    return parsed;
+}
+
+function parseNotifyPrefSetArgs(args: string[]): Partial<NotifyPreference> {
+    const patch: Partial<NotifyPreference> = {};
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--friend-request') {
+            patch.friend_request_enabled = parseOnOff(args[i + 1] || '', '--friend-request');
+            i += 1;
+            continue;
+        }
+        if (arg === '--friend-status') {
+            patch.friend_request_status_enabled = parseOnOff(args[i + 1] || '', '--friend-status');
+            i += 1;
+            continue;
+        }
+        if (arg === '--dm-realtime') {
+            patch.dm_realtime_enabled = parseOnOff(args[i + 1] || '', '--dm-realtime');
+            i += 1;
+            continue;
+        }
+        if (arg === '--mailbox-reminder') {
+            patch.mailbox_reminder_enabled = parseOnOff(args[i + 1] || '', '--mailbox-reminder');
+            i += 1;
+            continue;
+        }
+        if (arg === '--mailbox-interval-hours') {
+            patch.mailbox_reminder_interval_hours = parsePositiveInteger(
+                args[i + 1] || '',
+                '--mailbox-interval-hours',
+                1,
+                168
+            );
+            i += 1;
+            continue;
+        }
+        if (arg === '--mailbox-threshold') {
+            patch.mailbox_reminder_pending_step = parsePositiveInteger(
+                args[i + 1] || '',
+                '--mailbox-threshold',
+                1
+            );
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for notify-pref set: ${arg}`);
+    }
+
+    if (Object.keys(patch).length === 0) {
+        throw new Error(
+            'Usage: clawtalk notify-pref set [--friend-request on|off] [--friend-status on|off] [--dm-realtime on|off] [--mailbox-reminder on|off] [--mailbox-interval-hours <n>] [--mailbox-threshold <n>] [--as <agent_username>]'
+        );
+    }
+
+    return patch;
+}
+
+async function commandNotifyPref(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const sub = args[0] || 'get';
+
+    if (sub === 'get' || sub === 'list') {
+        const prefs = getNotifyPreference(state, session.agent_name);
+        console.log(JSON.stringify({
+            agent: session.agent_name,
+            notify_preference: prefs,
+        }, null, 2));
+        return;
+    }
+
+    if (sub === 'set') {
+        const patch = parseNotifyPrefSetArgs(args.slice(1));
+        const merged: NotifyPreference = {
+            ...getNotifyPreference(state, session.agent_name),
+            ...patch,
+        };
+        state.notify_prefs[session.agent_name] = merged;
+        await saveState(state);
+        console.log(JSON.stringify({
+            agent: session.agent_name,
+            notify_preference: merged,
+        }, null, 2));
+        return;
+    }
+
+    if (sub === 'reset') {
+        const reset = defaultNotifyPreference();
+        state.notify_prefs[session.agent_name] = reset;
+        await saveState(state);
+        console.log(JSON.stringify({
+            agent: session.agent_name,
+            notify_preference: reset,
+        }, null, 2));
+        return;
+    }
+
+    throw new Error(
+        'Usage: clawtalk notify-pref <get|set|reset> [--friend-request on|off] [--friend-status on|off] [--dm-realtime on|off] [--mailbox-reminder on|off] [--mailbox-interval-hours <n>] [--mailbox-threshold <n>] [--as <agent_username>]'
     );
 }
 
@@ -3913,68 +4149,7 @@ async function commandDoctor(state: LocalState): Promise<void> {
 }
 
 function printUsage() {
-    console.log(`
-clawtalk - Clawtalk workflow helper for OpenClaw
-
-Usage:
-  npm run clawtalk -- onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]
-  npm run clawtalk -- login <agent_username> <password> [--no-auto-bridge]
-  npm run clawtalk -- claim-status [--as <agent_username>]
-  npm run clawtalk -- claim-complete <verification_code> [--as <agent_username>]
-  npm run clawtalk -- logout [--as <agent_username>] [--local-only] [--all]
-  npm run clawtalk -- use <agent_username>
-  npm run clawtalk -- whoami [--as <agent_username>]
-
-  npm run clawtalk -- add-friend <peer_account> [request_message] [--as <agent_username>]
-  npm run clawtalk -- unfriend <peer_account> [--as <agent_username>]
-  npm run clawtalk -- list-friends [--as <agent_username>]
-  npm run clawtalk -- incoming [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
-  npm run clawtalk -- outgoing [--status <pending|accepted|rejected|cancelled|all>] [--as <agent_username>]
-  npm run clawtalk -- cancel-friend-request <request_id|peer_account> [--as <agent_username>]
-  npm run clawtalk -- accept-friend <from_account> [first_message] [--as <agent_username>]
-  npm run clawtalk -- reject-friend <from_account> [--as <agent_username>]
-  npm run clawtalk -- send-dm <peer_account> <message> [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]
-  npm run clawtalk -- leave-message <peer_account> <message> [--priority <low|normal|high>] [--as <agent_username>]
-  npm run clawtalk -- send-attachment <peer_account> <file_path> [caption] [--mailbox|--realtime] [--priority <low|normal|high>] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
-  npm run clawtalk -- download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
-  npm run clawtalk -- inbox [list|summary|clear|done <message_id>] [--as <agent_username>]
-  npm run clawtalk -- friend-zone settings [--as <agent_username>]
-  npm run clawtalk -- friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
-  npm run clawtalk -- friend-zone post [text] [--file <path>]... [--as <agent_username>]
-  npm run clawtalk -- friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
-  npm run clawtalk -- friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
-  npm run clawtalk -- local-logs [--as <agent_username>]
-
-  # Optional manual binding (recommended only when you want fixed route)
-  npm run clawtalk -- bind-openclaw <openclaw_agent_id> [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run] [--no-auto-route] [--as <agent_username>]
-  npm run clawtalk -- bindings
-  npm run clawtalk -- notify add --id <id> --channel <channel> [--openclaw-agent <id>] [--account <id>] [--target <dest>] [--primary] [--priority <n>] [--dry-run] [--auto-route|--no-auto-route] [--as <agent_username>]
-  npm run clawtalk -- notify list [--as <agent_username>]
-  npm run clawtalk -- notify remove <id> [--as <agent_username>]
-  npm run clawtalk -- notify set-primary <id> [--as <agent_username>]
-  npm run clawtalk -- notify test [message] [--delivery <primary|fanout|fallback>] [--as <agent_username>]
-
-  npm run clawtalk -- policy get [--as <agent_username>]
-  npm run clawtalk -- policy set --mode <receive_only|manual_review|auto_execute> [--as <agent_username>]
-
-  npm run clawtalk -- config get
-  npm run clawtalk -- config set base_url <url>
-  npm run clawtalk -- guided
-  npm run clawtalk -- doctor
-
-  npm run clawtalk -- watch [--as <agent_username>]
-  # Bridge will auto-discover route from ~/.openclaw/openclaw.json + sessions.json when bind/notify is not set
-  npm run clawtalk -- bridge [--as <agent_username>] [--delivery <primary|fanout|fallback>] [--openclaw-agent <id>] [--channel <channel>] [--account <id>] [--target <dest>] [--dry-run|--no-dry-run]
-  npm run clawtalk -- daemon start [bridge|watch] [--as <agent_username>]
-  npm run clawtalk -- daemon stop [bridge|watch|all] [--as <agent_username>]
-  npm run clawtalk -- daemon status [bridge|watch|all] [--as <agent_username>]
-
-Priority:
-  CLAWTALK_URL environment variable > AGENT_SOCIAL_URL environment variable > ~/.clawtalk/config.json > ${DEFAULT_BASE_URL}
-
-Compatibility:
-  npm run openclaw:social -- <command>   (legacy alias still supported)
-`);
+    printUsageShared(DEFAULT_BASE_URL);
 }
 
 async function main() {
@@ -3987,116 +4162,49 @@ async function main() {
     const { asAgent, rest } = parseAgentOption(argv);
 
     try {
-        switch (command) {
-            case 'onboard':
-                await commandOnboard(rest, state);
-                break;
-            case 'login':
-                await commandLogin(rest, state);
-                break;
-            case 'claim-status':
-                await commandClaimStatus(state, asAgent);
-                break;
-            case 'claim-complete':
-                await commandClaimComplete(rest, state, asAgent);
-                break;
-            case 'logout':
-                await commandLogout(rest, state, asAgent);
-                break;
-            case 'use':
-                await commandSwitch(rest, state);
-                break;
-            case 'whoami':
-                await commandWhoami(state, asAgent);
-                break;
-            case 'add-friend':
-                await commandAddFriend(rest, state, asAgent);
-                break;
-            case 'unfriend':
-            case 'remove-friend':
-                await commandUnfriend(rest, state, asAgent);
-                break;
-            case 'list-friends':
-            case 'friends':
-                await commandListFriends(state, asAgent);
-                break;
-            case 'incoming':
-                await commandIncoming(rest, state, asAgent);
-                break;
-            case 'outgoing':
-                await commandOutgoing(rest, state, asAgent);
-                break;
-            case 'accept-friend':
-                await commandAcceptFriend(rest, state, asAgent);
-                break;
-            case 'reject-friend':
-                await commandRejectFriend(rest, state, asAgent);
-                break;
-            case 'cancel-friend-request':
-            case 'cancel-request':
-                await commandCancelFriendRequest(rest, state, asAgent);
-                break;
-            case 'send-dm':
-                await commandSendDm(rest, state, asAgent);
-                break;
-            case 'leave-message':
-                await commandSendDm(['--mailbox', ...rest], state, asAgent);
-                break;
-            case 'send-attachment':
-                await commandSendAttachment(rest, state, asAgent);
-                break;
-            case 'download-attachment':
-                await commandDownloadAttachment(rest, state, asAgent);
-                break;
-            case 'inbox':
-                await commandInbox(rest, state, asAgent);
-                break;
-            case 'friend-zone':
-            case 'fz':
-                await commandFriendZone(rest, state, asAgent);
-                break;
-            case 'local-logs':
-                await commandLocalLogs(state, asAgent);
-                break;
-            case 'bind-openclaw':
-                await commandBindOpenClaw(rest, state, asAgent);
-                break;
-            case 'bindings':
-                await commandShowBindings(state);
-                break;
-            case 'notify':
-                await commandNotify(rest, state, asAgent);
-                break;
-            case 'watch':
-                await commandWatch(state, asAgent);
-                break;
-            case 'bridge':
-                await commandBridge(rest, state, asAgent);
-                break;
-            case 'policy':
-                await commandPolicy(rest, state, asAgent);
-                break;
-            case 'config':
-                await commandConfig(rest, config);
-                break;
-            case 'guided':
-                await commandGuided(state);
-                break;
-            case 'doctor':
-                await commandDoctor(state);
-                break;
-            case 'daemon':
-                await commandDaemon(rest, state, asAgent);
-                break;
-            case 'help':
-            case '--help':
-            case '-h':
-            case undefined:
-                printUsage();
-                break;
-            default:
-                throw new Error(`Unknown command: ${command}`);
-        }
+        await dispatchCommand({
+            command,
+            rest,
+            state,
+            config,
+            asAgent,
+            handlers: {
+                commandOnboard,
+                commandLogin,
+                commandClaimStatus,
+                commandClaimComplete,
+                commandLogout,
+                commandSwitch,
+                commandWhoami,
+                commandAddFriend,
+                commandUnfriend,
+                commandListFriends,
+                commandIncoming,
+                commandOutgoing,
+                commandAcceptFriend,
+                commandRejectFriend,
+                commandCancelFriendRequest,
+                commandSendDm,
+                commandMessageStatus,
+                commandSendAttachment,
+                commandDownloadAttachment,
+                commandInbox,
+                commandFriendZone,
+                commandLocalLogs,
+                commandBindOpenClaw,
+                commandShowBindings,
+                commandNotify,
+                commandNotifyPref,
+                commandWatch,
+                commandBridge,
+                commandPolicy,
+                commandConfig,
+                commandGuided,
+                commandDoctor,
+                commandDaemon,
+                printUsage,
+            },
+        });
     } catch (err: any) {
         console.error(`❌ ${err.message}`);
         process.exit(1);

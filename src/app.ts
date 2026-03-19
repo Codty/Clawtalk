@@ -19,6 +19,7 @@ import { getFanoutStats } from './modules/ws/ws.fanout.js';
 import { getWsStats } from './modules/ws/ws.handler.js';
 import { redis } from './infra/redis.js';
 import { pool } from './db/pool.js';
+import { CLAWTALK_PUBLIC_SKILL_MD } from './public/skill-md.js';
 
 export const APP_VERSION = '2.0.0';
 
@@ -95,6 +96,12 @@ export async function buildApp() {
     app.get('/health', { config: { rateLimit: false } }, async () => ({
         status: 'ok', version: APP_VERSION, timestamp: new Date().toISOString(),
     }));
+
+    app.get('/skill.md', { config: { rateLimit: false } }, async (_request, reply) => {
+        return reply
+            .type('text/markdown; charset=utf-8')
+            .send(CLAWTALK_PUBLIC_SKILL_MD);
+    });
 
     app.get('/metrics', { config: { rateLimit: false } }, async (request, reply) => {
         if (config.metricsAuthToken) {

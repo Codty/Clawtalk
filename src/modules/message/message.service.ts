@@ -15,6 +15,8 @@ export class MessageError extends Error {
     }
 }
 
+export type MessageStatus = 'sent' | 'delivered';
+
 interface AttachmentInput {
     url: string;
     mime_type?: string;
@@ -35,8 +37,9 @@ export interface MessageRow {
     recalled_by?: string | null;
     recall_reason?: string | null;
     deleted_at?: string | null;
-    read_at?: string | null;
-    read_count?: number;
+    delivered_at?: string | null;
+    delivered_count?: number;
+    status?: MessageStatus;
     attachments?: any[];
     is_sender_first_message?: boolean;
 }
@@ -44,6 +47,21 @@ export interface MessageRow {
 function toIsoOrNull(value: string | null | undefined): string | null {
     if (!value) return null;
     return new Date(value).toISOString();
+}
+
+function computeMessageStatusForViewer(row: any, viewerId: string): MessageStatus {
+    const deliveredAt = toIsoOrNull(row.delivered_at);
+    const deliveredCount = Number(row.delivered_count || 0);
+
+    // Sender view: track outbound state progression.
+    if (row.sender_id === viewerId) {
+        if (deliveredCount > 0) return 'delivered';
+        return 'sent';
+    }
+
+    // Receiver view: delivery is immediate once visible to this viewer.
+    if (deliveredAt) return 'delivered';
+    return 'sent';
 }
 
 function sanitizeMessageForClient(row: any): MessageRow {
@@ -168,31 +186,63 @@ async function fetchAttachmentsByMessageIds(messageIds: string[]): Promise<Map<s
     return map;
 }
 
-async function hydrateMessages(rows: any[]): Promise<MessageRow[]> {
+async function hydrateMessages(rows: any[], viewerId: string): Promise<MessageRow[]> {
     const ids = rows.map((r) => r.id);
     const attachmentsById = await fetchAttachmentsByMessageIds(ids);
-    return rows.map((row) => sanitizeMessageForClient({
-        ...row,
-        attachments: attachmentsById.get(row.id) || [],
-        read_count: row.read_count ? Number(row.read_count) : 0,
-    }));
+    return rows.map((row) => {
+        const normalizedRow = {
+            ...row,
+            attachments: attachmentsById.get(row.id) || [],
+            delivered_count: row.delivered_count ? Number(row.delivered_count) : 0,
+            delivered_at: toIsoOrNull(row.delivered_at),
+        };
+        const sanitized = sanitizeMessageForClient(normalizedRow);
+        return {
+            ...sanitized,
+            status: computeMessageStatusForViewer(normalizedRow, viewerId),
+        };
+    });
+}
+
+async function markMessagesDeliveredByIds(
+    viewerId: string,
+    messageIds: string[]
+): Promise<{ delivered_count: number }> {
+    if (config.messageStorageMode === 'local_only') return { delivered_count: 0 };
+    if (!Array.isArray(messageIds) || messageIds.length === 0) return { delivered_count: 0 };
+
+    const { rows } = await pool.query(
+        `INSERT INTO message_deliveries (message_id, agent_id, delivered_at)
+         SELECT m.id, $2, NOW()
+         FROM messages m
+         WHERE m.id = ANY($1::uuid[])
+           AND m.deleted_at IS NULL
+           AND m.sender_id <> $2
+         ON CONFLICT (message_id, agent_id)
+         DO NOTHING
+         RETURNING message_id`,
+        [messageIds, viewerId]
+    );
+    return { delivered_count: rows.length };
 }
 
 async function getMessageForViewer(messageId: string, viewerId: string): Promise<MessageRow> {
+    await markMessagesDeliveredByIds(viewerId, [messageId]);
+
     const { rows } = await pool.query(
         `SELECT m.*,
                 m.payload_json AS payload,
                 a.agent_name AS sender_name,
-                mr.read_at,
-                COALESCE(rc.read_count, 0) AS read_count
+                md.delivered_at,
+                COALESCE(dc.delivered_count, 0) AS delivered_count
          FROM messages m
          JOIN agents a ON a.id = m.sender_id
-         LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.agent_id = $2
+         LEFT JOIN message_deliveries md ON md.message_id = m.id AND md.agent_id = $2
          LEFT JOIN (
-             SELECT message_id, COUNT(*)::int AS read_count
-             FROM message_reads
+             SELECT message_id, COUNT(*)::int AS delivered_count
+             FROM message_deliveries
              GROUP BY message_id
-         ) rc ON rc.message_id = m.id
+         ) dc ON dc.message_id = m.id
          WHERE m.id = $1
          LIMIT 1`,
         [messageId, viewerId]
@@ -200,7 +250,7 @@ async function getMessageForViewer(messageId: string, viewerId: string): Promise
     if (rows.length === 0) {
         throw new MessageError('Message not found', 404);
     }
-    const hydrated = await hydrateMessages(rows);
+    const hydrated = await hydrateMessages(rows, viewerId);
     return hydrated[0];
 }
 
@@ -264,7 +314,6 @@ function buildLocalOnlyMessageRow(
         payload: envelope,
         client_msg_id: clientMsgId || null,
         created_at: now,
-        read_count: 0,
         is_sender_first_message: isSenderFirstMessage,
         attachments: attachments.map((item) => ({
             id: randomUUID(),
@@ -460,28 +509,19 @@ export async function markMessagesRead(
     agentId: string,
     messageIds: string[]
 ): Promise<{ read_count: number }> {
-    if (config.messageStorageMode === 'local_only') {
-        return { read_count: 0 };
-    }
     await assertMember(conversationId, agentId);
     if (!Array.isArray(messageIds) || messageIds.length === 0) {
         return { read_count: 0 };
     }
 
-    const { rows } = await pool.query(
-        `INSERT INTO message_reads (message_id, agent_id, read_at)
-         SELECT m.id, $2, NOW()
-         FROM messages m
-         WHERE m.conversation_id = $1
-           AND m.id = ANY($3::uuid[])
-           AND m.deleted_at IS NULL
-         ON CONFLICT (message_id, agent_id)
-         DO UPDATE SET read_at = EXCLUDED.read_at
-         RETURNING message_id`,
-        [conversationId, agentId, messageIds]
-    );
+    if (config.messageStorageMode === 'local_only') {
+        return { read_count: 0 };
+    }
 
-    return { read_count: rows.length };
+    // Compatibility no-op:
+    // The product no longer tracks "read" semantics. We only maintain delivery status.
+    await markMessagesDeliveredByIds(agentId, messageIds);
+    return { read_count: 0 };
 }
 
 /**
@@ -622,16 +662,16 @@ export async function getMessages(
         query = `SELECT m.*,
                         m.payload_json AS payload,
                         a.agent_name AS sender_name,
-                        mr.read_at,
-                        COALESCE(rc.read_count, 0) AS read_count
+                        md.delivered_at,
+                        COALESCE(dc.delivered_count, 0) AS delivered_count
                  FROM messages m
                  JOIN agents a ON a.id = m.sender_id
-                 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.agent_id = $2
+                 LEFT JOIN message_deliveries md ON md.message_id = m.id AND md.agent_id = $2
                  LEFT JOIN (
-                    SELECT message_id, COUNT(*)::int AS read_count
-                    FROM message_reads
+                    SELECT message_id, COUNT(*)::int AS delivered_count
+                    FROM message_deliveries
                     GROUP BY message_id
-                 ) rc ON rc.message_id = m.id
+                 ) dc ON dc.message_id = m.id
                  WHERE m.conversation_id = $1
                    AND m.created_at < $3
                    AND m.deleted_at IS NULL
@@ -642,16 +682,16 @@ export async function getMessages(
         query = `SELECT m.*,
                         m.payload_json AS payload,
                         a.agent_name AS sender_name,
-                        mr.read_at,
-                        COALESCE(rc.read_count, 0) AS read_count
+                        md.delivered_at,
+                        COALESCE(dc.delivered_count, 0) AS delivered_count
                  FROM messages m
                  JOIN agents a ON a.id = m.sender_id
-                 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.agent_id = $2
+                 LEFT JOIN message_deliveries md ON md.message_id = m.id AND md.agent_id = $2
                  LEFT JOIN (
-                    SELECT message_id, COUNT(*)::int AS read_count
-                    FROM message_reads
+                    SELECT message_id, COUNT(*)::int AS delivered_count
+                    FROM message_deliveries
                     GROUP BY message_id
-                 ) rc ON rc.message_id = m.id
+                 ) dc ON dc.message_id = m.id
                  WHERE m.conversation_id = $1
                    AND m.deleted_at IS NULL
                  ORDER BY m.created_at DESC
@@ -659,6 +699,66 @@ export async function getMessages(
         params = [conversationId, agentId, limit];
     }
 
-    const { rows } = await pool.query(query, params);
-    return hydrateMessages(rows);
+    let { rows } = await pool.query(query, params);
+
+    const incomingMessageIds = rows
+        .filter((row: any) => row.sender_id !== agentId)
+        .map((row: any) => row.id);
+
+    const deliveryUpsert = await markMessagesDeliveredByIds(agentId, incomingMessageIds);
+    if (deliveryUpsert.delivered_count > 0) {
+        const refreshed = await pool.query(query, params);
+        rows = refreshed.rows;
+    }
+
+    return hydrateMessages(rows, agentId);
+}
+
+export async function getMessageStatus(
+    conversationId: string,
+    messageId: string,
+    viewerId: string
+): Promise<{
+    message_id: string;
+    conversation_id: string;
+    status: MessageStatus;
+    delivered_count: number;
+    delivered_at: string | null;
+}> {
+    assertServerMessageStorage('Message status');
+    await assertMember(conversationId, viewerId);
+    await markMessagesDeliveredByIds(viewerId, [messageId]);
+
+    const { rows } = await pool.query(
+        `SELECT m.id,
+                m.conversation_id,
+                m.sender_id,
+                md.delivered_at,
+                COALESCE(dc.delivered_count, 0) AS delivered_count
+         FROM messages m
+         LEFT JOIN message_deliveries md ON md.message_id = m.id AND md.agent_id = $3
+         LEFT JOIN (
+            SELECT message_id, COUNT(*)::int AS delivered_count
+            FROM message_deliveries
+            GROUP BY message_id
+         ) dc ON dc.message_id = m.id
+         WHERE m.conversation_id = $1
+           AND m.id = $2
+           AND m.deleted_at IS NULL
+         LIMIT 1`,
+        [conversationId, messageId, viewerId]
+    );
+
+    if (rows.length === 0) {
+        throw new MessageError('Message not found', 404);
+    }
+
+    const row = rows[0];
+    return {
+        message_id: row.id,
+        conversation_id: row.conversation_id,
+        status: computeMessageStatusForViewer(row, viewerId),
+        delivered_count: Number(row.delivered_count || 0),
+        delivered_at: toIsoOrNull(row.delivered_at),
+    };
 }

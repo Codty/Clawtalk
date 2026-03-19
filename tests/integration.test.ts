@@ -32,6 +32,20 @@ afterAll(async () => {
     await app.close();
 });
 
+describe('Public Skill Endpoint', () => {
+    it('should serve /skill.md for one-message onboarding', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/skill.md',
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.headers['content-type']).toContain('text/markdown');
+        expect(res.body).toContain('name: clawtalk');
+        expect(res.body).toContain('help me join Clawtalk');
+    });
+});
+
 // ═══════════════════════════════════════
 // Auth
 // ═══════════════════════════════════════
@@ -161,6 +175,7 @@ describe('Message Envelope', () => {
     let textMessageId: string;
     let mediaMessageId: string;
     let deletedMessageId: string;
+    let statusLifecycleMessageId: string;
 
     beforeAll(async () => {
         const res = await app.inject({
@@ -183,6 +198,60 @@ describe('Message Envelope', () => {
         expect(body.payload.type).toBe('text');
         expect(body.payload.content).toBe('Hello!');
         expect(body.is_sender_first_message).toBe(true);
+    });
+
+    it('should expose message status lifecycle: sent -> delivered', async () => {
+        const send = await app.inject({
+            method: 'POST',
+            url: `/api/v1/conversations/${dmConvId}/messages`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { content: 'status-lifecycle', client_msg_id: 'env-status-001' },
+        });
+        expect(send.statusCode).toBe(201);
+        statusLifecycleMessageId = send.json().id;
+
+        const sentStatus = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${dmConvId}/messages/${statusLifecycleMessageId}/status`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(sentStatus.statusCode).toBe(200);
+        expect(sentStatus.json().status).toBe('sent');
+        expect(sentStatus.json().delivered_count).toBe(0);
+
+        const fetchByReceiver = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${dmConvId}/messages?limit=20`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(fetchByReceiver.statusCode).toBe(200);
+
+        const deliveredStatus = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${dmConvId}/messages/${statusLifecycleMessageId}/status`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(deliveredStatus.statusCode).toBe(200);
+        expect(deliveredStatus.json().status).toBe('delivered');
+        expect(deliveredStatus.json().delivered_count).toBeGreaterThanOrEqual(1);
+
+        const readCompat = await app.inject({
+            method: 'POST',
+            url: `/api/v1/conversations/${dmConvId}/messages/read`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+            payload: { message_ids: [statusLifecycleMessageId] },
+        });
+        expect(readCompat.statusCode).toBe(200);
+        expect(readCompat.json().read_count).toBe(0);
+
+        const statusAfterReadCompat = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${dmConvId}/messages/${statusLifecycleMessageId}/status`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(statusAfterReadCompat.statusCode).toBe(200);
+        expect(statusAfterReadCompat.json().status).toBe('delivered');
+        expect(statusAfterReadCompat.json().delivered_count).toBeGreaterThanOrEqual(1);
     });
 
     it('should preserve delivery metadata for mailbox mode', async () => {
@@ -298,7 +367,7 @@ describe('Message Envelope', () => {
         expect(res.json().sender_id).toBe(agentBId);
     });
 
-    it('should mark message as read and expose read_count', async () => {
+    it('read endpoint should behave as compatibility no-op', async () => {
         const mark = await app.inject({
             method: 'POST',
             url: `/api/v1/conversations/${dmConvId}/messages/read`,
@@ -306,15 +375,16 @@ describe('Message Envelope', () => {
             payload: { message_ids: [mediaMessageId] },
         });
         expect(mark.statusCode).toBe(200);
-        expect(mark.json().read_count).toBe(1);
+        expect(mark.json().read_count).toBe(0);
 
-        const res = await app.inject({
+        const status = await app.inject({
             method: 'GET',
-            url: `/api/v1/conversations/${dmConvId}/messages?limit=20`,
+            url: `/api/v1/conversations/${dmConvId}/messages/${mediaMessageId}/status`,
             headers: { authorization: `Bearer ${agentAToken}` },
         });
-        const mediaMsg = res.json().messages.find((m: any) => m.id === mediaMessageId);
-        expect(mediaMsg.read_count).toBeGreaterThanOrEqual(1);
+        expect(status.statusCode).toBe(200);
+        expect(status.json().status).toBe('delivered');
+        expect(status.json().delivered_count).toBeGreaterThanOrEqual(1);
     });
 
     it('should allow sender recall message within window', async () => {
