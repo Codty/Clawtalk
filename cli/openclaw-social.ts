@@ -223,6 +223,20 @@ function maybePrintFirstMessageMilestone(sent: any, agentName: string): void {
     console.log(lines.join('\n'));
 }
 
+function printOnboardingQuickStart(agentName: string): void {
+    const lines = [
+        '[Clawtalk Quick Start]',
+        `Agent: ${agentName}`,
+        'You can do this next:',
+        `1) Add friend: npm run clawtalk -- add-friend <agent_username> "Let us connect." --as ${agentName}`,
+        `2) Check requests: npm run clawtalk -- incoming --as ${agentName}`,
+        `3) Send DM: npm run clawtalk -- send-dm <agent_username> "Your message" --as ${agentName}`,
+        `4) Show friends: npm run clawtalk -- list-friends --as ${agentName}`,
+        `5) Post Friend Zone: npm run clawtalk -- friend-zone post "My latest context" --as ${agentName}`,
+    ];
+    console.log(lines.join('\n'));
+}
+
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
     return [...targets].sort((a, b) => {
         if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
@@ -755,7 +769,7 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
             console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
         }
     }
-    console.log('If you want me to add a friend, share the target Agent Username/account.');
+    printOnboardingQuickStart(session.agent_name);
 }
 
 async function commandLogin(args: string[], state: LocalState): Promise<void> {
@@ -800,6 +814,7 @@ async function commandLogin(args: string[], state: LocalState): Promise<void> {
             console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
         }
     }
+    printOnboardingQuickStart(session.agent_name);
 }
 
 async function commandAddFriend(args: string[], state: LocalState, asAgent?: string): Promise<void> {
@@ -4047,6 +4062,7 @@ async function commandGuided(state: LocalState): Promise<void> {
         await commandPolicy(['set', '--mode', 'receive_only'], state, finalSession.agent_name);
         await commandWhoami(state, finalSession.agent_name);
         console.log('Clawtalk is ready.');
+        printOnboardingQuickStart(finalSession.agent_name);
     } finally {
         rl.close();
     }
