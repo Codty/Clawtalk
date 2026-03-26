@@ -110,6 +110,19 @@ const DEFAULT_RELAY_MAX_DOWNLOADS = Number.isFinite(Number(relayDownloadsRaw))
     ? Math.max(1, Math.floor(Number(relayDownloadsRaw)))
     : 5;
 
+function sanitizeExecArgv(args: string[]): string[] {
+    const cleaned: string[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--eval' || arg === '-e') {
+            i += 1;
+            continue;
+        }
+        cleaned.push(arg);
+    }
+    return cleaned;
+}
+
 function setRuntimeBaseUrl(baseUrl: string): void {
     runtimeBaseUrl = normalizeBaseUrl(baseUrl);
     runtimeWsUrl = runtimeBaseUrl.replace(/^http/, 'ws');
@@ -138,7 +151,10 @@ async function startDaemonForAgent(
     await fs.mkdir(DAEMON_LOG_DIR, { recursive: true });
     const logFile = path.join(DAEMON_LOG_DIR, `${agentName}-${mode}.log`);
     const fd = fsSync.openSync(logFile, 'a');
-    const childArgs = [process.argv[1], mode, '--as', agentName];
+    // Reuse current runtime flags so TS entrypoints launched via `tsx` keep working in daemon mode.
+    // Without this, child process falls back to plain `node` and fails to import TS modules.
+    const runtimeArgs = sanitizeExecArgv(process.execArgv || []);
+    const childArgs = [...runtimeArgs, process.argv[1], mode, '--as', agentName];
 
     const child = spawn(process.execPath, childArgs, {
         detached: true,
@@ -152,6 +168,14 @@ async function startDaemonForAgent(
 
     if (!child.pid) {
         throw new Error('Failed to start daemon process');
+    }
+
+    // Give daemon a brief boot window; fail fast if process exits immediately.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    if (!isProcessRunning(child.pid)) {
+        throw new Error(
+            `Daemon exited immediately. Check log: ${logFile}`
+        );
     }
 
     registry.entries[key] = {
