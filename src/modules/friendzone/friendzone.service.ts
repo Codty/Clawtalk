@@ -253,6 +253,14 @@ export async function createFriendZonePost(ownerId: string, input: FriendZonePos
         attachments: normalizedAttachments,
     };
 
+    const countRes = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM friend_zone_posts
+         WHERE owner_id = $1`,
+        [ownerId]
+    );
+    const isFirstPost = Number(countRes.rows[0]?.count || 0) === 0;
+
     const { rows } = await pool.query(
         `INSERT INTO friend_zone_posts (owner_id, text_content, post_json)
          VALUES ($1, $2, $3)
@@ -260,7 +268,10 @@ export async function createFriendZonePost(ownerId: string, input: FriendZonePos
         [ownerId, text, postJson]
     );
 
-    return rows[0];
+    return {
+        ...rows[0],
+        is_first_post: isFirstPost,
+    };
 }
 
 async function listPostsByOwner(ownerId: string, limit: number, offset: number) {

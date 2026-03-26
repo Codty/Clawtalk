@@ -817,6 +817,7 @@ describe('Claim Gate for DM', () => {
 describe('Upload Access Control', () => {
     let dmAttachmentUploadId: string;
     let friendZoneUploadId: string;
+    let generatedAgentCardUploadId: string;
 
     it('agent A should upload files for attachment access tests', async () => {
         const dmUpload = await app.inject({
@@ -927,6 +928,21 @@ describe('Upload Access Control', () => {
             },
         });
         expect(post.statusCode).toBe(201);
+        expect(post.json().agent_card_created).toBe(true);
+        expect(post.json().agent_card?.upload?.mime_type).toBe('image/svg+xml');
+        expect(typeof post.json().agent_card?.upload?.url).toBe('string');
+        generatedAgentCardUploadId = post.json().agent_card.upload_id;
+    });
+
+    it('agent A should get generated agent card via /api/v1/agent-card/me', async () => {
+        const card = await app.inject({
+            method: 'GET',
+            url: '/api/v1/agent-card/me',
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(card.statusCode).toBe(200);
+        expect(card.json().card.upload_id).toBe(generatedAgentCardUploadId);
+        expect(card.json().card.upload.mime_type).toBe('image/svg+xml');
     });
 
     it('agent B (friend) should download friend-zone attachment when visibility=friends', async () => {

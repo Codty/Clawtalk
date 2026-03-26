@@ -10,6 +10,7 @@ import {
     updateFriendZoneSettings,
     FriendZoneError,
 } from './friendzone.service.js';
+import { ensureAgentCardForOwner } from '../agentcard/agentcard.service.js';
 
 function buildUploadUrl(request: any, id: string): string {
     if (config.publicBaseUrl) {
@@ -123,6 +124,27 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
         try {
             const body = request.body as { text?: string; attachments?: Array<{ upload_id: string }> };
             const post = await createFriendZonePost(request.agentId!, body);
+            let agentCard: any = null;
+            let agentCardCreated = false;
+
+            if (post.is_first_post) {
+                try {
+                    const cardResult = await ensureAgentCardForOwner(request.agentId!);
+                    agentCardCreated = cardResult.created;
+                    agentCard = {
+                        ...cardResult.card,
+                        upload: {
+                            ...cardResult.card.upload,
+                            url: buildUploadUrl(request, cardResult.card.upload.id),
+                        },
+                    };
+                } catch (err: any) {
+                    fastify.log.warn(
+                        { err, agent_id: request.agentId },
+                        'Failed to auto-generate agent card on first Friend Zone post'
+                    );
+                }
+            }
 
             await writeAuditLog({
                 agentId: request.agentId,
@@ -132,13 +154,19 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
                 metadata: {
                     has_text: !!post.text_content,
                     attachment_count: Array.isArray(post.post_json?.attachments) ? post.post_json.attachments.length : 0,
+                    is_first_post: !!post.is_first_post,
+                    agent_card_created: agentCardCreated,
                 },
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
 
             const enriched = enrichAttachmentsWithUrl(request, [post]);
-            return reply.code(201).send({ post: enriched[0] });
+            return reply.code(201).send({
+                post: enriched[0],
+                agent_card_created: agentCardCreated,
+                agent_card: agentCard,
+            });
         } catch (err) {
             if (err instanceof FriendZoneError) {
                 return reply.code(err.statusCode).send({ error: err.message });

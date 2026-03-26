@@ -3188,7 +3188,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
             sent_at: data.created_at || new Date().toISOString(),
         });
 
-        let prompt = buildMessagePrompt(policy.mode, senderName, content);
+        const prompt = buildMessagePrompt(policy.mode, senderName, content);
         if (deliveryMode === 'mailbox') {
             const mailboxId = data.id || `mailbox-${Date.now()}`;
             rememberMailboxPending(seen, {
@@ -3201,11 +3201,30 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 priority,
             });
             await persistWatcherState();
-            if (!messageId) {
+
+            // New default behavior: mailbox messages are still queued for inbox/digest,
+            // but also pushed immediately to the user channel.
+            if (shouldNotifyRealtimeDm(pref)) {
+                await deliverNewMessageWithReliability(
+                    {
+                        key: deliveryKey,
+                        event: data,
+                        senderName,
+                        prompt,
+                    },
+                    'incoming'
+                );
+
+                if (hooks.echoConsole !== false) {
+                    console.log(`\n${prompt}`);
+                }
+            } else if (!messageId) {
+                // For no-id events that are intentionally muted, ack once to avoid looped duplicates.
                 markNotificationAck(seen, deliveryKey, 'new_message', 0);
                 removeNotificationRetry(seen, deliveryKey);
                 await persistWatcherState();
             }
+
             await maybeNotifyMailboxReminder({ event: data, senderName, content });
             return;
         }
