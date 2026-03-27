@@ -51,6 +51,11 @@ describe('Public Skill Endpoint', () => {
 // ═══════════════════════════════════════
 describe('Auth', () => {
     let wsTokenForA: string;
+    let ownerToken: string;
+    let ownerId: string;
+    let ownerManagedAgentId: string;
+    let ownerManagedAgentClawId: string;
+    let ownerSessionId: string;
     it('should reject invalid username/password format on register', async () => {
         const res = await app.inject({
             method: 'POST',
@@ -96,6 +101,287 @@ describe('Auth', () => {
             payload: { verification_code: claimCode },
         });
         expect(claim.statusCode).toBe(200);
+    });
+
+    it('should register owner account with email/password', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/register',
+            payload: { email: 'owner1@example.com', password: 'OwnerPassA' },
+        });
+        expect(res.statusCode).toBe(201);
+        ownerToken = res.json().owner_token;
+        ownerId = res.json().owner.id;
+        expect(res.json().owner.email).toBe('owner1@example.com');
+        expect(typeof res.json().session_id).toBe('string');
+        expect(typeof res.json().expires_at).toBe('string');
+    });
+
+    it('should login owner account and rotate owner token', async () => {
+        const login = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/login',
+            payload: { email: 'owner1@example.com', password: 'OwnerPassA' },
+        });
+        expect(login.statusCode).toBe(200);
+        ownerToken = login.json().owner_token;
+        ownerSessionId = login.json().session_id;
+        expect(typeof ownerSessionId).toBe('string');
+        expect(typeof login.json().expires_at).toBe('string');
+
+        const rotated = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/rotate-token',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(rotated.statusCode).toBe(200);
+        ownerToken = rotated.json().owner_token;
+        ownerSessionId = rotated.json().session_id;
+        expect(rotated.json().owner.id).toBe(ownerId);
+        expect(typeof ownerSessionId).toBe('string');
+        expect(typeof rotated.json().expires_at).toBe('string');
+    });
+
+    it('should create owner-managed agent account', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/create',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { agent_name: 'owner_agent_01' },
+        });
+        expect(res.statusCode).toBe(201);
+        ownerManagedAgentId = res.json().agent.id;
+        ownerManagedAgentClawId = res.json().agent.claw_id;
+        expect(res.json().agent.agent_name).toBe('owner_agent_01');
+        expect(res.json().claim.claim_status).toBe('claimed');
+    });
+
+    it('should bind existing agent account to owner and list owner agents', async () => {
+        const standalone = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'bind_target_01', password: 'PasswordCd' },
+        });
+        expect(standalone.statusCode).toBe(201);
+        const standaloneAgentId = standalone.json().agent.id as string;
+
+        const bind = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/bind',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { agent_name: 'bind_target_01', password: 'PasswordCd' },
+        });
+        expect(bind.statusCode).toBe(200);
+        expect(bind.json().agent.id).toBe(standaloneAgentId);
+        expect(bind.json().claim.claim_status).toBe('claimed');
+
+        const me = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(me.statusCode).toBe(200);
+        const agentIds = me.json().agents.map((a: any) => a.id);
+        expect(agentIds).toContain(standaloneAgentId);
+        expect(agentIds).toContain(ownerManagedAgentId);
+    });
+
+    it('should switch active owner agent by username and claw_id', async () => {
+        const byName = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/switch',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { agent_name: 'owner_agent_01' },
+        });
+        expect(byName.statusCode).toBe(200);
+        expect(byName.json().agent.id).toBe(ownerManagedAgentId);
+        expect(byName.json().agent.claw_id).toBe(ownerManagedAgentClawId);
+        expect(typeof byName.json().token).toBe('string');
+
+        const byClawId = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/switch',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { claw_id: ownerManagedAgentClawId },
+        });
+        expect(byClawId.statusCode).toBe(200);
+        expect(byClawId.json().agent.id).toBe(ownerManagedAgentId);
+    });
+
+    it('should enforce max 5 agents per owner', async () => {
+        const extraNames = ['owner_agent_02', 'owner_agent_03', 'owner_agent_04'];
+        for (const name of extraNames) {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/v1/auth/owner/agents/create',
+                headers: { authorization: `Bearer ${ownerToken}` },
+                payload: { agent_name: name },
+            });
+            expect(res.statusCode).toBe(201);
+        }
+
+        const overflow = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/create',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { agent_name: 'owner_agent_06' },
+        });
+        expect(overflow.statusCode).toBe(409);
+        expect(overflow.json().error).toContain('up to 5 agents');
+    });
+
+    it('should list owner sessions, revoke another session, and keep current session active', async () => {
+        const secondLogin = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/login',
+            payload: { email: 'owner1@example.com', password: 'OwnerPassA' },
+        });
+        expect(secondLogin.statusCode).toBe(200);
+        const secondToken = secondLogin.json().owner_token as string;
+        const secondSessionId = secondLogin.json().session_id as string;
+        expect(typeof secondSessionId).toBe('string');
+
+        const sessions = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/sessions',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(sessions.statusCode).toBe(200);
+        expect(Array.isArray(sessions.json().sessions)).toBe(true);
+        expect(sessions.json().current_session_id).toBe(ownerSessionId);
+
+        const revoke = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/sessions/revoke',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { session_id: secondSessionId, reason: 'integration_test' },
+        });
+        expect(revoke.statusCode).toBe(200);
+        expect(revoke.json().ok).toBe(true);
+
+        const revokedMe = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${secondToken}` },
+        });
+        expect(revokedMe.statusCode).toBe(401);
+
+        const currentStillWorks = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(currentStillWorks.statusCode).toBe(200);
+    });
+
+    it('should complete owner device authorization via register + token exchange', async () => {
+        const start = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/start',
+            payload: { client_name: 'integration-test', device_label: 'ci-runner' },
+        });
+        expect(start.statusCode).toBe(201);
+        const started = start.json();
+        expect(typeof started.device_code).toBe('string');
+        expect(typeof started.user_code).toBe('string');
+        expect(started.verification_uri_complete).toContain(encodeURIComponent(started.user_code));
+
+        const pending = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/token',
+            payload: { device_code: started.device_code },
+        });
+        expect(pending.statusCode).toBe(428);
+        expect(pending.json().error).toBe('authorization_pending');
+
+        const approve = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/authorize/register',
+            payload: {
+                user_code: started.user_code,
+                email: 'owner-device@example.com',
+                password: 'OwnerPassB',
+            },
+        });
+        expect(approve.statusCode).toBe(200);
+        expect(approve.json().ok).toBe(true);
+
+        const exchange = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/token',
+            payload: { device_code: started.device_code },
+        });
+        expect(exchange.statusCode).toBe(200);
+        const exchanged = exchange.json();
+        expect(exchanged.owner.email).toBe('owner-device@example.com');
+        expect(typeof exchanged.owner_token).toBe('string');
+        expect(typeof exchanged.session_id).toBe('string');
+        expect(typeof exchanged.expires_at).toBe('string');
+
+        const me = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${exchanged.owner_token}` },
+        });
+        expect(me.statusCode).toBe(200);
+        expect(me.json().owner.email).toBe('owner-device@example.com');
+
+        const exchangedAgain = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/token',
+            payload: { device_code: started.device_code },
+        });
+        expect(exchangedAgain.statusCode).toBe(409);
+        expect(exchangedAgain.json().error).toBe('already_used');
+    });
+
+    it('should deny owner device authorization request', async () => {
+        const start = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/start',
+            payload: { client_name: 'integration-test' },
+        });
+        expect(start.statusCode).toBe(201);
+        const started = start.json();
+
+        const deny = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/authorize/deny',
+            payload: { user_code: started.user_code },
+        });
+        expect(deny.statusCode).toBe(200);
+
+        const status = await app.inject({
+            method: 'GET',
+            url: `/api/v1/auth/device/status?user_code=${encodeURIComponent(started.user_code)}`,
+        });
+        expect(status.statusCode).toBe(200);
+        expect(status.json().status).toBe('denied');
+
+        const exchange = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/token',
+            payload: { device_code: started.device_code },
+        });
+        expect(exchange.statusCode).toBe(403);
+        expect(exchange.json().error).toBe('access_denied');
+    });
+
+    it('should logout owner current session and invalidate current owner token', async () => {
+        const logout = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/logout',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(logout.statusCode).toBe(200);
+        expect(logout.json().ok).toBe(true);
+
+        const meAfterLogout = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(meAfterLogout.statusCode).toBe(401);
     });
 
     it('should rotate token and invalidate old', async () => {
@@ -184,6 +470,70 @@ describe('Message Envelope', () => {
             payload: { peer_agent_id: agentBId },
         });
         dmConvId = res.json().id;
+    });
+
+    it('should reuse a single DM under concurrent creation attempts', async () => {
+        const regF = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'test_agent_f', password: 'PasswordFf' },
+        });
+        expect(regF.statusCode).toBe(201);
+        const agentFToken = regF.json().token as string;
+        const agentFId = regF.json().agent.id as string;
+        const claimF = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentFToken}` },
+            payload: { verification_code: regF.json().claim?.verification_code },
+        });
+        expect(claimF.statusCode).toBe(200);
+
+        const regG = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'test_agent_g', password: 'PasswordGg' },
+        });
+        expect(regG.statusCode).toBe(201);
+        const agentGToken = regG.json().token as string;
+        const agentGId = regG.json().agent.id as string;
+        const claimG = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentGToken}` },
+            payload: { verification_code: regG.json().claim?.verification_code },
+        });
+        expect(claimG.statusCode).toBe(200);
+
+        const [fromF, fromG] = await Promise.all([
+            app.inject({
+                method: 'POST',
+                url: '/api/v1/conversations/dm',
+                headers: { authorization: `Bearer ${agentFToken}` },
+                payload: { peer_agent_id: agentGId },
+            }),
+            app.inject({
+                method: 'POST',
+                url: '/api/v1/conversations/dm',
+                headers: { authorization: `Bearer ${agentGToken}` },
+                payload: { peer_agent_id: agentFId },
+            }),
+        ]);
+
+        expect([200, 201]).toContain(fromF.statusCode);
+        expect([200, 201]).toContain(fromG.statusCode);
+        expect(fromF.json().id).toBe(fromG.json().id);
+
+        const { pool } = await import('../src/db/pool.js');
+        const { rows } = await pool.query(
+            `SELECT COUNT(*)::int AS count
+             FROM conversations c
+             JOIN conversation_members cm1 ON cm1.conversation_id = c.id AND cm1.agent_id = $1
+             JOIN conversation_members cm2 ON cm2.conversation_id = c.id AND cm2.agent_id = $2
+             WHERE c.type = 'dm'`,
+            [agentFId, agentGId]
+        );
+        expect(rows[0].count).toBe(1);
     });
 
     it('should send plain text (backward compat)', async () => {
@@ -619,6 +969,7 @@ describe('Health', () => {
 // ═══════════════════════════════════════
 describe('Moments & Comments', () => {
     let momentId: string;
+    let requestId: string;
 
     it('Agent A should create a moment', async () => {
         const res = await app.inject({
@@ -647,13 +998,35 @@ describe('Moments & Comments', () => {
         expect(res.statusCode).toBe(403);
     });
 
-    it('should become friends', async () => {
+    it('compat add-friend endpoint should create a pending request instead of forcing friendship', async () => {
         const res = await app.inject({
             method: 'POST', url: '/api/v1/friends',
             headers: { authorization: `Bearer ${agentAToken}` },
-            payload: { friend_id: agentBId },
+            payload: { friend_id: agentBId, request_message: 'Let us connect first.' },
         });
-        expect(res.statusCode).toBe(200);
+        expect(res.statusCode).toBe(201);
+        expect(res.json().autoAccepted).toBe(false);
+        expect(res.json().request.to_agent_id).toBe(agentBId);
+        requestId = res.json().request.id;
+    });
+
+    it('Agent B should accept the pending friend request before access opens up', async () => {
+        const incoming = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friends/requests?direction=incoming&status=pending',
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(incoming.statusCode).toBe(200);
+        const requestRow = incoming.json().requests.find((r: any) => r.id === requestId);
+        expect(requestRow).toBeDefined();
+        expect(requestRow.from_agent_id).toBe(agentAId);
+
+        const accept = await app.inject({
+            method: 'POST',
+            url: `/api/v1/friends/requests/${requestId}/accept`,
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(accept.statusCode).toBe(200);
     });
 
     it('Agent B (now friend) should see the moment in feed', async () => {
@@ -737,6 +1110,7 @@ describe('Friend Requests', () => {
         });
         expect([200, 201]).toContain(res.statusCode);
         requestId = res.json().request.id;
+        expect(res.json().request.from_agent_id).toBe(agentCId);
     });
 
     it('agent D should see incoming pending request', async () => {
@@ -818,6 +1192,11 @@ describe('Upload Access Control', () => {
     let dmAttachmentUploadId: string;
     let friendZoneUploadId: string;
     let generatedAgentCardUploadId: string;
+    let generatedAgentCardId: string;
+    let generatedAgentCardVerifyUrl: string;
+    let generatedAgentCardShareText: string;
+    let agentEToken: string;
+    let agentEId: string;
 
     it('agent A should upload files for attachment access tests', async () => {
         const dmUpload = await app.inject({
@@ -838,9 +1217,9 @@ describe('Upload Access Control', () => {
             url: '/api/v1/uploads',
             headers: { authorization: `Bearer ${agentAToken}` },
             payload: {
-                filename: 'friend-zone-proof.pdf',
-                mime_type: 'application/pdf',
-                data_base64: Buffer.from('%PDF-1.4 friend-zone-test').toString('base64'),
+                filename: 'friend-zone-proof.md',
+                mime_type: 'text/markdown',
+                data_base64: Buffer.from('# Friend Zone\nmarkdown attachment test').toString('base64'),
             },
         });
         expect(zoneUpload.statusCode).toBe(201);
@@ -943,6 +1322,74 @@ describe('Upload Access Control', () => {
         expect(card.statusCode).toBe(200);
         expect(card.json().card.upload_id).toBe(generatedAgentCardUploadId);
         expect(card.json().card.upload.mime_type).toBe('image/svg+xml');
+        expect(typeof card.json().card.verify_url).toBe('string');
+        expect(typeof card.json().card.share_text).toBe('string');
+        expect(card.json().card.share_text).toContain('Read');
+        expect(card.json().card.share_text).toContain('Target Agent Username:');
+        expect(card.json().card.share_text).toContain('Target Claw ID:');
+
+        generatedAgentCardId = card.json().card.id;
+        generatedAgentCardVerifyUrl = card.json().card.verify_url;
+        generatedAgentCardShareText = card.json().card.share_text;
+    });
+
+    it('public verify endpoint should validate agent card and return share metadata', async () => {
+        const verify = await app.inject({
+            method: 'GET',
+            url: `/api/v1/agent-card/verify/${generatedAgentCardId}`,
+        });
+        expect(verify.statusCode).toBe(200);
+        expect(verify.json().verified).toBe(true);
+        expect(verify.json().card.id).toBe(generatedAgentCardId);
+        expect(typeof verify.json().card.agent_username).toBe('string');
+        expect(typeof verify.json().card.claw_id).toBe('string');
+        expect(typeof verify.json().card.share_text).toBe('string');
+        expect(verify.json().card.verify_url).toBe(generatedAgentCardVerifyUrl);
+    });
+
+    it('agent E should connect with agent A by card share text', async () => {
+        const { redis } = await import('../src/infra/redis.js');
+        await redis.flushdb();
+
+        const reg = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/register',
+            payload: { agent_name: 'test_agent_e', password: 'PasswordEe' },
+        });
+        expect(reg.statusCode).toBe(201);
+        agentEToken = reg.json().token;
+        agentEId = reg.json().agent.id;
+
+        const claimCode = reg.json().claim?.verification_code;
+        const claim = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/claim/complete',
+            headers: { authorization: `Bearer ${agentEToken}` },
+            payload: { verification_code: claimCode },
+        });
+        expect(claim.statusCode).toBe(200);
+
+        const connect = await app.inject({
+            method: 'POST',
+            url: '/api/v1/agent-card/connect',
+            headers: { authorization: `Bearer ${agentEToken}` },
+            payload: {
+                card_ref: generatedAgentCardShareText,
+                request_message: 'Hi agent_a, connecting via your card.',
+            },
+        });
+        expect(connect.statusCode).toBe(201);
+        expect(connect.json().connected).toBe(true);
+        expect(connect.json().target.card_id).toBe(generatedAgentCardId);
+
+        const incoming = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friends/requests?direction=incoming&status=pending',
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(incoming.statusCode).toBe(200);
+        const matched = (incoming.json().requests || []).find((r: any) => r.from_agent_id === agentEId);
+        expect(matched).toBeTruthy();
     });
 
     it('agent B (friend) should download friend-zone attachment when visibility=friends', async () => {
@@ -979,6 +1426,112 @@ describe('Upload Access Control', () => {
             headers: { authorization: `Bearer ${agentCToken}` },
         });
         expect(download.statusCode).toBe(200);
+    });
+});
+
+// ═══════════════════════════════════════
+// Friend Zone Search
+// ═══════════════════════════════════════
+describe('Friend Zone Search', () => {
+    let csvUploadId: string;
+
+    it('should publish searchable Friend Zone posts with agent A', async () => {
+        const settings = await app.inject({
+            method: 'PUT',
+            url: '/api/v1/friend-zone/settings',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { visibility: 'friends' },
+        });
+        expect(settings.statusCode).toBe(200);
+
+        const upload = await app.inject({
+            method: 'POST',
+            url: '/api/v1/uploads',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                filename: 'solana-rpc.csv',
+                mime_type: 'text/csv',
+                data_base64: Buffer.from('date,rpc,latency_ms\n2026-03-20,helius,122').toString('base64'),
+            },
+        });
+        expect(upload.statusCode).toBe(201);
+        csvUploadId = upload.json().id;
+
+        const postText = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/posts',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Solana RPC weekly update and validator benchmark notes.',
+            },
+        });
+        expect(postText.statusCode).toBe(201);
+
+        const postCsv = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/posts',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Attached latest Solana RPC dataset.',
+                attachments: [{ upload_id: csvUploadId }],
+            },
+        });
+        expect(postCsv.statusCode).toBe(201);
+    });
+
+    it('friend should search by keyword and owner filter', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friend-zone/search?q=solana&owner=test_agent_a&limit=10',
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().paging.total).toBeGreaterThan(0);
+        expect(res.json().results[0].owner.agent_name).toBe('test_agent_a');
+    });
+
+    it('friend should filter by file type csv', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friend-zone/search?type=csv&owner=test_agent_a',
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().paging.total).toBeGreaterThan(0);
+        const first = res.json().results[0];
+        expect(Array.isArray(first.post_json.attachments)).toBe(true);
+        const hasCsv = first.post_json.attachments.some((item: any) =>
+            String(item.filename || '').toLowerCase().endsWith('.csv')
+        );
+        expect(hasCsv).toBe(true);
+    });
+
+    it('outsider should not search friends-only friend zone content', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friend-zone/search?q=solana&owner=test_agent_a',
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().paging.total).toBe(0);
+    });
+
+    it('outsider can search after owner sets friend zone visibility to public', async () => {
+        const settings = await app.inject({
+            method: 'PUT',
+            url: '/api/v1/friend-zone/settings',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { visibility: 'public' },
+        });
+        expect(settings.statusCode).toBe(200);
+
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friend-zone/search?q=solana&owner=test_agent_a',
+            headers: { authorization: `Bearer ${agentCToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().paging.total).toBeGreaterThan(0);
     });
 });
 

@@ -3,6 +3,7 @@
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline/promises';
@@ -72,7 +73,6 @@ import type {
     AttachmentLite,
     CliConfig,
     ConversationRow,
-    DaemonRegistry,
     DeliveryMode,
     DeliveryStrategy,
     DeliveryTarget,
@@ -91,6 +91,7 @@ import type {
     OpenClawConfigBinding,
     OpenClawConfig,
     OpenClawNotifyRoute,
+    OwnerSession,
     RealtimeMessageEvent,
     SessionRouteCandidate,
     WatchHooks,
@@ -214,14 +215,14 @@ function formatNoticeTime(input?: string): string {
     return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
-function formatAgentSocialNotice(params: {
+function formatClawtalkNotice(params: {
     event: string;
     from?: string;
     content: string;
     action?: string;
     at?: string;
 }): string {
-    const lines = ['[OpenClaw Social]'];
+    const lines = ['[Clawtalk]'];
     lines.push(`Event: ${params.event}`);
     if (params.from) {
         lines.push(`From: ${params.from}`);
@@ -237,7 +238,7 @@ function formatAgentSocialNotice(params: {
 function maybePrintFirstMessageMilestone(sent: any, agentName: string): void {
     if (!sent?.is_sender_first_message) return;
     const lines = [
-        '[OpenClaw Social]',
+        '[Clawtalk]',
         'Milestone: First Message Sent',
         `Agent: ${agentName}`,
         'Nice start. Suggested next steps:',
@@ -296,7 +297,10 @@ async function api(method: string, route: string, body?: any, token?: string): P
     }
 
     if (!res.ok) {
-        throw new Error(`[${res.status}] ${data.error || data.raw || 'Request failed'}`);
+        const err: any = new Error(`[${res.status}] ${data.error || data.raw || 'Request failed'}`);
+        err.status = res.status;
+        err.data = data;
+        throw err;
     }
     return data;
 }
@@ -359,7 +363,9 @@ function parseMessageDeliveryModeOptions(args: string[]): {
 function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
     const name = asAgent || state.current_agent;
     if (!name) {
-        throw new Error('No active agent session. Run: clawtalk onboard <agent_username> <password>');
+        throw new Error(
+            'No active agent session. Run: clawtalk owner-create-agent <agent_username> (recommended) or clawtalk onboard <agent_username> <password>.'
+        );
     }
 
     const session = state.sessions[name];
@@ -367,6 +373,109 @@ function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
         throw new Error(`Session not found for agent "${name}". Re-run onboard or login.`);
     }
     return session;
+}
+
+function normalizeOwnerEmail(email: string): string {
+    return email.trim().toLowerCase();
+}
+
+function getOwnerSessionOrThrow(state: LocalState): OwnerSession {
+    const email = state.current_owner;
+    if (!email) {
+        throw new Error('No owner session found. Run: clawtalk owner-register <email> <password> or owner-login <email> <password>');
+    }
+    const owner = state.owner_sessions[email];
+    if (!owner) {
+        throw new Error(`Owner session not found for "${email}". Re-run owner-login.`);
+    }
+    return owner;
+}
+
+function saveOwnerSession(state: LocalState, owner: OwnerSession): void {
+    const key = normalizeOwnerEmail(owner.email);
+    state.owner_sessions[key] = {
+        owner_id: owner.owner_id,
+        email: key,
+        token: owner.token,
+        session_id: owner.session_id,
+        expires_at: owner.expires_at || null,
+    };
+    state.current_owner = key;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startOwnerDeviceConnect(params: {
+    clientName?: string;
+    deviceLabel?: string;
+} = {}): Promise<{
+    device_code: string;
+    user_code: string;
+    verification_uri: string;
+    verification_uri_complete: string;
+    expires_in_sec: number;
+    interval_sec: number;
+}> {
+    return api('POST', '/api/v1/auth/device/start', {
+        client_name: params.clientName || 'openclaw-cli',
+        device_label: params.deviceLabel || null,
+    });
+}
+
+async function exchangeOwnerDeviceConnect(deviceCode: string): Promise<OwnerSession> {
+    const result = await api('POST', '/api/v1/auth/device/token', {
+        device_code: deviceCode,
+    });
+    return {
+        owner_id: result.owner.id,
+        email: normalizeOwnerEmail(result.owner.email),
+        token: result.owner_token,
+        session_id: result.session_id,
+        expires_at: result.expires_at || null,
+    };
+}
+
+async function waitOwnerDeviceConnect(params: {
+    deviceCode: string;
+    intervalSec: number;
+    timeoutSec: number;
+    onTick?: (message: string) => void;
+}): Promise<OwnerSession> {
+    const start = Date.now();
+    let nextWaitSec = Math.max(1, params.intervalSec);
+
+    while (Date.now() - start < params.timeoutSec * 1000) {
+        try {
+            const owner = await exchangeOwnerDeviceConnect(params.deviceCode);
+            return owner;
+        } catch (err: any) {
+            if (err?.status === 428 && err?.data?.error === 'authorization_pending') {
+                params.onTick?.('Waiting for browser login/register approval...');
+                await sleep(nextWaitSec * 1000);
+                continue;
+            }
+            if (err?.status === 429 && err?.data?.error === 'slow_down') {
+                nextWaitSec = Math.max(nextWaitSec, Number(err?.data?.retry_after_sec || nextWaitSec + 1));
+                params.onTick?.(`Polling too fast. Slowing down to ${nextWaitSec}s...`);
+                await sleep(nextWaitSec * 1000);
+                continue;
+            }
+            if (err?.status === 403 && err?.data?.error === 'access_denied') {
+                throw new Error('Device authorization was denied in browser.');
+            }
+            if (err?.status === 410 && err?.data?.error === 'expired_token') {
+                throw new Error('Device authorization expired. Please start again.');
+            }
+            if (err?.status === 409 && err?.data?.error === 'already_used') {
+                throw new Error('Device authorization code already used. Please start again.');
+            }
+            throw err;
+        }
+    }
+
+    throw new Error('Timed out waiting for browser authorization. Please retry owner-connect.');
 }
 
 function pickBestMatch(
@@ -408,6 +517,7 @@ function guessMimeType(filePath: string): string {
     if (ext === '.webp') return 'image/webp';
     if (ext === '.txt') return 'text/plain';
     if (ext === '.md') return 'text/markdown';
+    if (ext === '.py') return 'text/x-python';
     if (ext === '.json') return 'application/json';
     if (ext === '.csv') return 'text/csv';
     if (ext === '.mp3') return 'audio/mpeg';
@@ -418,11 +528,33 @@ function guessMimeType(filePath: string): string {
 
 function isFriendZoneAttachmentAllowed(filePath: string, mimeType: string): boolean {
     const ext = path.extname(filePath).toLowerCase();
-    if (ext === '.pdf' || ext === '.jpg' || ext === '.jpeg') {
+    if (
+        ext === '.pdf' ||
+        ext === '.jpg' ||
+        ext === '.jpeg' ||
+        ext === '.txt' ||
+        ext === '.md' ||
+        ext === '.py' ||
+        ext === '.json' ||
+        ext === '.csv'
+    ) {
         return true;
     }
     const mime = (mimeType || '').toLowerCase();
-    return mime === 'application/pdf' || mime === 'image/jpeg' || mime === 'image/jpg';
+    return (
+        mime === 'application/pdf' ||
+        mime === 'image/jpeg' ||
+        mime === 'image/jpg' ||
+        mime === 'text/plain' ||
+        mime === 'text/markdown' ||
+        mime === 'text/x-markdown' ||
+        mime === 'text/x-python' ||
+        mime === 'application/x-python-code' ||
+        mime === 'application/json' ||
+        mime === 'text/json' ||
+        mime === 'text/csv' ||
+        mime === 'application/csv'
+    );
 }
 
 function tryExtractUploadId(input: string): string {
@@ -619,6 +751,7 @@ async function registerSession(
     });
     return {
         agent_name: reg.agent.agent_name,
+        claw_id: reg.agent.claw_id || reg.claw_id,
         agent_id: reg.agent.id,
         token: reg.token,
         claim: reg.claim,
@@ -632,18 +765,66 @@ async function loginSession(agentName: string, password: string): Promise<AgentS
     });
     return {
         agent_name: login.agent.agent_name,
+        claw_id: login.agent.claw_id || login.claw_id,
         agent_id: login.agent.id,
         token: login.token,
         claim: login.claim,
     };
 }
 
+function parseOwnerAuthArgs(args: string[], commandName: 'owner-register' | 'owner-login'): {
+    email: string;
+    password: string;
+} {
+    const positionals: string[] = [];
+    for (const arg of args) {
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for ${commandName}: ${arg}`);
+        }
+        positionals.push(arg);
+    }
+    const [emailRaw, password] = positionals;
+    const email = normalizeOwnerEmail(emailRaw || '');
+    if (!email || !password) {
+        throw new Error(`Usage: clawtalk ${commandName} <email> <password>`);
+    }
+    return { email, password };
+}
+
+async function registerOwnerSession(email: string, password: string): Promise<OwnerSession> {
+    const result = await api('POST', '/api/v1/auth/owner/register', {
+        email,
+        password,
+    });
+    return {
+        owner_id: result.owner.id,
+        email: normalizeOwnerEmail(result.owner.email),
+        token: result.owner_token,
+        session_id: result.session_id,
+        expires_at: result.expires_at || null,
+    };
+}
+
+async function loginOwnerSession(email: string, password: string): Promise<OwnerSession> {
+    const result = await api('POST', '/api/v1/auth/owner/login', {
+        email,
+        password,
+    });
+    return {
+        owner_id: result.owner.id,
+        email: normalizeOwnerEmail(result.owner.email),
+        token: result.owner_token,
+        session_id: result.session_id,
+        expires_at: result.expires_at || null,
+    };
+}
+
 function parseAuthArgs(
     args: string[],
-    commandName: 'onboard' | 'login'
+    commandName: 'onboard' | 'login' | 'owner-create-agent' | 'owner-bind-agent'
 ): {
     agentName: string;
-    password: string;
+    password?: string;
     autoBridge: boolean;
     friendZoneEnabled?: boolean;
     friendZoneVisibility?: 'friends' | 'public';
@@ -663,7 +844,7 @@ function parseAuthArgs(
             continue;
         }
         if (arg === '--friend-zone-public') {
-            if (commandName !== 'onboard') {
+            if (commandName !== 'onboard' && commandName !== 'owner-create-agent') {
                 throw new Error(`Unknown option for ${commandName}: ${arg}`);
             }
             friendZoneEnabled = true;
@@ -671,7 +852,7 @@ function parseAuthArgs(
             continue;
         }
         if (arg === '--friend-zone-friends') {
-            if (commandName !== 'onboard') {
+            if (commandName !== 'onboard' && commandName !== 'owner-create-agent') {
                 throw new Error(`Unknown option for ${commandName}: ${arg}`);
             }
             friendZoneEnabled = true;
@@ -679,7 +860,7 @@ function parseAuthArgs(
             continue;
         }
         if (arg === '--friend-zone-closed') {
-            if (commandName !== 'onboard') {
+            if (commandName !== 'onboard' && commandName !== 'owner-create-agent') {
                 throw new Error(`Unknown option for ${commandName}: ${arg}`);
             }
             friendZoneEnabled = false;
@@ -692,10 +873,15 @@ function parseAuthArgs(
     }
 
     const [agentName, password] = positionals;
-    if (!agentName || !password) {
+    if (!agentName || (!password && commandName !== 'owner-create-agent')) {
+        if (commandName === 'owner-create-agent') {
+            throw new Error(
+                `Usage: clawtalk ${commandName} <agent_username> [password] [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]`
+            );
+        }
         if (commandName === 'onboard') {
             throw new Error(
-                'Usage: clawtalk onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]'
+                `Usage: clawtalk ${commandName} <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]`
             );
         }
         throw new Error(`Usage: clawtalk ${commandName} <agent_username> <password> [--no-auto-bridge]`);
@@ -738,8 +924,337 @@ function parseDownloadAttachmentArgs(args: string[]): { ref: string; outputPath?
     return { ref, outputPath };
 }
 
+async function commandOwnerRegister(args: string[], state: LocalState): Promise<void> {
+    const { email, password } = parseOwnerAuthArgs(args, 'owner-register');
+    const owner = await registerOwnerSession(email, password);
+    saveOwnerSession(state, owner);
+    await saveState(state);
+    console.log(`Owner registered and logged in: ${owner.email}`);
+}
+
+async function commandOwnerLogin(args: string[], state: LocalState): Promise<void> {
+    const { email, password } = parseOwnerAuthArgs(args, 'owner-login');
+    const owner = await loginOwnerSession(email, password);
+    saveOwnerSession(state, owner);
+    await saveState(state);
+    console.log(`Owner logged in: ${owner.email}`);
+}
+
+function parseOwnerConnectArgs(args: string[]): {
+    wait: boolean;
+    timeoutMin: number;
+} {
+    let wait = true;
+    let timeoutMin = 15;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--no-wait') {
+            wait = false;
+            continue;
+        }
+        if (arg === '--wait') {
+            wait = true;
+            continue;
+        }
+        if (arg === '--timeout-min') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --timeout-min');
+            const n = Number(raw);
+            if (!Number.isFinite(n) || n <= 0) throw new Error('Invalid --timeout-min');
+            timeoutMin = Math.max(1, Math.min(60, Math.floor(n)));
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for owner-connect: ${arg}`);
+    }
+    return { wait, timeoutMin };
+}
+
+async function commandOwnerConnect(args: string[], state: LocalState): Promise<void> {
+    const { wait, timeoutMin } = parseOwnerConnectArgs(args);
+    const connect = await startOwnerDeviceConnect({
+        clientName: 'openclaw-cli',
+        deviceLabel: `${os.hostname()} (${process.platform})`,
+    });
+
+    console.log('[Clawtalk Owner Connect]');
+    console.log(`1) Open this link in your browser: ${connect.verification_uri_complete}`);
+    console.log(`2) Complete login/register there (code: ${connect.user_code})`);
+    console.log(`This request expires in ${Math.max(1, Math.floor(connect.expires_in_sec / 60))} minute(s).`);
+
+    if (!wait) {
+        console.log('Run this command later to retry: npm run clawtalk -- owner-connect --wait');
+        return;
+    }
+
+    const owner = await waitOwnerDeviceConnect({
+        deviceCode: connect.device_code,
+        intervalSec: connect.interval_sec,
+        timeoutSec: timeoutMin * 60,
+        onTick: (message) => console.log(message),
+    });
+    saveOwnerSession(state, owner);
+    await saveState(state);
+    console.log(`Owner connected successfully: ${owner.email}`);
+}
+
+async function commandOwnerRotateToken(state: LocalState): Promise<void> {
+    const current = getOwnerSessionOrThrow(state);
+    const result = await api('POST', '/api/v1/auth/owner/rotate-token', undefined, current.token);
+    const owner: OwnerSession = {
+        owner_id: result.owner.id,
+        email: normalizeOwnerEmail(result.owner.email),
+        token: result.owner_token,
+        session_id: result.session_id,
+        expires_at: result.expires_at || null,
+    };
+    saveOwnerSession(state, owner);
+    await saveState(state);
+    console.log(`Owner token rotated: ${owner.email}`);
+}
+
+async function commandOwnerWhoami(state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const result = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
+    console.log(JSON.stringify({
+        owner: result.owner,
+        agents: result.agents || [],
+        base_url: runtimeBaseUrl,
+    }, null, 2));
+}
+
+async function commandOwnerAgents(state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const result = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
+    console.log(JSON.stringify(result.agents || [], null, 2));
+}
+
+async function commandOwnerSessions(state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const result = await api('GET', '/api/v1/auth/owner/sessions', undefined, owner.token);
+    console.log(JSON.stringify(result, null, 2));
+}
+
+function parseOwnerRevokeSessionArgs(args: string[]): { sessionId: string; reason?: string } {
+    const positionals: string[] = [];
+    let reason: string | undefined;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--reason') {
+            reason = args[i + 1];
+            if (!reason) {
+                throw new Error('Missing value for --reason');
+            }
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for owner-revoke-session: ${arg}`);
+        }
+        positionals.push(arg);
+    }
+    const [sessionId] = positionals;
+    if (!sessionId) {
+        throw new Error('Usage: clawtalk owner-revoke-session <session_id> [--reason <text>]');
+    }
+    return { sessionId, reason };
+}
+
+async function commandOwnerRevokeSession(args: string[], state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const { sessionId, reason } = parseOwnerRevokeSessionArgs(args);
+    const result = await api(
+        'POST',
+        '/api/v1/auth/owner/sessions/revoke',
+        { session_id: sessionId, reason },
+        owner.token
+    );
+    console.log(JSON.stringify(result, null, 2));
+}
+
+async function commandOwnerLogout(state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    let remoteResult = 'remote logout skipped';
+    try {
+        const res = await api('POST', '/api/v1/auth/owner/logout', undefined, owner.token);
+        remoteResult = `revoked_session_id=${res.revoked_session_id || owner.session_id || 'unknown'}`;
+    } catch (err: any) {
+        // Backward compatibility for older tokens/endpoints: rotate token to invalidate all owner sessions.
+        if (err?.status === 400 || err?.status === 404) {
+            try {
+                await api('POST', '/api/v1/auth/owner/rotate-token', undefined, owner.token);
+                remoteResult = 'fallback=owner_token_rotated(global)';
+            } catch (rotateErr: any) {
+                console.warn(
+                    `[owner-logout] ${owner.email} failed remote logout and fallback rotate; continuing with local logout: ${String(rotateErr?.message || rotateErr)}`
+                );
+                remoteResult = 'remote revoke failed';
+            }
+        } else {
+            console.warn(
+                `[owner-logout] ${owner.email} failed remote logout; continuing with local logout: ${String(err?.message || err)}`
+            );
+            remoteResult = 'remote revoke failed';
+        }
+    }
+    delete state.owner_sessions[normalizeOwnerEmail(owner.email)];
+    if (state.current_owner === normalizeOwnerEmail(owner.email)) {
+        const remaining = Object.keys(state.owner_sessions);
+        state.current_owner = remaining[0];
+    }
+    await saveState(state);
+    console.log(`Owner logged out: ${owner.email} (${remoteResult})`);
+}
+
+async function commandOwnerCreateAgent(args: string[], state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const {
+        agentName,
+        password,
+        autoBridge,
+        friendZoneEnabled,
+        friendZoneVisibility,
+    } = parseAuthArgs(args, 'owner-create-agent');
+
+    const result = await api(
+        'POST',
+        '/api/v1/auth/owner/agents/create',
+        {
+            agent_name: agentName,
+            password,
+            friend_zone_enabled: friendZoneEnabled,
+            friend_zone_visibility: friendZoneVisibility,
+        },
+        owner.token
+    );
+
+    const session: AgentSession = {
+        agent_name: result.agent.agent_name,
+        claw_id: result.agent.claw_id || result.claw_id,
+        agent_id: result.agent.id,
+        token: result.token,
+        claim: result.claim,
+    };
+    state.sessions[session.agent_name] = session;
+    state.current_agent = session.agent_name;
+    ensureSeenState(state, session.agent_name);
+    if (!state.policies[session.agent_name]) {
+        state.policies[session.agent_name] = defaultPolicy();
+    }
+    await saveState(state);
+
+    console.log(`Owner ${owner.email} created agent: ${session.agent_name}`);
+    if (session.claw_id) {
+        console.log(`claw_id: ${session.claw_id}`);
+    }
+    if (session.claim?.claim_status === 'pending_claim') {
+        console.log('Account is pending human claim verification.');
+        if (session.claim.claim_url) {
+            console.log(`claim_url: ${session.claim.claim_url}`);
+        }
+        if (session.claim.verification_code) {
+            console.log(`verification_code: ${session.claim.verification_code}`);
+        }
+        if (session.claim.claim_expires_at) {
+            console.log(`claim_expires_at: ${session.claim.claim_expires_at}`);
+        }
+        console.log('Complete claim first: npm run clawtalk -- claim-complete <verification_code> --as <agent_username>');
+        return;
+    }
+
+    console.log(`Current delivery policy: ${state.policies[session.agent_name].mode}`);
+    if (autoBridge) {
+        try {
+            const daemon = await startDaemonForAgent(session.agent_name, 'bridge');
+            if (daemon.started) {
+                console.log(`Background bridge started automatically (pid=${daemon.pid}).`);
+            } else {
+                console.log(`Background bridge is already running (pid=${daemon.pid}).`);
+            }
+            console.log(`Log file: ${daemon.logFile}`);
+        } catch (err: any) {
+            console.warn(`[owner-create-agent] Failed to auto-start bridge: ${String(err?.message || err)}`);
+            console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
+        }
+    }
+    printOnboardingQuickStart(session.agent_name);
+}
+
+async function commandOwnerBindAgent(args: string[], state: LocalState): Promise<void> {
+    const owner = getOwnerSessionOrThrow(state);
+    const { agentName, password, autoBridge } = parseAuthArgs(args, 'owner-bind-agent');
+    if (!password) {
+        throw new Error('Usage: clawtalk owner-bind-agent <agent_username> <password> [--no-auto-bridge]');
+    }
+
+    const result = await api(
+        'POST',
+        '/api/v1/auth/owner/agents/bind',
+        {
+            agent_name: agentName,
+            password,
+        },
+        owner.token
+    );
+
+    const login: AgentSession = {
+        agent_name: result.agent.agent_name,
+        claw_id: result.agent.claw_id || result.claw_id,
+        agent_id: result.agent.id,
+        token: result.token,
+        claim: result.claim,
+    };
+
+    state.sessions[login.agent_name] = login;
+    state.current_agent = login.agent_name;
+    ensureSeenState(state, login.agent_name);
+    if (!state.policies[login.agent_name]) {
+        state.policies[login.agent_name] = defaultPolicy();
+    }
+    await saveState(state);
+
+    console.log(`Owner ${owner.email} bound agent: ${login.agent_name}`);
+    if (login.claw_id) {
+        console.log(`claw_id: ${login.claw_id}`);
+    }
+    if (login.claim?.claim_status === 'pending_claim') {
+        console.log('Account is pending human claim verification.');
+        if (login.claim.claim_url) {
+            console.log(`claim_url: ${login.claim.claim_url}`);
+        }
+        if (login.claim.verification_code) {
+            console.log(`verification_code: ${login.claim.verification_code}`);
+        }
+        if (login.claim.claim_expires_at) {
+            console.log(`claim_expires_at: ${login.claim.claim_expires_at}`);
+        }
+        console.log('Complete claim first: npm run clawtalk -- claim-complete <verification_code> --as <agent_username>');
+        return;
+    }
+
+    console.log(`Current delivery policy: ${state.policies[login.agent_name].mode}`);
+    if (autoBridge) {
+        try {
+            const daemon = await startDaemonForAgent(login.agent_name, 'bridge');
+            if (daemon.started) {
+                console.log(`Background bridge started automatically (pid=${daemon.pid}).`);
+            } else {
+                console.log(`Background bridge is already running (pid=${daemon.pid}).`);
+            }
+            console.log(`Log file: ${daemon.logFile}`);
+        } catch (err: any) {
+            console.warn(`[owner-bind-agent] Failed to auto-start bridge: ${String(err?.message || err)}`);
+            console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${login.agent_name}`);
+        }
+    }
+    printOnboardingQuickStart(login.agent_name);
+}
+
 async function commandOnboard(args: string[], state: LocalState): Promise<void> {
     const { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility } = parseAuthArgs(args, 'onboard');
+    if (!password) {
+        throw new Error('Usage: clawtalk onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]');
+    }
     let session: AgentSession;
     try {
         session = await registerSession(agentName, password, {
@@ -798,6 +1313,9 @@ async function commandOnboard(args: string[], state: LocalState): Promise<void> 
 
 async function commandLogin(args: string[], state: LocalState): Promise<void> {
     const { agentName, password, autoBridge } = parseAuthArgs(args, 'login');
+    if (!password) {
+        throw new Error('Usage: clawtalk login <agent_username> <password> [--no-auto-bridge]');
+    }
     const session = await loginSession(agentName, password);
     state.sessions[session.agent_name] = session;
     state.current_agent = session.agent_name;
@@ -1394,6 +1912,131 @@ async function commandDownloadAttachment(args: string[], state: LocalState, asAg
     console.log(`size_bytes: ${fileBuffer.length}`);
 }
 
+function parseAgentCardCommonArgs(args: string[]): { ensure: boolean; rest: string[] } {
+    const rest: string[] = [];
+    let ensure = false;
+    for (const arg of args) {
+        if (arg === '--ensure') {
+            ensure = true;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`Unknown option for agent-card: ${arg}`);
+        }
+        rest.push(arg);
+    }
+    return { ensure, rest };
+}
+
+async function fetchAgentCard(token: string, ensure: boolean): Promise<any> {
+    if (ensure) {
+        const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, token);
+        return ensured.card;
+    }
+    try {
+        const current = await api('GET', '/api/v1/agent-card/me', undefined, token);
+        return current.card;
+    } catch (err: any) {
+        if (err?.status === 404) {
+            const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, token);
+            return ensured.card;
+        }
+        throw err;
+    }
+}
+
+async function commandAgentCard(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [subRaw, ...subArgs] = args;
+    const sub = (subRaw || 'show').toLowerCase();
+    const session = getSessionOrThrow(state, asAgent);
+
+    if (sub === 'show') {
+        const parsed = parseAgentCardCommonArgs(subArgs);
+        const card = await fetchAgentCard(session.token, parsed.ensure);
+        console.log(JSON.stringify(card, null, 2));
+        if (card?.upload?.url) {
+            console.log('');
+            console.log(`![Clawtalk Agent Card](${card.upload.url})`);
+        }
+        return;
+    }
+
+    if (sub === 'share-text' || sub === 'share') {
+        const parsed = parseAgentCardCommonArgs(subArgs);
+        const card = await fetchAgentCard(session.token, parsed.ensure);
+        if (!card?.share_text) {
+            throw new Error('share_text is missing in card response. Upgrade server and retry.');
+        }
+        console.log(card.share_text);
+        return;
+    }
+
+    if (sub === 'connect') {
+        const parseConnectArgs = (input: string[]): { cardRef: string; requestMessage?: string } => {
+            if (!input.length) {
+                throw new Error(
+                    'Usage: clawtalk agent-card connect <card_id_or_verify_url_or_text> [request_message] [--message <text>] [--as <agent_username>]'
+                );
+            }
+
+            const messageFlagIndex = input.indexOf('--message');
+            if (messageFlagIndex >= 0) {
+                const cardRefJoined = input.slice(0, messageFlagIndex).join(' ').trim();
+                const requestMessageJoined = input.slice(messageFlagIndex + 1).join(' ').trim();
+                if (!cardRefJoined) {
+                    throw new Error('Missing card reference before --message.');
+                }
+                if (!requestMessageJoined) {
+                    throw new Error('Missing message text after --message.');
+                }
+                return { cardRef: cardRefJoined, requestMessage: requestMessageJoined };
+            }
+
+            const first = input[0] || '';
+            const looksLikeSimpleCardRef =
+                /^https?:\/\//i.test(first) ||
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(first);
+
+            // Backward compatibility:
+            // - If first token already looks like card ref, remaining tokens are treated as request message.
+            // - Otherwise treat the whole input as one card_ref blob (supports pasting full share text).
+            if (looksLikeSimpleCardRef) {
+                return {
+                    cardRef: first,
+                    requestMessage: input.slice(1).join(' ').trim() || undefined,
+                };
+            }
+
+            return {
+                cardRef: input.join(' ').trim(),
+                requestMessage: undefined,
+            };
+        };
+
+        const { cardRef, requestMessage } = parseConnectArgs(subArgs);
+        const result = await api(
+            'POST',
+            '/api/v1/agent-card/connect',
+            {
+                card_ref: cardRef,
+                request_message: requestMessage,
+            },
+            session.token
+        );
+        if (result.auto_accepted) {
+            console.log(`Connected with ${result.target.agent_username} immediately (auto-accepted).`);
+        } else {
+            console.log(`Friend request sent to ${result.target.agent_username} via card ${result.target.card_id}.`);
+            console.log(`Request ID: ${result.request.id}`);
+        }
+        return;
+    }
+
+    throw new Error(
+        'Usage: clawtalk agent-card <show|share-text|connect> [--ensure] [--message <text>] [--as <agent_username>]'
+    );
+}
+
 function parseFriendZoneListArgs(args: string[], usage: string): { positionals: string[]; limit?: number; offset?: number } {
     const positionals: string[] = [];
     let limit: number | undefined;
@@ -1433,6 +2076,112 @@ function formatFriendZoneQuery(limit?: number, offset?: number): string {
     return params.length ? `?${params.join('&')}` : '';
 }
 
+function parseFriendZoneSearchArgs(args: string[]): {
+    query?: string;
+    owner?: string;
+    fileType?: string;
+    sinceDays?: number;
+    limit?: number;
+    offset?: number;
+    asJson: boolean;
+} {
+    const usage = 'Usage: clawtalk friend-zone search [query] [--owner <agent_username>] [--type <txt|md|py|json|csv|pdf|jpg>] [--since-days <n>] [--limit <n>] [--offset <n>] [--json] [--as <agent_username>]';
+    const queryParts: string[] = [];
+    let owner: string | undefined;
+    let fileType: string | undefined;
+    let sinceDays: number | undefined;
+    let limit: number | undefined;
+    let offset: number | undefined;
+    let asJson = false;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--owner') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --owner)`);
+            owner = value.trim();
+            if (!owner) throw new Error('Invalid --owner value.');
+            i += 1;
+            continue;
+        }
+        if (arg === '--type') {
+            const value = (args[i + 1] || '').trim().toLowerCase().replace(/^\./, '');
+            if (!value) throw new Error(`${usage} (missing value for --type)`);
+            const canonical = value === 'jpeg' ? 'jpg' : value;
+            const allowed = new Set(['txt', 'md', 'py', 'json', 'csv', 'pdf', 'jpg']);
+            if (!allowed.has(canonical)) {
+                throw new Error('Invalid --type. Use one of: txt, md, py, json, csv, pdf, jpg.');
+            }
+            fileType = canonical;
+            i += 1;
+            continue;
+        }
+        if (arg === '--since-days') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --since-days)`);
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 1) {
+                throw new Error('Invalid --since-days. Use integer >= 1.');
+            }
+            sinceDays = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--limit') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --limit)`);
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 1) {
+                throw new Error('Invalid --limit. Use integer >= 1.');
+            }
+            limit = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--offset') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --offset)`);
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                throw new Error('Invalid --offset. Use integer >= 0.');
+            }
+            offset = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--json') {
+            asJson = true;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`${usage} (unknown option: ${arg})`);
+        }
+        queryParts.push(arg);
+    }
+
+    const query = queryParts.join(' ').trim() || undefined;
+    return { query, owner, fileType, sinceDays, limit, offset, asJson };
+}
+
+function formatFriendZoneSearchQuery(params: {
+    query?: string;
+    owner?: string;
+    fileType?: string;
+    sinceDays?: number;
+    limit?: number;
+    offset?: number;
+}): string {
+    const qs = new URLSearchParams();
+    if (params.query) qs.set('q', params.query);
+    if (params.owner) qs.set('owner', params.owner);
+    if (params.fileType) qs.set('type', params.fileType);
+    if (params.sinceDays !== undefined) qs.set('since_days', String(params.sinceDays));
+    if (params.limit !== undefined) qs.set('limit', String(params.limit));
+    if (params.offset !== undefined) qs.set('offset', String(params.offset));
+    const built = qs.toString();
+    return built ? `?${built}` : '';
+}
+
 async function uploadFriendZoneFile(token: string, filePathArg: string): Promise<{ upload_id: string }> {
     const resolvedPath = path.resolve(filePathArg);
     let fileBuffer: Buffer;
@@ -1449,7 +2198,9 @@ async function uploadFriendZoneFile(token: string, filePathArg: string): Promise
     const filename = path.basename(resolvedPath);
     const mimeType = guessMimeType(resolvedPath);
     if (!isFriendZoneAttachmentAllowed(filename, mimeType)) {
-        throw new Error(`Friend Zone attachments only support PDF/JPG. Rejected: ${filename}`);
+        throw new Error(
+            `Friend Zone attachments support TXT/MD/PY/JSON/CSV/PDF/JPG. Rejected: ${filename}`
+        );
     }
 
     const upload = await api(
@@ -1578,6 +2329,19 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         const count = Array.isArray(result.post?.post_json?.attachments) ? result.post.post_json.attachments.length : 0;
         console.log(`Friend Zone post created: ${result.post.id}`);
         console.log(`attachments: ${count}`);
+        if (result.agent_card_created && result.agent_card?.upload?.url) {
+            const cardUrl = String(result.agent_card.upload.url);
+            console.log('[Clawtalk]');
+            console.log('Event: Agent Card Created');
+            console.log('Content: Your first Friend Zone post created your Agent Card.');
+            console.log(`Card image: ${cardUrl}`);
+            console.log(`![Clawtalk Agent Card](${cardUrl})`);
+            await pushAgentCardImageToChat(state, session, {
+                mediaUrl: cardUrl,
+                eventTitle: 'Agent Card Created',
+                contentLine: 'Your first Friend Zone post created your Agent Card. I attached the image.',
+            });
+        }
         return;
     }
 
@@ -1612,7 +2376,60 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         return;
     }
 
-    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|mine|view> ... [--as <agent_username>]');
+    if (sub === 'search') {
+        const parsed = parseFriendZoneSearchArgs(args.slice(1));
+        const query = formatFriendZoneSearchQuery({
+            query: parsed.query,
+            owner: parsed.owner,
+            fileType: parsed.fileType,
+            sinceDays: parsed.sinceDays,
+            limit: parsed.limit,
+            offset: parsed.offset,
+        });
+        const result = await api(
+            'GET',
+            `/api/v1/friend-zone/search${query}`,
+            undefined,
+            session.token
+        );
+
+        if (parsed.asJson) {
+            console.log(JSON.stringify(result, null, 2));
+            return;
+        }
+
+        const total = Number(result?.paging?.total || 0);
+        const shown = Array.isArray(result?.results) ? result.results.length : 0;
+        console.log(`Friend Zone search: ${total} match(es), showing ${shown}.`);
+        if (!shown) {
+            return;
+        }
+
+        for (const item of result.results) {
+            const ownerName = item?.owner?.agent_name || 'unknown';
+            const access = item?.access || 'unknown';
+            const when = item?.created_at || '';
+            const reasons = Array.isArray(item?.match_reasons) && item.match_reasons.length
+                ? item.match_reasons.join(',')
+                : 'n/a';
+            const snippet = item?.text_snippet || '(no text)';
+            const attachments = Array.isArray(item?.post_json?.attachments) ? item.post_json.attachments : [];
+            const attachmentNames = attachments
+                .map((a: any) => a?.filename)
+                .filter((v: any) => typeof v === 'string' && v.length > 0)
+                .slice(0, 3)
+                .join(', ');
+
+            console.log(`- ${ownerName} | ${when} | access=${access} | reasons=${reasons}`);
+            console.log(`  snippet: ${snippet}`);
+            if (attachmentNames) {
+                console.log(`  attachments: ${attachmentNames}`);
+            }
+        }
+        return;
+    }
+
+    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|mine|view|search> ... [--as <agent_username>]');
 }
 
 async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<void> {
@@ -1801,7 +2618,7 @@ function buildInboxDigest(pending: MailboxItem[], options: InboxDigestOptions): 
     });
 
     const lines: string[] = [];
-    lines.push('[OpenClaw Social]');
+    lines.push('[Clawtalk]');
     lines.push('Event: Inbox Digest');
     lines.push(`Generated: ${formatNoticeTime()}`);
     lines.push(
@@ -1894,7 +2711,7 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
             .slice(0, options.maxItems);
 
         if (pending.length === 0) {
-            console.log('[OpenClaw Social]');
+            console.log('[Clawtalk]');
             console.log('Event: Inbox Digest');
             console.log(`Generated: ${formatNoticeTime()}`);
             console.log('Overview: no pending mailbox messages in current filter window.');
@@ -2018,22 +2835,58 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
 }
 
 async function commandSwitch(args: string[], state: LocalState): Promise<void> {
-    const [agentName] = args;
-    if (!agentName) {
-        throw new Error('Usage: clawtalk use <agent_username>');
+    const [ref] = args;
+    if (!ref) {
+        throw new Error('Usage: clawtalk use <agent_username|claw_id>');
     }
-    if (!state.sessions[agentName]) {
-        throw new Error(`No saved session for "${agentName}". Run onboard first.`);
+
+    const localByName = state.sessions[ref];
+    if (localByName) {
+        state.current_agent = localByName.agent_name;
+        await saveState(state);
+        console.log(`Switched current session to: ${localByName.agent_name}`);
+        return;
     }
-    state.current_agent = agentName;
+
+    const localByClawId = Object.values(state.sessions).find((session) => session.claw_id === ref);
+    if (localByClawId) {
+        state.current_agent = localByClawId.agent_name;
+        await saveState(state);
+        console.log(`Switched current session to: ${localByClawId.agent_name}`);
+        return;
+    }
+
+    // Cross-device path: fetch a fresh agent token from owner account.
+    const owner = getOwnerSessionOrThrow(state);
+    const payload = /^ct_[a-f0-9]{24}$/i.test(ref)
+        ? { claw_id: ref }
+        : { agent_name: ref };
+    const result = await api('POST', '/api/v1/auth/owner/agents/switch', payload, owner.token);
+    const session: AgentSession = {
+        agent_name: result.agent.agent_name,
+        claw_id: result.agent.claw_id || result.claw_id,
+        agent_id: result.agent.id,
+        token: result.token,
+        claim: result.claim,
+    };
+    state.sessions[session.agent_name] = session;
+    state.current_agent = session.agent_name;
+    ensureSeenState(state, session.agent_name);
+    if (!state.policies[session.agent_name]) {
+        state.policies[session.agent_name] = defaultPolicy();
+    }
     await saveState(state);
-    console.log(`Switched current session to: ${agentName}`);
+    console.log(`Switched current session to: ${session.agent_name}`);
+    if (session.claw_id) {
+        console.log(`claw_id: ${session.claw_id}`);
+    }
 }
 
 async function commandWhoami(state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
     console.log(JSON.stringify({
         current_agent: session.agent_name,
+        claw_id: session.claw_id || null,
         agent_id: session.agent_id,
         claim: session.claim || null,
         base_url: runtimeBaseUrl,
@@ -2605,6 +3458,35 @@ async function sendOpenClawNotification(route: OpenClawNotifyRoute, message: str
     }
 }
 
+async function sendOpenClawNotificationRich(
+    route: OpenClawNotifyRoute,
+    payload: { message: string; mediaUrl?: string }
+): Promise<void> {
+    const args = [
+        'message', 'send',
+        '--channel', route.channel,
+        '--account', route.account_id,
+        '--target', route.target,
+        '--message', payload.message,
+        '--json',
+    ];
+
+    if (payload.mediaUrl) {
+        args.push('--media', payload.mediaUrl);
+    }
+
+    if (route.dry_run) {
+        args.push('--dry-run');
+    }
+
+    try {
+        await execFileAsync('openclaw', args, { maxBuffer: 1024 * 1024 });
+    } catch (err: any) {
+        const stderr = String(err?.stderr || err?.message || '').trim();
+        throw new Error(`openclaw message send failed: ${stderr}`);
+    }
+}
+
 function hasDeliveryOverride(overrides: {
     openclawAgentId?: string;
     channel?: string;
@@ -2751,6 +3633,103 @@ async function dispatchNotification(targets: DeliveryTarget[], strategy: Deliver
     throw new Error(`Fallback delivery failed: ${errors.join(' | ')}`);
 }
 
+async function sendWithTargetRich(
+    target: DeliveryTarget,
+    payload: { message: string; mediaUrl?: string }
+): Promise<void> {
+    let route = target.refresh_each_send ? undefined : target.cached_route;
+    if (!route) {
+        route = await target.resolve();
+        if (!target.refresh_each_send) {
+            target.cached_route = route;
+        }
+    }
+
+    try {
+        await sendOpenClawNotificationRich(route, payload);
+    } catch {
+        route = await target.resolve();
+        if (!target.refresh_each_send) {
+            target.cached_route = route;
+        }
+        await sendOpenClawNotificationRich(route, payload);
+    }
+}
+
+async function dispatchNotificationRich(
+    targets: DeliveryTarget[],
+    strategy: DeliveryStrategy,
+    payload: { message: string; mediaUrl?: string }
+): Promise<void> {
+    if (targets.length === 0) {
+        throw new Error(
+            'No delivery targets available. Configure notify/bind, or make sure OpenClaw has recent active sessions for auto route discovery.'
+        );
+    }
+
+    const ordered = sortDeliveryTargets(targets);
+
+    if (strategy === 'primary') {
+        const primary = ordered.find((t) => t.is_primary) || ordered[0];
+        await sendWithTargetRich(primary, payload);
+        return;
+    }
+
+    if (strategy === 'fanout') {
+        const results = await Promise.allSettled(ordered.map((target) => sendWithTargetRich(target, payload)));
+        const success = results.some((r) => r.status === 'fulfilled');
+        if (!success) {
+            const failures = results
+                .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+                .map((r) => String(r.reason?.message || r.reason));
+            throw new Error(`Fanout delivery failed: ${failures.join(' | ')}`);
+        }
+        return;
+    }
+
+    const errors: string[] = [];
+    for (const target of ordered) {
+        try {
+            await sendWithTargetRich(target, payload);
+            return;
+        } catch (err: any) {
+            errors.push(`${target.id}: ${String(err?.message || err)}`);
+        }
+    }
+    throw new Error(`Fallback delivery failed: ${errors.join(' | ')}`);
+}
+
+async function pushAgentCardImageToChat(
+    state: LocalState,
+    session: AgentSession,
+    params: {
+        mediaUrl: string;
+        eventTitle: string;
+        contentLine: string;
+    }
+): Promise<void> {
+    const mediaUrl = String(params.mediaUrl || '').trim();
+    if (!mediaUrl) return;
+
+    const caption = [
+        '[Clawtalk]',
+        `Event: ${params.eventTitle}`,
+        `Agent: ${session.agent_name}`,
+        `Content: ${params.contentLine}`,
+        'Action: Share this card image to let another agent connect with you.',
+    ].join('\n');
+
+    const baseBinding = state.bindings[session.agent_name];
+    const targets = selectDeliveryTargets(state, session, baseBinding);
+    try {
+        await dispatchNotificationRich(targets, 'fallback', { message: caption, mediaUrl });
+    } catch (err: any) {
+        console.warn(
+            `[agent-card] failed to push card image to chat. reason=${String(err?.message || err)}`
+        );
+    }
+}
+
 function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: string): string {
     let action = '';
     if (mode === 'receive_only') {
@@ -2760,7 +3739,7 @@ function buildMessagePrompt(mode: DeliveryMode, senderName: string, content: str
     } else {
         action = 'auto_execute mode is active. Please confirm whether to continue with automatic handling.';
     }
-    return formatAgentSocialNotice({
+    return formatClawtalkNotice({
         event: 'New Message',
         from: senderName,
         content,
@@ -2792,7 +3771,7 @@ function buildMailboxPrompt(
     const reasonLine = reason === 'threshold'
         ? `Pending mailbox reached ${thresholdStep}+ items.`
         : `Scheduled mailbox reminder (${intervalHours}h interval).`;
-    return formatAgentSocialNotice({
+    return formatClawtalkNotice({
         event: 'Mailbox Reminder',
         from: senderName,
         content: `${reasonLine} Pending mailbox messages: ${pendingCount}. Latest: ${truncateForDigest(content, 160)}`,
@@ -2874,7 +3853,7 @@ function buildOutgoingStatusPrompt(req: FriendRequestRow): string | null {
 
 function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName: string): string | null {
     if (status === 'accepted') {
-        return formatAgentSocialNotice({
+        return formatClawtalkNotice({
             event: 'Friend Request Status Changed',
             from: peerName,
             content: 'The peer accepted your friend request.',
@@ -2882,7 +3861,7 @@ function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName
         });
     }
     if (status === 'rejected') {
-        return formatAgentSocialNotice({
+        return formatClawtalkNotice({
             event: 'Friend Request Status Changed',
             from: peerName,
             content: 'The peer rejected your friend request.',
@@ -2890,7 +3869,7 @@ function buildOutgoingStatusPromptByStatus(status: FriendRequestStatus, peerName
         });
     }
     if (status === 'cancelled') {
-        return formatAgentSocialNotice({
+        return formatClawtalkNotice({
             event: 'Friend Request Status Changed',
             from: peerName,
             content: 'This friend request has been cancelled.',
@@ -3000,7 +3979,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     `[watch] notification dropped after ${attempts} attempts: key=${payload.key}; last_error=${errorText}`
                 );
                 if (hooks.echoConsole !== false) {
-                    const failurePrompt = formatAgentSocialNotice({
+                    const failurePrompt = formatClawtalkNotice({
                         event: 'Delivery Failed',
                         from: payload.senderName,
                         content: 'A peer message could not be forwarded after max retries.',
@@ -3288,7 +4267,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                 changed = true;
 
                 const fromName = req.from_agent_name || req.from_agent_id;
-                const prompt = formatAgentSocialNotice({
+                const prompt = formatClawtalkNotice({
                     event: 'Friend Request',
                     from: fromName,
                     content: 'A peer sent you a friend request.',
@@ -3417,7 +4396,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
                     await persistWatcherState();
 
                     const fromName = await resolveAgentName(data.from_agent_id || '');
-                    const prompt = formatAgentSocialNotice({
+                    const prompt = formatClawtalkNotice({
                         event: 'Friend Request',
                         from: fromName,
                         content: 'A peer sent you a friend request.',
@@ -4056,49 +5035,148 @@ async function commandGuided(state: LocalState): Promise<void> {
     try {
         console.log('Clawtalk guided setup started.');
         console.log(`Current API base_url: ${runtimeBaseUrl}`);
-
-        const authModeRaw = (await rl.question('Do you want to login or register? [login/register] (default: register): '))
+        const ownerFlowRaw = (await rl.question('Use owner account web connect (recommended)? [Y/n]: '))
             .trim()
             .toLowerCase();
-        const authMode = authModeRaw === 'login' ? 'login' : 'register';
+        const useOwnerFlow = ownerFlowRaw !== 'n' && ownerFlowRaw !== 'no';
 
-        const agentUsername = (await rl.question('Agent Username: ')).trim();
-        if (!agentUsername) {
-            throw new Error('Agent Username cannot be empty.');
-        }
-
-        const password = (await rl.question('Password: ')).trim();
-        if (!password) {
-            throw new Error('Password cannot be empty.');
-        }
-
-        const authArgs = [agentUsername, password];
-        if (authMode === 'register') {
-            const friendZoneRaw = (await rl.question(
-                'Friend Zone visibility [friends/public/closed] (default: friends): '
-            )).trim().toLowerCase();
-            if (friendZoneRaw === 'public') {
-                authArgs.push('--friend-zone-public');
-            } else if (friendZoneRaw === 'closed') {
-                authArgs.push('--friend-zone-closed');
-            } else {
-                authArgs.push('--friend-zone-friends');
+        if (useOwnerFlow) {
+            let hasValidOwner = false;
+            const currentOwnerKey = state.current_owner;
+            if (currentOwnerKey && state.owner_sessions[currentOwnerKey]) {
+                try {
+                    await api('GET', '/api/v1/auth/owner/me', undefined, state.owner_sessions[currentOwnerKey].token);
+                    hasValidOwner = true;
+                    console.log(`Owner session already active: ${state.owner_sessions[currentOwnerKey].email}`);
+                } catch {
+                    delete state.owner_sessions[currentOwnerKey];
+                    state.current_owner = undefined;
+                    await saveState(state);
+                }
             }
-            await commandOnboard(authArgs, state);
+
+            if (!hasValidOwner) {
+                const connect = await startOwnerDeviceConnect({
+                    clientName: 'openclaw-cli',
+                    deviceLabel: `${os.hostname()} (${process.platform})`,
+                });
+                console.log('');
+                console.log('No owner session found. Please open this page in your browser and login/register:');
+                console.log(connect.verification_uri_complete);
+                console.log(`(code: ${connect.user_code}, expires in ~${Math.max(1, Math.floor(connect.expires_in_sec / 60))} min)`);
+                await rl.question('Press Enter after finishing browser login/register...');
+
+                const owner = await waitOwnerDeviceConnect({
+                    deviceCode: connect.device_code,
+                    intervalSec: connect.interval_sec,
+                    timeoutSec: 15 * 60,
+                    onTick: (m) => console.log(m),
+                });
+                saveOwnerSession(state, owner);
+                await saveState(state);
+                console.log(`Owner connected: ${owner.email}`);
+            }
+
+            const owner = getOwnerSessionOrThrow(state);
+            const ownerMe = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
+            const existingAgents = Array.isArray(ownerMe.agents) ? ownerMe.agents : [];
+            if (existingAgents.length > 0) {
+                console.log('Your existing agents:');
+                for (const item of existingAgents) {
+                    console.log(`- ${item.agent_username || item.agent_name} (${item.claw_id || 'no-claw-id'})`);
+                }
+            }
+
+            const actionRaw = (await rl.question(
+                existingAgents.length > 0
+                    ? 'Choose action [use/create/bind] (default: use): '
+                    : 'Choose action [create/bind] (default: create): '
+            )).trim().toLowerCase();
+            const action = existingAgents.length > 0
+                ? (actionRaw === 'create' || actionRaw === 'bind' ? actionRaw : 'use')
+                : (actionRaw === 'bind' ? 'bind' : 'create');
+
+            if (action === 'use') {
+                const target = (await rl.question('Use which agent (agent_username or claw_id): ')).trim();
+                if (!target) {
+                    throw new Error('Agent reference cannot be empty.');
+                }
+                await commandSwitch([target], state);
+            } else if (action === 'create') {
+                const agentUsername = (await rl.question('New Agent Username: ')).trim();
+                if (!agentUsername) {
+                    throw new Error('Agent Username cannot be empty.');
+                }
+                const authArgs = [agentUsername];
+                const friendZoneRaw = (await rl.question(
+                    'Friend Zone visibility [friends/public/closed] (default: friends): '
+                )).trim().toLowerCase();
+                if (friendZoneRaw === 'public') {
+                    authArgs.push('--friend-zone-public');
+                } else if (friendZoneRaw === 'closed') {
+                    authArgs.push('--friend-zone-closed');
+                } else {
+                    authArgs.push('--friend-zone-friends');
+                }
+                await commandOwnerCreateAgent(authArgs, state);
+            } else {
+                const agentUsername = (await rl.question('Bind Agent Username: ')).trim();
+                if (!agentUsername) {
+                    throw new Error('Agent Username cannot be empty.');
+                }
+                const agentPassword = (await rl.question('Agent Password: ')).trim();
+                if (!agentPassword) {
+                    throw new Error('Agent Password cannot be empty.');
+                }
+                const authArgs = [agentUsername, agentPassword];
+                await commandOwnerBindAgent(authArgs, state);
+            }
         } else {
-            await commandLogin(authArgs, state);
+            const authModeRaw = (await rl.question('Do you want to login or register? [login/register] (default: register): '))
+                .trim()
+                .toLowerCase();
+            const authMode = authModeRaw === 'login' ? 'login' : 'register';
+
+            const agentUsername = (await rl.question('Agent Username: ')).trim();
+            if (!agentUsername) {
+                throw new Error('Agent Username cannot be empty.');
+            }
+
+            const password = (await rl.question('Password: ')).trim();
+            if (!password) {
+                throw new Error('Password cannot be empty.');
+            }
+
+            const authArgs = [agentUsername, password];
+            if (authMode === 'register') {
+                const friendZoneRaw = (await rl.question(
+                    'Friend Zone visibility [friends/public/closed] (default: friends): '
+                )).trim().toLowerCase();
+                if (friendZoneRaw === 'public') {
+                    authArgs.push('--friend-zone-public');
+                } else if (friendZoneRaw === 'closed') {
+                    authArgs.push('--friend-zone-closed');
+                } else {
+                    authArgs.push('--friend-zone-friends');
+                }
+                await commandOnboard(authArgs, state);
+            } else {
+                await commandLogin(authArgs, state);
+            }
         }
 
         const activeSession = getSessionOrThrow(state);
-        await commandClaimStatus(state, activeSession.agent_name);
+        if (!useOwnerFlow) {
+            await commandClaimStatus(state, activeSession.agent_name);
 
-        const claimSession = getSessionOrThrow(state, activeSession.agent_name);
-        if (claimSession.claim?.claim_status === 'pending_claim') {
-            const verificationCode = (await rl.question('Enter verification_code to complete claim: ')).trim();
-            if (!verificationCode) {
-                throw new Error('verification_code is required to complete claim.');
+            const claimSession = getSessionOrThrow(state, activeSession.agent_name);
+            if (claimSession.claim?.claim_status === 'pending_claim') {
+                const verificationCode = (await rl.question('Enter verification_code to complete claim: ')).trim();
+                if (!verificationCode) {
+                    throw new Error('verification_code is required to complete claim.');
+                }
+                await commandClaimComplete([verificationCode], state, claimSession.agent_name);
             }
-            await commandClaimComplete([verificationCode], state, claimSession.agent_name);
         }
 
         const finalSession = getSessionOrThrow(state);
@@ -4191,6 +5269,15 @@ async function commandDoctor(state: LocalState): Promise<void> {
             : 'No local sessions found. Run guided/onboard/login first.',
     });
 
+    const ownerSessionCount = Object.keys(state.owner_sessions || {}).length;
+    checks.push({
+        name: 'local_owner_sessions',
+        status: ownerSessionCount > 0 ? 'ok' : 'warn',
+        detail: ownerSessionCount > 0
+            ? `${ownerSessionCount} local owner session(s) found`
+            : 'No local owner session found. Run owner-register/owner-login or guided first.',
+    });
+
     const hasFail = checks.some((c) => c.status === 'fail');
     const hasWarn = checks.some((c) => c.status === 'warn');
     const overall = hasFail ? 'fail' : hasWarn ? 'warn' : 'ok';
@@ -4228,6 +5315,17 @@ async function main() {
             config,
             asAgent,
             handlers: {
+                commandOwnerConnect,
+                commandOwnerRegister,
+                commandOwnerLogin,
+                commandOwnerRotateToken,
+                commandOwnerWhoami,
+                commandOwnerLogout,
+                commandOwnerAgents,
+                commandOwnerSessions,
+                commandOwnerRevokeSession,
+                commandOwnerCreateAgent,
+                commandOwnerBindAgent,
                 commandOnboard,
                 commandLogin,
                 commandClaimStatus,
@@ -4247,6 +5345,7 @@ async function main() {
                 commandMessageStatus,
                 commandSendAttachment,
                 commandDownloadAttachment,
+                commandAgentCard,
                 commandInbox,
                 commandFriendZone,
                 commandLocalLogs,

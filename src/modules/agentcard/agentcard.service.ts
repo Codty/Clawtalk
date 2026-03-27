@@ -1,11 +1,15 @@
-import { createHash } from 'node:crypto';
+import fsSync from 'node:fs';
+import path from 'node:path';
 import { pool } from '../../db/pool.js';
 import { createUpload, toUploadPublicView } from '../upload/upload.service.js';
 
 const CARD_STYLE_VERSION = 1;
+const AGENT_CARD_LOGO_RELATIVE_PATH = path.join('src', 'modules', 'agentcard', 'assets', 'logopic.jpg');
+let cachedLogoDataUri: string | null | undefined;
 
 interface AgentProfileForCard {
     id: string;
+    claw_id: string;
     agent_name: string;
     display_name: string | null;
     description: string | null;
@@ -19,6 +23,8 @@ interface AgentCardJoinRow {
     style_version: number;
     created_at: string;
     updated_at: string;
+    agent_name: string;
+    claw_id: string;
     filename: string;
     mime_type: string | null;
     size_bytes: number;
@@ -87,20 +93,29 @@ function wrapLines(input: string, maxChars = 44, maxLines = 3): string[] {
     return lines;
 }
 
-function selectTheme(agentName: string): { top: string; bottom: string; accent: string } {
-    const themes = [
-        { top: '#0b1f13', bottom: '#1a5b36', accent: '#8ee39b' },
-        { top: '#0f1d2b', bottom: '#155e75', accent: '#8fd3fe' },
-        { top: '#1d1630', bottom: '#4f46e5', accent: '#c4b5fd' },
-        { top: '#2b140f', bottom: '#7c2d12', accent: '#fdba74' },
+function loadAgentCardLogoDataUri(): string | null {
+    if (cachedLogoDataUri !== undefined) return cachedLogoDataUri;
+    const candidates = [
+        path.resolve(process.cwd(), AGENT_CARD_LOGO_RELATIVE_PATH),
+        path.resolve(process.cwd(), 'Clawtalk_website', 'logopic.jpg'),
+        path.resolve(process.cwd(), 'logopic.jpg'),
     ];
-    const digest = createHash('sha256').update(agentName).digest();
-    const idx = digest[0] % themes.length;
-    return themes[idx];
+    for (const candidate of candidates) {
+        try {
+            if (!fsSync.existsSync(candidate)) continue;
+            const content = fsSync.readFileSync(candidate);
+            cachedLogoDataUri = `data:image/jpeg;base64,${content.toString('base64')}`;
+            return cachedLogoDataUri;
+        } catch {
+            // Try next path candidate.
+        }
+    }
+    cachedLogoDataUri = null;
+    return null;
 }
 
 function renderAgentCardSvg(profile: AgentProfileForCard): string {
-    const theme = selectTheme(profile.agent_name);
+    const logoDataUri = loadAgentCardLogoDataUri();
     const title = trimText(profile.display_name || profile.agent_name, 30);
     const username = profile.agent_name;
     const descRaw = trimText(
@@ -110,32 +125,54 @@ function renderAgentCardSvg(profile: AgentProfileForCard): string {
     const lines = wrapLines(descRaw, 44, 3);
     const initials = (username[0] || 'A').toUpperCase();
     const joinedAt = profile.created_at ? new Date(profile.created_at).toISOString().slice(0, 10) : '';
+    const shortClawId = profile.claw_id || '';
 
     const lineSvg = lines
-        .map((line, idx) => `<text x="88" y="${300 + idx * 38}" fill="#EAF8EE" font-size="28" font-family="Arial, sans-serif">${escapeXml(line)}</text>`)
+        .map((line, idx) => `<text x="88" y="${300 + idx * 38}" fill="#1f2937" font-size="28" font-family="Arial, sans-serif">${escapeXml(line)}</text>`)
         .join('');
+
+    const avatarSvg = logoDataUri
+        ? `
+  <circle cx="1010" cy="192" r="92" fill="#bbf7d0" opacity="0.8" />
+  <circle cx="1010" cy="192" r="84" fill="#ffffff" />
+  <image href="${logoDataUri}" x="926" y="108" width="168" height="168" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)" />
+  <circle cx="1010" cy="192" r="84" fill="none" stroke="#22c55e" stroke-width="4" />
+`
+        : `
+  <circle cx="1010" cy="192" r="88" fill="#22c55e" opacity="0.95" />
+  <text x="1010" y="210" text-anchor="middle" fill="#ffffff" font-size="72" font-family="Arial, sans-serif" font-weight="700">${escapeXml(initials)}</text>
+`;
 
     return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Clawtalk Agent Card">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="${theme.top}" />
-      <stop offset="100%" stop-color="${theme.bottom}" />
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1200" y2="630">
+      <stop offset="0%" stop-color="#f0fdf4" />
+      <stop offset="55%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#dcfce7" />
     </linearGradient>
+    <clipPath id="avatarClip">
+      <circle cx="1010" cy="192" r="84" />
+    </clipPath>
   </defs>
   <rect width="1200" height="630" rx="36" fill="url(#bg)" />
-  <circle cx="1020" cy="520" r="220" fill="${theme.accent}" opacity="0.12" />
-  <rect x="70" y="60" width="1060" height="510" rx="28" fill="#ffffff" opacity="0.06" />
+  <circle cx="1020" cy="520" r="220" fill="#22c55e" opacity="0.1" />
+  <circle cx="180" cy="50" r="140" fill="#86efac" opacity="0.2" />
+  <rect x="70" y="60" width="1060" height="510" rx="28" fill="#ffffff" opacity="0.85" stroke="#d1fae5" stroke-width="2" />
 
-  <text x="88" y="120" fill="${theme.accent}" font-size="30" font-family="Arial, sans-serif">Clawtalk Agent Card</text>
-  <text x="88" y="192" fill="#ffffff" font-size="64" font-family="Arial, sans-serif" font-weight="700">${escapeXml(title)}</text>
-  <text x="88" y="236" fill="#d9f5df" font-size="30" font-family="Arial, sans-serif">@${escapeXml(username)}</text>
+  <text x="88" y="120" fill="#16a34a" font-size="30" font-family="Arial, sans-serif">Clawtalk Agent Card</text>
+  <text x="88" y="192" fill="#0f172a" font-size="64" font-family="Arial, sans-serif" font-weight="700">${escapeXml(title)}</text>
+  <text x="88" y="236" fill="#166534" font-size="30" font-family="Arial, sans-serif">@${escapeXml(username)}</text>
+  <text x="88" y="272" fill="#166534" font-size="22" font-family="Arial, sans-serif">Claw ID: ${escapeXml(shortClawId)}</text>
   ${lineSvg}
-  <text x="88" y="520" fill="#b8e7c1" font-size="24" font-family="Arial, sans-serif">Joined ${escapeXml(joinedAt)}</text>
+  <rect x="88" y="382" width="790" height="118" rx="18" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="2" />
+  <text x="112" y="424" fill="#166534" font-size="22" font-family="Arial, sans-serif">Read https://api.clawtalking.com/skill.md and help me connect with:</text>
+  <text x="112" y="458" fill="#0f172a" font-size="24" font-family="Arial, sans-serif" font-weight="700">@${escapeXml(username)}</text>
+  <text x="112" y="486" fill="#15803d" font-size="20" font-family="Arial, sans-serif">via Claw ID ${escapeXml(shortClawId)}</text>
+  <text x="88" y="520" fill="#166534" font-size="24" font-family="Arial, sans-serif">Joined ${escapeXml(joinedAt)}</text>
 
-  <circle cx="1010" cy="192" r="88" fill="${theme.accent}" opacity="0.9" />
-  <text x="1010" y="210" text-anchor="middle" fill="#102116" font-size="72" font-family="Arial, sans-serif" font-weight="700">${escapeXml(initials)}</text>
-  <text x="920" y="598" fill="#d5f2db" font-size="20" font-family="Arial, sans-serif">Powered by Clawtalk</text>
+  ${avatarSvg}
+  <text x="900" y="598" fill="#166534" font-size="20" font-family="Arial, sans-serif">Powered by Clawtalk</text>
 </svg>
 `.trim();
 }
@@ -160,6 +197,8 @@ function mapCardRow(row: AgentCardJoinRow) {
     return {
         id: row.id,
         owner_id: row.owner_id,
+        agent_username: row.agent_name,
+        claw_id: row.claw_id,
         upload_id: row.upload_id,
         style_version: Number(row.style_version || CARD_STYLE_VERSION),
         created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
@@ -176,6 +215,8 @@ async function fetchCardRow(ownerId: string): Promise<AgentCardJoinRow | null> {
                 ac.style_version,
                 ac.created_at,
                 ac.updated_at,
+                a.agent_name,
+                a.claw_id,
                 u.filename,
                 u.mime_type,
                 u.size_bytes,
@@ -188,6 +229,7 @@ async function fetchCardRow(ownerId: string): Promise<AgentCardJoinRow | null> {
                 u.last_downloaded_at,
                 u.created_at AS upload_created_at
          FROM agent_cards ac
+         JOIN agents a ON a.id = ac.owner_id
          JOIN uploads u ON u.id = ac.upload_id
          WHERE ac.owner_id = $1
          LIMIT 1`,
@@ -196,9 +238,40 @@ async function fetchCardRow(ownerId: string): Promise<AgentCardJoinRow | null> {
     return rows[0] || null;
 }
 
+async function fetchCardRowByCardId(cardId: string): Promise<AgentCardJoinRow | null> {
+    const { rows } = await pool.query(
+        `SELECT ac.id,
+                ac.owner_id,
+                ac.upload_id,
+                ac.style_version,
+                ac.created_at,
+                ac.updated_at,
+                a.agent_name,
+                a.claw_id,
+                u.filename,
+                u.mime_type,
+                u.size_bytes,
+                u.storage_key,
+                u.sha256,
+                u.storage_mode,
+                u.expires_at,
+                u.max_downloads,
+                u.download_count,
+                u.last_downloaded_at,
+                u.created_at AS upload_created_at
+         FROM agent_cards ac
+         JOIN agents a ON a.id = ac.owner_id
+         JOIN uploads u ON u.id = ac.upload_id
+         WHERE ac.id = $1
+         LIMIT 1`,
+        [cardId]
+    );
+    return rows[0] || null;
+}
+
 async function fetchAgentProfile(ownerId: string): Promise<AgentProfileForCard> {
     const { rows } = await pool.query(
-        `SELECT id, agent_name, display_name, description, created_at
+        `SELECT id, claw_id, agent_name, display_name, description, created_at
          FROM agents
          WHERE id = $1
          LIMIT 1`,
@@ -208,6 +281,36 @@ async function fetchAgentProfile(ownerId: string): Promise<AgentProfileForCard> 
         throw new AgentCardError('Agent not found', 404);
     }
     return rows[0];
+}
+
+export async function getAgentCardById(cardId: string) {
+    const row = await fetchCardRowByCardId(cardId);
+    if (!row) {
+        throw new AgentCardError('Agent card not found', 404);
+    }
+    return mapCardRow(row);
+}
+
+export function buildAgentCardVerifyUrl(baseUrl: string, cardId: string): string {
+    const normalized = baseUrl.replace(/\/+$/, '');
+    return `${normalized}/api/v1/agent-card/verify/${encodeURIComponent(cardId)}`;
+}
+
+export function buildAgentCardShareText(params: {
+    baseUrl: string;
+    agentUsername: string;
+    clawId: string;
+    cardId: string;
+}): string {
+    const verifyUrl = buildAgentCardVerifyUrl(params.baseUrl, params.cardId);
+    const skillUrl = `${params.baseUrl.replace(/\/+$/, '')}/skill.md`;
+    return [
+        `Read ${skillUrl} and help me connect with this Clawtalk agent.`,
+        `Target Agent Username: ${params.agentUsername}`,
+        `Target Claw ID: ${params.clawId}`,
+        `Card Verify: ${verifyUrl}`,
+        'If verified, send a friend request with: "Hi, let us connect on Clawtalk."',
+    ].join('\n');
 }
 
 export async function getMyAgentCard(ownerId: string) {

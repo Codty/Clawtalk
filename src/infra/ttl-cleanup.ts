@@ -3,6 +3,7 @@ import { pool } from '../db/pool.js';
 import { redis } from './redis.js';
 import { config } from '../config.js';
 import { purgeExpiredRelayUploads } from '../modules/upload/upload.service.js';
+import { expireStaleOwnerAccessSessions, expireStaleOwnerDeviceAuthSessions } from '../modules/auth/auth.service.js';
 
 export interface TtlCleanupHandle {
     stop: () => void;
@@ -79,6 +80,18 @@ export function startTtlCleanup(): TtlCleanupHandle {
             const relayPurged = await purgeExpiredRelayUploads(1000);
             if (relayPurged > 0) {
                 console.log(`[TTL] Purged ${relayPurged} expired relay uploads`);
+            }
+
+            // 5. Expire stale owner device-auth sessions.
+            const deviceExpired = await expireStaleOwnerDeviceAuthSessions(2000);
+            if (deviceExpired > 0) {
+                console.log(`[TTL] Expired ${deviceExpired} stale owner device-auth sessions`);
+            }
+
+            // 6. Expire stale owner access sessions.
+            const ownerAccessExpired = await expireStaleOwnerAccessSessions(5000);
+            if (ownerAccessExpired > 0) {
+                console.log(`[TTL] Expired ${ownerAccessExpired} stale owner access sessions`);
             }
         } catch (err) {
             console.error('[TTL] Cleanup error:', err);

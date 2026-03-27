@@ -12,6 +12,12 @@ export class ConversationError extends Error {
     }
 }
 
+function canonicalDmPair(agentId: string, peerAgentId: string): [string, string] {
+    return agentId < peerAgentId
+        ? [agentId, peerAgentId]
+        : [peerAgentId, agentId];
+}
+
 /**
  * Create or return existing DM between two agents.
  */
@@ -34,23 +40,31 @@ export async function createOrGetDM(agentId: string, peerAgentId: string) {
         );
     }
 
-    const { rows: existing } = await pool.query(
-        `SELECT c.id, c.type, c.name, c.created_at, c.policy_json
-     FROM conversations c
-     JOIN conversation_members cm1 ON cm1.conversation_id = c.id AND cm1.agent_id = $1
-     JOIN conversation_members cm2 ON cm2.conversation_id = c.id AND cm2.agent_id = $2
-     WHERE c.type = 'dm'
-     LIMIT 1`,
-        [agentId, peerAgentId]
-    );
-
-    if (existing.length > 0) {
-        return { conversation: existing[0], created: false };
-    }
-
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        const [pairA, pairB] = canonicalDmPair(agentId, peerAgentId);
+        await client.query(
+            'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+            [pairA, pairB]
+        );
+
+        const { rows: existing } = await client.query(
+            `SELECT c.id, c.type, c.name, c.created_at, c.policy_json
+             FROM conversations c
+             JOIN conversation_members cm1 ON cm1.conversation_id = c.id AND cm1.agent_id = $1
+             JOIN conversation_members cm2 ON cm2.conversation_id = c.id AND cm2.agent_id = $2
+             WHERE c.type = 'dm'
+             ORDER BY c.created_at ASC
+             LIMIT 1`,
+            [agentId, peerAgentId]
+        );
+
+        if (existing.length > 0) {
+            await client.query('COMMIT');
+            return { conversation: existing[0], created: false };
+        }
+
         const { rows: convRows } = await client.query(
             `INSERT INTO conversations (type) VALUES ('dm') RETURNING *`
         );

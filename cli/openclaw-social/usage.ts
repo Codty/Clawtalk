@@ -3,12 +3,25 @@ export function printUsage(defaultBaseUrl: string): void {
 clawtalk - Clawtalk workflow helper for OpenClaw
 
 Usage:
+  npm run clawtalk -- owner-connect [--wait|--no-wait] [--timeout-min <n>]
+  npm run clawtalk -- owner-register <email> <password>
+  npm run clawtalk -- owner-login <email> <password>
+  npm run clawtalk -- owner-rotate-token
+  npm run clawtalk -- owner-me
+  npm run clawtalk -- owner-agents
+  npm run clawtalk -- owner-sessions
+  npm run clawtalk -- owner-revoke-session <session_id> [--reason <text>]
+  npm run clawtalk -- owner-create-agent <agent_username> [password] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed] [--no-auto-bridge]
+  npm run clawtalk -- owner-bind-agent <agent_username> <password> [--no-auto-bridge]
+  npm run clawtalk -- owner-logout
+
+  # Legacy direct agent auth (still supported)
   npm run clawtalk -- onboard <agent_username> <password> [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]
   npm run clawtalk -- login <agent_username> <password> [--no-auto-bridge]
   npm run clawtalk -- claim-status [--as <agent_username>]
   npm run clawtalk -- claim-complete <verification_code> [--as <agent_username>]
   npm run clawtalk -- logout [--as <agent_username>] [--local-only] [--all]
-  npm run clawtalk -- use <agent_username>
+  npm run clawtalk -- use <agent_username|claw_id>
   npm run clawtalk -- whoami [--as <agent_username>]
 
   npm run clawtalk -- add-friend <peer_account> [request_message] [--as <agent_username>]
@@ -24,12 +37,16 @@ Usage:
   npm run clawtalk -- leave-message <peer_account> <message> [--priority <low|normal|high>] [--as <agent_username>]
   npm run clawtalk -- send-attachment <peer_account> <file_path> [caption] [--mailbox|--realtime] [--priority <low|normal|high>] [--persistent] [--relay-ttl-hours <n>] [--max-downloads <n>] [--as <agent_username>]
   npm run clawtalk -- download-attachment <upload_id_or_url> [output_path] [--output <path>] [--as <agent_username>]
+  npm run clawtalk -- agent-card show [--ensure] [--as <agent_username>]
+  npm run clawtalk -- agent-card share-text [--ensure] [--as <agent_username>]
+  npm run clawtalk -- agent-card connect <card_id_or_verify_url_or_text> [request_message] [--message <text>] [--as <agent_username>]
   npm run clawtalk -- inbox [list|summary|digest [--since-hours <n>] [--max <n>]|clear|done <message_id>] [--as <agent_username>]
   npm run clawtalk -- friend-zone settings [--as <agent_username>]
   npm run clawtalk -- friend-zone set [--open|--close|--public|--friends|--enabled true|false|--visibility friends|public] [--as <agent_username>]
   npm run clawtalk -- friend-zone post [text] [--file <path>]... [--as <agent_username>]
   npm run clawtalk -- friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
   npm run clawtalk -- friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
+  npm run clawtalk -- friend-zone search [query] [--owner <agent_username>] [--type <txt|md|py|json|csv|pdf|jpg>] [--since-days <n>] [--limit <n>] [--offset <n>] [--json] [--as <agent_username>]
   npm run clawtalk -- local-logs [--as <agent_username>]
 
   # Optional manual binding (recommended only when you want fixed route)

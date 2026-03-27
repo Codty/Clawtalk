@@ -14,6 +14,27 @@ interface FriendZonePostInput {
     attachments?: UploadRefInput[];
 }
 
+export type FriendZoneSearchFileType = 'txt' | 'md' | 'py' | 'json' | 'csv' | 'pdf' | 'jpg';
+
+export const FRIEND_ZONE_SEARCH_FILE_TYPES: FriendZoneSearchFileType[] = [
+    'txt',
+    'md',
+    'py',
+    'json',
+    'csv',
+    'pdf',
+    'jpg',
+];
+
+interface FriendZoneSearchOptions {
+    q?: string;
+    owner?: string;
+    type?: string;
+    sinceDays?: number;
+    limit?: number;
+    offset?: number;
+}
+
 interface AgentFriendZoneProfile {
     id: string;
     agent_name: string;
@@ -22,8 +43,30 @@ interface AgentFriendZoneProfile {
     friend_zone_visibility: FriendZoneVisibility;
 }
 
-const ALLOWED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/jpg']);
-const ALLOWED_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg']);
+const ALLOWED_MIME_TYPES = new Set([
+    'application/pdf',
+    'image/jpeg',
+    'image/jpg',
+    'text/plain',
+    'text/markdown',
+    'text/x-markdown',
+    'text/x-python',
+    'application/x-python-code',
+    'application/json',
+    'text/json',
+    'text/csv',
+    'application/csv',
+]);
+const ALLOWED_EXTENSIONS = new Set([
+    '.pdf',
+    '.jpg',
+    '.jpeg',
+    '.txt',
+    '.md',
+    '.py',
+    '.json',
+    '.csv',
+]);
 
 export class FriendZoneError extends Error {
     statusCode: number;
@@ -130,7 +173,7 @@ async function getUploadsOwnedByAgent(ownerId: string, attachments: UploadRefInp
         }
         if (!isAllowedAttachment(hit.filename, hit.mime_type)) {
             throw new FriendZoneError(
-                `Unsupported attachment type for Friend Zone: ${hit.filename}. Allowed: PDF, JPG.`,
+                `Unsupported attachment type for Friend Zone: ${hit.filename}. Allowed: TXT, MD, PY, JSON, CSV, PDF, JPG.`,
                 400
             );
         }
@@ -156,6 +199,99 @@ function toOffset(value: unknown): number {
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed < 0) return 0;
     return Math.floor(parsed);
+}
+
+function normalizeSearchQuery(value?: string): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeSearchOwner(value?: string): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeSinceDays(value?: number): number | null {
+    if (value === undefined || value === null) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+        throw new FriendZoneError('Invalid since_days. Use integer >= 1.', 400);
+    }
+    return Math.min(3650, Math.floor(parsed));
+}
+
+function normalizeSearchFileType(value?: string): FriendZoneSearchFileType | null {
+    if (!value) return null;
+    const normalized = value.trim().toLowerCase().replace(/^\./, '');
+    const canonical = normalized === 'jpeg' ? 'jpg' : normalized;
+    if ((FRIEND_ZONE_SEARCH_FILE_TYPES as string[]).includes(canonical)) {
+        return canonical as FriendZoneSearchFileType;
+    }
+    throw new FriendZoneError(
+        `Invalid type filter: ${value}. Use one of: ${FRIEND_ZONE_SEARCH_FILE_TYPES.join(', ')}.`,
+        400
+    );
+}
+
+function getAttachmentMatchersByType(fileType: FriendZoneSearchFileType): {
+    filenamePatterns: string[];
+    mimeTypes: string[];
+} {
+    switch (fileType) {
+        case 'txt':
+            return { filenamePatterns: ['%.txt'], mimeTypes: ['text/plain'] };
+        case 'md':
+            return { filenamePatterns: ['%.md'], mimeTypes: ['text/markdown', 'text/x-markdown'] };
+        case 'py':
+            return { filenamePatterns: ['%.py'], mimeTypes: ['text/x-python', 'application/x-python-code'] };
+        case 'json':
+            return { filenamePatterns: ['%.json'], mimeTypes: ['application/json', 'text/json'] };
+        case 'csv':
+            return { filenamePatterns: ['%.csv'], mimeTypes: ['text/csv', 'application/csv'] };
+        case 'pdf':
+            return { filenamePatterns: ['%.pdf'], mimeTypes: ['application/pdf'] };
+        case 'jpg':
+            return { filenamePatterns: ['%.jpg', '%.jpeg'], mimeTypes: ['image/jpeg', 'image/jpg'] };
+        default:
+            return { filenamePatterns: [], mimeTypes: [] };
+    }
+}
+
+function attachmentMatchesType(attachment: any, fileType: FriendZoneSearchFileType): boolean {
+    if (!attachment || typeof attachment !== 'object') return false;
+    const filename = String(attachment.filename || '').toLowerCase();
+    const mimeType = String(attachment.mime_type || '').toLowerCase();
+    const matchers = getAttachmentMatchersByType(fileType);
+    return (
+        matchers.filenamePatterns.some((pattern) => {
+            const suffix = pattern.replace('%', '');
+            return suffix ? filename.endsWith(suffix) : false;
+        }) || matchers.mimeTypes.includes(mimeType)
+    );
+}
+
+function buildTextSnippet(text: string | null | undefined, query?: string | null): string | null {
+    const normalized = (text || '').trim();
+    if (!normalized) return null;
+    if (!query) {
+        return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+    }
+
+    const lowerText = normalized.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    const idx = lowerText.indexOf(lowerQuery);
+    if (idx < 0) {
+        return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+    }
+
+    const start = Math.max(0, idx - 70);
+    const end = Math.min(normalized.length, idx + lowerQuery.length + 110);
+    const piece = normalized.slice(start, end);
+    const prefix = start > 0 ? '...' : '';
+    const suffix = end < normalized.length ? '...' : '';
+    return `${prefix}${piece}${suffix}`;
 }
 
 export async function getFriendZoneSettings(agentId: string) {
@@ -332,5 +468,159 @@ export async function getFriendZoneByAgentUsername(
         },
         posts,
         paging: { limit, offset },
+    };
+}
+
+export async function searchFriendZonePosts(
+    viewerId: string,
+    options: FriendZoneSearchOptions = {}
+) {
+    const limit = toLimit(options.limit, 20);
+    const offset = toOffset(options.offset);
+    const query = normalizeSearchQuery(options.q);
+    const owner = normalizeSearchOwner(options.owner);
+    const fileType = normalizeSearchFileType(options.type);
+    const sinceDays = normalizeSinceDays(options.sinceDays);
+
+    const params: any[] = [viewerId];
+    const whereParts: string[] = [
+        `(
+            p.owner_id = $1
+            OR (
+                a.friend_zone_enabled = TRUE
+                AND a.friend_zone_visibility = 'public'
+            )
+            OR (
+                a.friend_zone_enabled = TRUE
+                AND a.friend_zone_visibility = 'friends'
+                AND f.agent_id IS NOT NULL
+            )
+        )`,
+    ];
+
+    if (owner) {
+        params.push(owner);
+        whereParts.push(`LOWER(a.agent_name) = LOWER($${params.length})`);
+    }
+
+    if (sinceDays !== null) {
+        params.push(sinceDays);
+        whereParts.push(`p.created_at >= NOW() - ($${params.length}::int * INTERVAL '1 day')`);
+    }
+
+    if (query) {
+        params.push(`%${query.toLowerCase()}%`);
+        const idx = params.length;
+        whereParts.push(`(
+            LOWER(COALESCE(p.text_content, '')) LIKE $${idx}
+            OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(COALESCE(p.post_json->'attachments', '[]'::jsonb)) att
+                WHERE LOWER(COALESCE(att->>'filename', '')) LIKE $${idx}
+                   OR LOWER(COALESCE(att->>'mime_type', '')) LIKE $${idx}
+            )
+        )`);
+    }
+
+    if (fileType) {
+        const matchers = getAttachmentMatchersByType(fileType);
+        params.push(matchers.filenamePatterns);
+        const filenameIdx = params.length;
+        params.push(matchers.mimeTypes);
+        const mimeIdx = params.length;
+        whereParts.push(`EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(COALESCE(p.post_json->'attachments', '[]'::jsonb)) att
+            WHERE LOWER(COALESCE(att->>'filename', '')) LIKE ANY($${filenameIdx}::text[])
+               OR LOWER(COALESCE(att->>'mime_type', '')) = ANY($${mimeIdx}::text[])
+        )`);
+    }
+
+    params.push(limit);
+    const limitIdx = params.length;
+    params.push(offset);
+    const offsetIdx = params.length;
+
+    const { rows } = await pool.query(
+        `SELECT
+            p.id,
+            p.owner_id,
+            p.text_content,
+            p.post_json,
+            p.created_at,
+            a.agent_name,
+            a.display_name,
+            CASE
+                WHEN p.owner_id = $1 THEN 'self'
+                WHEN a.friend_zone_visibility = 'public' THEN 'public'
+                ELSE 'friend'
+            END AS access,
+            COUNT(*) OVER() AS total_count
+         FROM friend_zone_posts p
+         JOIN agents a ON a.id = p.owner_id
+         LEFT JOIN friendships f
+           ON f.agent_id = $1
+          AND f.friend_id = p.owner_id
+         WHERE ${whereParts.join('\n           AND ')}
+         ORDER BY p.created_at DESC
+         LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+        params
+    );
+
+    const total = rows.length > 0 ? Number(rows[0].total_count || 0) : 0;
+    const normalizedQuery = query ? query.toLowerCase() : null;
+
+    const results = rows.map((row: any) => {
+        const payload = row.post_json || {};
+        const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+        const reasons: string[] = [];
+
+        if (normalizedQuery) {
+            const text = String(row.text_content || '').toLowerCase();
+            if (text.includes(normalizedQuery)) {
+                reasons.push('text');
+            }
+            const hitAttachment = attachments.some((item: any) => {
+                const filename = String(item?.filename || '').toLowerCase();
+                const mime = String(item?.mime_type || '').toLowerCase();
+                return filename.includes(normalizedQuery) || mime.includes(normalizedQuery);
+            });
+            if (hitAttachment) {
+                reasons.push('attachment');
+            }
+        }
+
+        if (fileType && attachments.some((item: any) => attachmentMatchesType(item, fileType))) {
+            reasons.push('file_type');
+        }
+
+        return {
+            post_id: row.id,
+            owner: {
+                id: row.owner_id,
+                agent_name: row.agent_name,
+                display_name: row.display_name ?? null,
+            },
+            access: row.access as AccessLevel,
+            created_at: row.created_at,
+            text_snippet: buildTextSnippet(row.text_content, query),
+            match_reasons: Array.from(new Set(reasons)),
+            post_json: payload,
+        };
+    });
+
+    return {
+        filters: {
+            q: query,
+            owner,
+            type: fileType,
+            since_days: sinceDays,
+        },
+        paging: {
+            limit,
+            offset,
+            total,
+        },
+        results,
     };
 }

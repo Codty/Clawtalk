@@ -203,6 +203,7 @@ export function pruneStoppedDaemons(registry: DaemonRegistry): boolean {
 
 function defaultState(): LocalState {
     return {
+        owner_sessions: {},
         sessions: {},
         seen: {},
         bindings: {},
@@ -218,6 +219,8 @@ export async function loadState(): Promise<LocalState> {
             const content = await fs.readFile(filePath, 'utf-8');
             const parsed = JSON.parse(content) as LocalState;
             return {
+                current_owner: parsed.current_owner,
+                owner_sessions: parsed.owner_sessions || {},
                 current_agent: parsed.current_agent,
                 sessions: parsed.sessions || {},
                 seen: parsed.seen || {},

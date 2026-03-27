@@ -1,6 +1,17 @@
 import type { CliConfig, LocalState } from './types.js';
 
 export interface DispatcherHandlers {
+    commandOwnerConnect: (args: string[], state: LocalState) => Promise<void>;
+    commandOwnerRegister: (args: string[], state: LocalState) => Promise<void>;
+    commandOwnerLogin: (args: string[], state: LocalState) => Promise<void>;
+    commandOwnerRotateToken: (state: LocalState) => Promise<void>;
+    commandOwnerWhoami: (state: LocalState) => Promise<void>;
+    commandOwnerLogout: (state: LocalState) => Promise<void>;
+    commandOwnerAgents: (state: LocalState) => Promise<void>;
+    commandOwnerSessions: (state: LocalState) => Promise<void>;
+    commandOwnerRevokeSession: (args: string[], state: LocalState) => Promise<void>;
+    commandOwnerCreateAgent: (args: string[], state: LocalState) => Promise<void>;
+    commandOwnerBindAgent: (args: string[], state: LocalState) => Promise<void>;
     commandOnboard: (args: string[], state: LocalState) => Promise<void>;
     commandLogin: (args: string[], state: LocalState) => Promise<void>;
     commandClaimStatus: (state: LocalState, asAgent?: string) => Promise<void>;
@@ -20,6 +31,7 @@ export interface DispatcherHandlers {
     commandMessageStatus: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandSendAttachment: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandDownloadAttachment: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
+    commandAgentCard: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandInbox: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandFriendZone: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandLocalLogs: (state: LocalState, asAgent?: string) => Promise<void>;
@@ -48,6 +60,39 @@ export async function dispatchCommand(params: {
     const { command, rest, state, config, asAgent, handlers } = params;
 
     switch (command) {
+        case 'owner-connect':
+            await handlers.commandOwnerConnect(rest, state);
+            break;
+        case 'owner-register':
+            await handlers.commandOwnerRegister(rest, state);
+            break;
+        case 'owner-login':
+            await handlers.commandOwnerLogin(rest, state);
+            break;
+        case 'owner-rotate-token':
+            await handlers.commandOwnerRotateToken(state);
+            break;
+        case 'owner-me':
+            await handlers.commandOwnerWhoami(state);
+            break;
+        case 'owner-logout':
+            await handlers.commandOwnerLogout(state);
+            break;
+        case 'owner-agents':
+            await handlers.commandOwnerAgents(state);
+            break;
+        case 'owner-sessions':
+            await handlers.commandOwnerSessions(state);
+            break;
+        case 'owner-revoke-session':
+            await handlers.commandOwnerRevokeSession(rest, state);
+            break;
+        case 'owner-create-agent':
+            await handlers.commandOwnerCreateAgent(rest, state);
+            break;
+        case 'owner-bind-agent':
+            await handlers.commandOwnerBindAgent(rest, state);
+            break;
         case 'onboard':
             await handlers.commandOnboard(rest, state);
             break;
@@ -111,6 +156,10 @@ export async function dispatchCommand(params: {
             break;
         case 'download-attachment':
             await handlers.commandDownloadAttachment(rest, state, asAgent);
+            break;
+        case 'agent-card':
+        case 'card':
+            await handlers.commandAgentCard(rest, state, asAgent);
             break;
         case 'inbox':
             await handlers.commandInbox(rest, state, asAgent);

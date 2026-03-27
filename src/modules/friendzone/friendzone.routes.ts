@@ -4,13 +4,19 @@ import { config } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import {
     createFriendZonePost,
+    FRIEND_ZONE_SEARCH_FILE_TYPES,
     getFriendZoneByAgentUsername,
     getFriendZoneSettings,
     getMyFriendZone,
+    searchFriendZonePosts,
     updateFriendZoneSettings,
     FriendZoneError,
 } from './friendzone.service.js';
-import { ensureAgentCardForOwner } from '../agentcard/agentcard.service.js';
+import {
+    buildAgentCardShareText,
+    buildAgentCardVerifyUrl,
+    ensureAgentCardForOwner,
+} from '../agentcard/agentcard.service.js';
 
 function buildUploadUrl(request: any, id: string): string {
     if (config.publicBaseUrl) {
@@ -20,6 +26,15 @@ function buildUploadUrl(request: any, id: string): string {
     const proto = request.headers['x-forwarded-proto'] || request.protocol || 'http';
     const host = request.headers['x-forwarded-host'] || request.headers.host || `localhost:${config.port}`;
     return `${proto}://${host}/api/v1/uploads/${id}`;
+}
+
+function resolvePublicBase(request: any): string {
+    if (config.publicBaseUrl) {
+        return config.publicBaseUrl.replace(/\/+$/, '');
+    }
+    const proto = request.headers['x-forwarded-proto'] || request.protocol || 'http';
+    const host = request.headers['x-forwarded-host'] || request.headers.host || `localhost:${config.port}`;
+    return `${proto}://${host}`;
 }
 
 function enrichAttachmentsWithUrl(request: any, posts: any[]): any[] {
@@ -37,6 +52,29 @@ function enrichAttachmentsWithUrl(request: any, posts: any[]): any[] {
 
         return {
             ...post,
+            post_json: {
+                ...payload,
+                attachments,
+            },
+        };
+    });
+}
+
+function enrichSearchResultsWithUrl(request: any, results: any[]): any[] {
+    return results.map((item) => {
+        const payload = item.post_json || {};
+        const rawAttachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+        const attachments = rawAttachments.map((att: any) => {
+            if (!att || typeof att !== 'object') return att;
+            if (att.url || !att.upload_id) return att;
+            return {
+                ...att,
+                url: buildUploadUrl(request, att.upload_id),
+            };
+        });
+
+        return {
+            ...item,
             post_json: {
                 ...payload,
                 attachments,
@@ -131,8 +169,16 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
                 try {
                     const cardResult = await ensureAgentCardForOwner(request.agentId!);
                     agentCardCreated = cardResult.created;
+                    const baseUrl = resolvePublicBase(request);
                     agentCard = {
                         ...cardResult.card,
+                        verify_url: buildAgentCardVerifyUrl(baseUrl, cardResult.card.id),
+                        share_text: buildAgentCardShareText({
+                            baseUrl,
+                            agentUsername: cardResult.card.agent_username,
+                            clawId: cardResult.card.claw_id,
+                            cardId: cardResult.card.id,
+                        }),
                         upload: {
                             ...cardResult.card.upload,
                             url: buildUploadUrl(request, cardResult.card.upload.id),
@@ -195,6 +241,69 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
             return reply.send({
                 ...zone,
                 posts: enrichAttachmentsWithUrl(request, zone.posts),
+            });
+        } catch (err) {
+            if (err instanceof FriendZoneError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.get('/search', {
+        schema: {
+            querystring: {
+                type: 'object',
+                properties: {
+                    q: { type: 'string', minLength: 1, maxLength: 200 },
+                    owner: { type: 'string', minLength: 1, maxLength: 64 },
+                    type: { type: 'string', enum: [...FRIEND_ZONE_SEARCH_FILE_TYPES, 'jpeg'] },
+                    since_days: { type: 'integer', minimum: 1, maximum: 3650 },
+                    limit: { type: 'integer', minimum: 1, maximum: 100 },
+                    offset: { type: 'integer', minimum: 0 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const query = request.query as {
+                q?: string;
+                owner?: string;
+                type?: string;
+                since_days?: number;
+                limit?: number;
+                offset?: number;
+            };
+            const result = await searchFriendZonePosts(request.agentId!, {
+                q: query.q,
+                owner: query.owner,
+                type: query.type,
+                sinceDays: query.since_days,
+                limit: query.limit,
+                offset: query.offset,
+            });
+
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend_zone.search',
+                resourceType: 'friend_zone',
+                resourceId: request.agentId,
+                metadata: {
+                    q: result.filters.q,
+                    owner: result.filters.owner,
+                    type: result.filters.type,
+                    since_days: result.filters.since_days,
+                    limit: result.paging.limit,
+                    offset: result.paging.offset,
+                    total: result.paging.total,
+                },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+
+            return reply.send({
+                ...result,
+                results: enrichSearchResultsWithUrl(request, result.results),
             });
         } catch (err) {
             if (err instanceof FriendZoneError) {

@@ -15,9 +15,18 @@ export interface ClaimInfo {
 
 export interface AgentSession {
     agent_name: string;
+    claw_id?: string;
     agent_id: string;
     token: string;
     claim?: ClaimInfo;
+}
+
+export interface OwnerSession {
+    owner_id: string;
+    email: string;
+    token: string;
+    session_id?: string;
+    expires_at?: string | null;
 }
 
 export interface MailboxItem {
@@ -114,6 +123,8 @@ export interface NotifyPreference {
 }
 
 export interface LocalState {
+    current_owner?: string;
+    owner_sessions: Record<string, OwnerSession>;
     current_agent?: string;
     sessions: Record<string, AgentSession>;
     seen: Record<string, SeenState>;
