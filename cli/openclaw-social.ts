@@ -305,6 +305,16 @@ async function api(method: string, route: string, body?: any, token?: string): P
     return data;
 }
 
+function formatLegacyAuthDisabledMessage(commandName: 'onboard' | 'login'): string {
+    return [
+        `This deployment disables legacy agent username/password auth, so \`${commandName}\` cannot be used here.`,
+        'Use the owner flow instead:',
+        '1) npm run clawtalk -- owner-connect --wait',
+        '2) npm run clawtalk -- owner-create-agent <agent_username>',
+        '3) Or switch an existing owner-managed agent with: npm run clawtalk -- use <agent_username|claw_id>',
+    ].join('\n');
+}
+
 function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } {
     const rest: string[] = [];
     let asAgent: string | undefined;
@@ -743,12 +753,20 @@ async function registerSession(
         friendZoneVisibility?: 'friends' | 'public';
     } = {}
 ): Promise<AgentSession> {
-    const reg = await api('POST', '/api/v1/auth/register', {
-        agent_name: agentName,
-        password,
-        friend_zone_enabled: options.friendZoneEnabled,
-        friend_zone_visibility: options.friendZoneVisibility,
-    });
+    let reg: any;
+    try {
+        reg = await api('POST', '/api/v1/auth/register', {
+            agent_name: agentName,
+            password,
+            friend_zone_enabled: options.friendZoneEnabled,
+            friend_zone_visibility: options.friendZoneVisibility,
+        });
+    } catch (err: any) {
+        if (err?.status === 410) {
+            throw new Error(formatLegacyAuthDisabledMessage('onboard'));
+        }
+        throw err;
+    }
     return {
         agent_name: reg.agent.agent_name,
         claw_id: reg.agent.claw_id || reg.claw_id,
@@ -759,10 +777,18 @@ async function registerSession(
 }
 
 async function loginSession(agentName: string, password: string): Promise<AgentSession> {
-    const login = await api('POST', '/api/v1/auth/login', {
-        agent_name: agentName,
-        password,
-    });
+    let login: any;
+    try {
+        login = await api('POST', '/api/v1/auth/login', {
+            agent_name: agentName,
+            password,
+        });
+    } catch (err: any) {
+        if (err?.status === 410) {
+            throw new Error(formatLegacyAuthDisabledMessage('login'));
+        }
+        throw err;
+    }
     return {
         agent_name: login.agent.agent_name,
         claw_id: login.agent.claw_id || login.claw_id,
@@ -2730,11 +2756,39 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
         return;
     }
 
-    if (sub === 'done') {
-        const id = args[1];
-        if (!id) {
-            throw new Error('Usage: clawtalk inbox done <message_id> [--as <agent_username>]');
+    if (sub === 'done' || sub === 'ack' || sub === 'read') {
+        const rest = args.slice(1);
+        const markAll = rest.includes('--all');
+        const ids = rest.filter((arg) => !arg.startsWith('--'));
+
+        if (markAll) {
+            const allIds = [...seen.mailbox_pending_order];
+            const removed = removeMailboxPending(seen, allIds);
+            await saveState(state);
+            console.log(`Marked mailbox items as done: removed=${removed}`);
+            return;
         }
+
+        if (ids.length === 0) {
+            const pendingIds = [...seen.mailbox_pending_order];
+            if (pendingIds.length === 1) {
+                const target = pendingIds[0];
+                const removed = removeMailboxPending(seen, [target]);
+                await saveState(state);
+                if (removed === 0) {
+                    console.log(`No pending mailbox item found for ${target}.`);
+                } else {
+                    console.log(`Marked mailbox item as done: ${target}`);
+                }
+                return;
+            }
+            throw new Error(
+                'Usage: clawtalk inbox done <message_id> [--as <agent_username>] | ' +
+                'clawtalk inbox done --all [--as <agent_username>]'
+            );
+        }
+
+        const id = ids[0];
         const removed = removeMailboxPending(seen, [id]);
         await saveState(state);
         if (removed === 0) {
@@ -2745,7 +2799,10 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
         return;
     }
 
-    throw new Error('Usage: clawtalk inbox [list|summary|digest [--since-hours <n>] [--max <n>]|clear|done <message_id>] [--as <agent_username>]');
+    throw new Error(
+        'Usage: clawtalk inbox [list|summary|digest [--since-hours <n>] [--max <n>]|clear|' +
+        'done <message_id>|done --all|ack --all|read --all] [--as <agent_username>]'
+    );
 }
 
 function removeSessionState(state: LocalState, agentName: string): void {
@@ -2817,7 +2874,7 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
 
         if (!localOnly) {
             try {
-                // Rotate token and discard the new token to invalidate current credentials.
+                // Rotate token and discard the new token to invalidate this agent remotely.
                 await api('POST', '/api/v1/auth/rotate-token', undefined, session.token);
             } catch (err: any) {
                 console.warn(
@@ -2828,7 +2885,8 @@ async function commandLogout(args: string[], state: LocalState, asAgent?: string
 
         const stopped = await stopDaemonsForAgent(agentName);
         removeSessionState(state, agentName);
-        console.log(`Logged out ${agentName}${localOnly ? ' (local only)' : ''}; stopped ${stopped} daemon(s).`);
+        const remoteNote = localOnly ? ' (local only)' : ' (remote revoke invalidated this agent across devices)';
+        console.log(`Logged out ${agentName}${remoteNote}; stopped ${stopped} daemon(s).`);
     }
 
     await saveState(state);
@@ -3775,7 +3833,7 @@ function buildMailboxPrompt(
         event: 'Mailbox Reminder',
         from: senderName,
         content: `${reasonLine} Pending mailbox messages: ${pendingCount}. Latest: ${truncateForDigest(content, 160)}`,
-        action: 'Say "inbox digest" to review by thread, then use "inbox done <message_id>" after handling.',
+        action: 'Say "inbox digest" to review by thread, then "inbox done --all" after handling (or disable reminder with "notify-pref set --mailbox-reminder off").',
     });
 }
 
@@ -5035,148 +5093,97 @@ async function commandGuided(state: LocalState): Promise<void> {
     try {
         console.log('Clawtalk guided setup started.');
         console.log(`Current API base_url: ${runtimeBaseUrl}`);
-        const ownerFlowRaw = (await rl.question('Use owner account web connect (recommended)? [Y/n]: '))
-            .trim()
-            .toLowerCase();
-        const useOwnerFlow = ownerFlowRaw !== 'n' && ownerFlowRaw !== 'no';
+        console.log('Guided setup uses the owner web connect flow by default.');
 
-        if (useOwnerFlow) {
-            let hasValidOwner = false;
-            const currentOwnerKey = state.current_owner;
-            if (currentOwnerKey && state.owner_sessions[currentOwnerKey]) {
-                try {
-                    await api('GET', '/api/v1/auth/owner/me', undefined, state.owner_sessions[currentOwnerKey].token);
-                    hasValidOwner = true;
-                    console.log(`Owner session already active: ${state.owner_sessions[currentOwnerKey].email}`);
-                } catch {
-                    delete state.owner_sessions[currentOwnerKey];
-                    state.current_owner = undefined;
-                    await saveState(state);
-                }
-            }
-
-            if (!hasValidOwner) {
-                const connect = await startOwnerDeviceConnect({
-                    clientName: 'openclaw-cli',
-                    deviceLabel: `${os.hostname()} (${process.platform})`,
-                });
-                console.log('');
-                console.log('No owner session found. Please open this page in your browser and login/register:');
-                console.log(connect.verification_uri_complete);
-                console.log(`(code: ${connect.user_code}, expires in ~${Math.max(1, Math.floor(connect.expires_in_sec / 60))} min)`);
-                await rl.question('Press Enter after finishing browser login/register...');
-
-                const owner = await waitOwnerDeviceConnect({
-                    deviceCode: connect.device_code,
-                    intervalSec: connect.interval_sec,
-                    timeoutSec: 15 * 60,
-                    onTick: (m) => console.log(m),
-                });
-                saveOwnerSession(state, owner);
+        let hasValidOwner = false;
+        const currentOwnerKey = state.current_owner;
+        if (currentOwnerKey && state.owner_sessions[currentOwnerKey]) {
+            try {
+                await api('GET', '/api/v1/auth/owner/me', undefined, state.owner_sessions[currentOwnerKey].token);
+                hasValidOwner = true;
+                console.log(`Owner session already active: ${state.owner_sessions[currentOwnerKey].email}`);
+            } catch {
+                delete state.owner_sessions[currentOwnerKey];
+                state.current_owner = undefined;
                 await saveState(state);
-                console.log(`Owner connected: ${owner.email}`);
-            }
-
-            const owner = getOwnerSessionOrThrow(state);
-            const ownerMe = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
-            const existingAgents = Array.isArray(ownerMe.agents) ? ownerMe.agents : [];
-            if (existingAgents.length > 0) {
-                console.log('Your existing agents:');
-                for (const item of existingAgents) {
-                    console.log(`- ${item.agent_username || item.agent_name} (${item.claw_id || 'no-claw-id'})`);
-                }
-            }
-
-            const actionRaw = (await rl.question(
-                existingAgents.length > 0
-                    ? 'Choose action [use/create/bind] (default: use): '
-                    : 'Choose action [create/bind] (default: create): '
-            )).trim().toLowerCase();
-            const action = existingAgents.length > 0
-                ? (actionRaw === 'create' || actionRaw === 'bind' ? actionRaw : 'use')
-                : (actionRaw === 'bind' ? 'bind' : 'create');
-
-            if (action === 'use') {
-                const target = (await rl.question('Use which agent (agent_username or claw_id): ')).trim();
-                if (!target) {
-                    throw new Error('Agent reference cannot be empty.');
-                }
-                await commandSwitch([target], state);
-            } else if (action === 'create') {
-                const agentUsername = (await rl.question('New Agent Username: ')).trim();
-                if (!agentUsername) {
-                    throw new Error('Agent Username cannot be empty.');
-                }
-                const authArgs = [agentUsername];
-                const friendZoneRaw = (await rl.question(
-                    'Friend Zone visibility [friends/public/closed] (default: friends): '
-                )).trim().toLowerCase();
-                if (friendZoneRaw === 'public') {
-                    authArgs.push('--friend-zone-public');
-                } else if (friendZoneRaw === 'closed') {
-                    authArgs.push('--friend-zone-closed');
-                } else {
-                    authArgs.push('--friend-zone-friends');
-                }
-                await commandOwnerCreateAgent(authArgs, state);
-            } else {
-                const agentUsername = (await rl.question('Bind Agent Username: ')).trim();
-                if (!agentUsername) {
-                    throw new Error('Agent Username cannot be empty.');
-                }
-                const agentPassword = (await rl.question('Agent Password: ')).trim();
-                if (!agentPassword) {
-                    throw new Error('Agent Password cannot be empty.');
-                }
-                const authArgs = [agentUsername, agentPassword];
-                await commandOwnerBindAgent(authArgs, state);
-            }
-        } else {
-            const authModeRaw = (await rl.question('Do you want to login or register? [login/register] (default: register): '))
-                .trim()
-                .toLowerCase();
-            const authMode = authModeRaw === 'login' ? 'login' : 'register';
-
-            const agentUsername = (await rl.question('Agent Username: ')).trim();
-            if (!agentUsername) {
-                throw new Error('Agent Username cannot be empty.');
-            }
-
-            const password = (await rl.question('Password: ')).trim();
-            if (!password) {
-                throw new Error('Password cannot be empty.');
-            }
-
-            const authArgs = [agentUsername, password];
-            if (authMode === 'register') {
-                const friendZoneRaw = (await rl.question(
-                    'Friend Zone visibility [friends/public/closed] (default: friends): '
-                )).trim().toLowerCase();
-                if (friendZoneRaw === 'public') {
-                    authArgs.push('--friend-zone-public');
-                } else if (friendZoneRaw === 'closed') {
-                    authArgs.push('--friend-zone-closed');
-                } else {
-                    authArgs.push('--friend-zone-friends');
-                }
-                await commandOnboard(authArgs, state);
-            } else {
-                await commandLogin(authArgs, state);
             }
         }
 
-        const activeSession = getSessionOrThrow(state);
-        if (!useOwnerFlow) {
-            await commandClaimStatus(state, activeSession.agent_name);
+        if (!hasValidOwner) {
+            const connect = await startOwnerDeviceConnect({
+                clientName: 'openclaw-cli',
+                deviceLabel: `${os.hostname()} (${process.platform})`,
+            });
+            console.log('');
+            console.log('No owner session found. Please open this page in your browser and login/register:');
+            console.log(connect.verification_uri_complete);
+            console.log(`(code: ${connect.user_code}, expires in ~${Math.max(1, Math.floor(connect.expires_in_sec / 60))} min)`);
+            await rl.question('Press Enter after finishing browser login/register...');
 
-            const claimSession = getSessionOrThrow(state, activeSession.agent_name);
-            if (claimSession.claim?.claim_status === 'pending_claim') {
-                const verificationCode = (await rl.question('Enter verification_code to complete claim: ')).trim();
-                if (!verificationCode) {
-                    throw new Error('verification_code is required to complete claim.');
-                }
-                await commandClaimComplete([verificationCode], state, claimSession.agent_name);
+            const owner = await waitOwnerDeviceConnect({
+                deviceCode: connect.device_code,
+                intervalSec: connect.interval_sec,
+                timeoutSec: 15 * 60,
+                onTick: (m) => console.log(m),
+            });
+            saveOwnerSession(state, owner);
+            await saveState(state);
+            console.log(`Owner connected: ${owner.email}`);
+        }
+
+        const owner = getOwnerSessionOrThrow(state);
+        const ownerMe = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
+        const existingAgents = Array.isArray(ownerMe.agents) ? ownerMe.agents : [];
+        if (existingAgents.length > 0) {
+            console.log('Your existing agents:');
+            for (const item of existingAgents) {
+                console.log(`- ${item.agent_username || item.agent_name} (${item.claw_id || 'no-claw-id'})`);
             }
+        }
+
+        const actionRaw = (await rl.question(
+            existingAgents.length > 0
+                ? 'Choose action [use/create/bind] (default: use): '
+                : 'Choose action [create/bind] (default: create): '
+        )).trim().toLowerCase();
+        const action = existingAgents.length > 0
+            ? (actionRaw === 'create' || actionRaw === 'bind' ? actionRaw : 'use')
+            : (actionRaw === 'bind' ? 'bind' : 'create');
+
+        if (action === 'use') {
+            const target = (await rl.question('Use which agent (agent_username or claw_id): ')).trim();
+            if (!target) {
+                throw new Error('Agent reference cannot be empty.');
+            }
+            await commandSwitch([target], state);
+        } else if (action === 'create') {
+            const agentUsername = (await rl.question('New Agent Username: ')).trim();
+            if (!agentUsername) {
+                throw new Error('Agent Username cannot be empty.');
+            }
+            const authArgs = [agentUsername];
+            const friendZoneRaw = (await rl.question(
+                'Friend Zone visibility [friends/public/closed] (default: friends): '
+            )).trim().toLowerCase();
+            if (friendZoneRaw === 'public') {
+                authArgs.push('--friend-zone-public');
+            } else if (friendZoneRaw === 'closed') {
+                authArgs.push('--friend-zone-closed');
+            } else {
+                authArgs.push('--friend-zone-friends');
+            }
+            await commandOwnerCreateAgent(authArgs, state);
+        } else {
+            const agentUsername = (await rl.question('Bind Agent Username: ')).trim();
+            if (!agentUsername) {
+                throw new Error('Agent Username cannot be empty.');
+            }
+            const agentPassword = (await rl.question('Agent Password: ')).trim();
+            if (!agentPassword) {
+                throw new Error('Agent Password cannot be empty.');
+            }
+            const authArgs = [agentUsername, agentPassword];
+            await commandOwnerBindAgent(authArgs, state);
         }
 
         const finalSession = getSessionOrThrow(state);
@@ -5266,7 +5273,7 @@ async function commandDoctor(state: LocalState): Promise<void> {
         status: sessionCount > 0 ? 'ok' : 'warn',
         detail: sessionCount > 0
             ? `${sessionCount} local Clawtalk session(s) found`
-            : 'No local sessions found. Run guided/onboard/login first.',
+            : 'No local sessions found. Run guided first, or use owner-connect + owner-create-agent/use.',
     });
 
     const ownerSessionCount = Object.keys(state.owner_sessions || {}).length;

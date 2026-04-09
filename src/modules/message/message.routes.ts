@@ -99,17 +99,8 @@ export async function messageRoutes(fastify: FastifyInstance) {
     }, async (request, reply) => {
         try {
             const { message_ids } = request.body as { message_ids: string[] };
-            const result = await markMessagesRead(request.params.id, request.agentId!, message_ids);
-            await writeAuditLog({
-                agentId: request.agentId,
-                action: 'message.read',
-                resourceType: 'conversation',
-                resourceId: request.params.id,
-                metadata: { read_count: result.read_count },
-                ip: request.ip,
-                userAgent: request.headers['user-agent'] as string,
-            });
-            return reply.send(result);
+            await markMessagesRead(request.params.id, request.agentId!, message_ids);
+            return reply.send({ read_count: 0 });
         } catch (err) {
             if (err instanceof MessageError || err instanceof ConversationError) {
                 return reply.code(err.statusCode).send({ error: err.message });

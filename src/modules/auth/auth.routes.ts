@@ -14,6 +14,12 @@ import {
     switchOwnerAgent,
     startOwnerDeviceAuth,
     authorizeOwnerDeviceAuth,
+    authorizeOwnerDeviceAuthWithClerk,
+    loginOwnerWithClerk,
+    requestOwnerEmailVerification,
+    verifyOwnerEmailByToken,
+    requestOwnerPasswordReset,
+    resetOwnerPasswordByToken,
     exchangeOwnerDeviceAuthToken,
     getOwnerDeviceAuthSessionByUserCode,
     denyOwnerDeviceAuth,
@@ -28,19 +34,95 @@ import {
     clearLoginFailures,
     getAgentAccessState,
     AuthError,
+    tryVerifyToken,
 } from './auth.service.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { authenticateOwner } from '../../middleware/authenticate-owner.js';
 import { config } from '../../config.js';
 
-const authRateLimitConfig = {
-    rateLimit: {
-        max: config.rateLimitAuth,
-        timeWindow: config.rateLimitWindowMs,
-        keyGenerator: (request: any) => request.ip,
-    },
-};
+function normalizeRateLimitKey(value: unknown): string {
+    if (typeof value !== 'string') return 'unknown';
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return 'unknown';
+    return normalized.replace(/[^a-z0-9:@._-]+/g, '_').slice(0, 160) || 'unknown';
+}
+
+function getBearerToken(request: any): string | undefined {
+    const header = request.headers?.authorization;
+    if (typeof header !== 'string') return undefined;
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match?.[1]?.trim();
+}
+
+function getPrincipalRateLimitKey(
+    request: any,
+    scope: string,
+    options: { includeSessionId?: boolean; expectedTokenType?: 'access' | 'owner_access' } = {}
+): string {
+    const token = getBearerToken(request);
+    if (token) {
+        const verified = tryVerifyToken(token);
+        if (verified?.sub) {
+            if (options.expectedTokenType && verified.token_type !== options.expectedTokenType) {
+                return `${scope}:ip:${normalizeRateLimitKey(request.ip)}`;
+            }
+            const sub = normalizeRateLimitKey(verified.sub);
+            const sid = normalizeRateLimitKey(verified.sid || '');
+            if (sub !== 'unknown' && options.includeSessionId && sid !== 'unknown') {
+                return `${scope}:principal:${sub}:${sid}`;
+            }
+            if (sub !== 'unknown') {
+                return `${scope}:principal:${sub}`;
+            }
+        }
+        return `${scope}:ip:${normalizeRateLimitKey(request.ip)}`;
+    }
+    return `${scope}:ip:${normalizeRateLimitKey(request.ip)}`;
+}
+
+function createRateLimitConfig(max: number, keyGenerator: (request: any) => string) {
+    return {
+        rateLimit: {
+            max,
+            timeWindow: config.rateLimitWindowMs,
+            keyGenerator,
+        },
+    };
+}
+
+const deviceStartRateLimitConfig = createRateLimitConfig(config.rateLimitAuthDeviceStart, (request) =>
+    `device-start:ip:${normalizeRateLimitKey(request.ip)}`
+);
+const deviceTokenRateLimitConfig = createRateLimitConfig(config.rateLimitAuthDeviceToken, (request) => {
+    const deviceCode = normalizeRateLimitKey((request.body as any)?.device_code || '');
+    return `device-token:ip:${normalizeRateLimitKey(request.ip)}:device:${deviceCode}`;
+});
+const deviceAuthorizeRateLimitConfig = createRateLimitConfig(config.rateLimitAuthDeviceAuthorize, (request) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const query = (request.query || {}) as Record<string, unknown>;
+    const email = normalizeRateLimitKey(String(body.email || ''));
+    const userCode = normalizeRateLimitKey(String(body.user_code || query.user_code || ''));
+    return `device-authorize:ip:${normalizeRateLimitKey(request.ip)}:email:${email}:user:${userCode}`;
+});
+const ownerCredentialRateLimitConfig = createRateLimitConfig(config.rateLimitAuthOwnerCredential, (request) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const query = (request.query || {}) as Record<string, unknown>;
+    const email = normalizeRateLimitKey(String(body.email || ''));
+    const token = normalizeRateLimitKey(String(body.token || query.token || ''));
+    return `owner-credential:ip:${normalizeRateLimitKey(request.ip)}:email:${email}:token:${token}`;
+});
+const ownerActionRateLimitConfig = createRateLimitConfig(config.rateLimitAuthOwnerAction, (request) =>
+    getPrincipalRateLimitKey(request, 'owner-action', { expectedTokenType: 'owner_access' })
+);
+const agentCredentialRateLimitConfig = createRateLimitConfig(config.rateLimitAuthAgentCredential, (request) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const agentName = normalizeRateLimitKey(String(body.agent_name || ''));
+    return `agent-credential:ip:${normalizeRateLimitKey(request.ip)}:agent:${agentName}`;
+});
+const agentActionRateLimitConfig = createRateLimitConfig(config.rateLimitAuthAgentAction, (request) =>
+    getPrincipalRateLimitKey(request, 'agent-action', { expectedTokenType: 'access' })
+);
 
 const USERNAME_PATTERN = '^(?!.*[._-]{2})[a-z][a-z0-9._-]{2,22}[a-z0-9]$';
 const EMAIL_PATTERN = '^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$';
@@ -78,72 +160,211 @@ function escapeHtml(value: string): string {
         .replaceAll("'", '&#39;');
 }
 
-function renderDeviceAuthPage(userCode: string, baseApiUrl: string): string {
+function renderDeviceAuthPage(
+    userCode: string,
+    baseApiUrl: string,
+    clerkEnabled: boolean,
+    clerkPublishableKey: string,
+    clerkIssuer: string
+): string {
     const code = escapeHtml(userCode || '');
     const apiBase = escapeHtml(baseApiUrl.replace(/\/+$/, ''));
+    const clerkIssuerBase = (clerkIssuer || '').trim().replace(/\/+$/, '');
+    const publishableKey = (clerkPublishableKey || '').trim();
+    const clerkConfigured = clerkEnabled && publishableKey.length > 0;
+    const clerkScriptSrc = clerkIssuerBase
+        ? `${escapeHtml(clerkIssuerBase)}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js`
+        : 'https://unpkg.com/@clerk/clerk-js@latest/dist/clerk.browser.js';
+    const clerkScriptTag = clerkConfigured
+        ? `<script async crossorigin="anonymous" src="${clerkScriptSrc}"></script>`
+        : '';
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Clawtalk Account Connect</title>
+  <title>Clawtalk Login</title>
   <style>
-    :root { --bg:#f6faf7; --card:#ffffff; --line:#d6e7db; --text:#102117; --muted:#5a6f60; --brand:#16a34a; --brandDark:#0f7a36; --err:#b42318; }
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background:var(--bg); color:var(--text);}
-    .wrap { max-width: 760px; margin: 36px auto; padding: 0 16px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px; box-shadow:0 10px 30px rgba(16,33,23,.06); }
-    .title { margin:0 0 6px; font-size:28px; }
-    .sub { margin:0 0 18px; color:var(--muted); }
-    .code { display:inline-block; padding:8px 12px; border-radius:10px; border:1px solid var(--line); background:#f3fbf5; font-weight:700; letter-spacing:1px; }
-    .grid { display:grid; grid-template-columns:1fr; gap:16px; margin-top:20px; }
-    @media(min-width:760px){ .grid { grid-template-columns:1fr 1fr; } }
-    .pane { border:1px solid var(--line); border-radius:12px; padding:14px; }
-    .pane h3 { margin:0 0 10px; font-size:18px; }
-    label { display:block; font-size:13px; color:var(--muted); margin:8px 0 6px; }
-    input { width:100%; border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:14px; box-sizing:border-box; }
-    button { margin-top:12px; border:0; border-radius:10px; background:var(--brand); color:white; padding:10px 14px; font-weight:600; cursor:pointer; }
-    button:hover { background:var(--brandDark); }
+    :root {
+      --bg:#fcfcfc; --card:#ffffff; --text:#1a1a1a; --muted:#5a6f60; --line:#d6e7db;
+      --brand:#22c55e; --brandHover:#16a34a; --err:#b42318;
+      --brandLight:#f0fdf4; --brandSoft:#dcfce7;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      background: linear-gradient(135deg, var(--brandLight) 0%, #ffffff 55%, rgba(220,252,231,.45) 100%);
+      color:var(--text); padding:20px;
+    }
+    .card {
+      width:min(100%, 620px); background:var(--card); border:1px solid var(--line);
+      border-radius:18px; padding:28px; box-shadow:0 16px 40px rgba(22,163,74,.08);
+    }
+    .header { margin-bottom:18px; }
+    .title { margin:0; font-size:28px; font-weight:700; letter-spacing:.2px; }
+    .device {
+      display:inline-flex; align-items:center; gap:8px; margin-top:8px; color:var(--muted); font-size:13px;
+      background:#f3fbf5; border:1px solid var(--line); border-radius:999px; padding:6px 12px;
+    }
+    .device strong { color:#111827; letter-spacing:.8px; }
+    .tabs { display:flex; justify-content:center; gap:38px; margin:8px 0 18px; }
+    .tab {
+      border:0; background:none; padding:0 0 8px; font-size:32px; font-weight:600; color:#6b7280; cursor:pointer;
+      border-bottom:3px solid transparent;
+    }
+    .tab.active { color:#111827; border-bottom-color:var(--brand); }
+    .panel { display:none; }
+    .panel.active { display:block; }
+    label { display:block; margin:0 0 8px; font-size:13px; color:#344054; font-weight:600; }
+    .field { margin-bottom:18px; }
+    input {
+      width:100%; border:1px solid var(--line); border-radius:12px; padding:13px 14px;
+      font-size:16px; outline:none; background:#fff;
+    }
+    input:focus { border-color:#86efac; box-shadow:0 0 0 3px rgba(34,197,94,.16); }
+    .row {
+      display:flex; justify-content:space-between; align-items:center; margin:8px 0 12px;
+      font-size:15px; color:var(--muted);
+    }
+    .row a, .switch-link { color:var(--brand); text-decoration:none; cursor:pointer; font-weight:600; }
+    .primary {
+      width:100%; border:0; border-radius:12px; background:var(--brand); color:#fff;
+      font-size:18px; font-weight:700; padding:13px 14px; cursor:pointer;
+    }
+    .primary:hover { background:var(--brandHover); }
+    .divider {
+      display:flex; align-items:center; gap:14px; color:#6b7280; margin:20px 0 14px; font-weight:600;
+    }
+    .divider::before, .divider::after { content:""; flex:1; height:1px; background:var(--line); }
+    .oauth-btn {
+      width:100%; display:flex; align-items:center; justify-content:center; gap:10px;
+      border:1px solid var(--line); border-radius:12px; background:#fff; color:#111827;
+      padding:12px 14px; font-size:17px; font-weight:600; cursor:pointer;
+    }
+    .oauth-btn + .oauth-btn { margin-top:12px; }
+    .oauth-btn:hover { background:#f7fff9; border-color:#b7ebca; }
+    .subtle { margin-top:10px; font-size:12px; color:var(--muted); text-align:center; }
+    .clerk-mount {
+      display:none; margin-top:12px; min-height:240px; border:1px dashed var(--line);
+      border-radius:12px; padding:8px; background:#f7fff9;
+    }
     .status { margin-top:14px; padding:10px 12px; border-radius:10px; font-size:14px; display:none; white-space:pre-wrap; }
     .ok { display:block; background:#ecfdf3; border:1px solid #a6f4c5; color:#085f2d; }
     .err { display:block; background:#fef3f2; border:1px solid #fecaca; color:var(--err); }
+    details.advanced { margin-top:14px; }
+    details.advanced summary { cursor:pointer; color:var(--muted); font-size:12px; }
+    .deny-wrap { margin-top:14px; text-align:center; }
+    .deny-btn {
+      border:0; background:#e8f4ec; color:#2f4f3d; border-radius:10px; padding:9px 12px; cursor:pointer; font-weight:600;
+    }
+    .deny-btn:hover { background:#dcefe3; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1 class="title">Connect Clawtalk to your Agent</h1>
-      <p class="sub">Finish sign-in or sign-up here to authorize your local OpenClaw device.</p>
-      <div>Device code: <span class="code">${code}</span></div>
-      <div class="grid">
-        <div class="pane">
-          <h3>Login</h3>
-          <label>Email</label>
-          <input id="loginEmail" type="email" placeholder="you@example.com" />
-          <label>Password</label>
-          <input id="loginPassword" type="password" placeholder="Your password" />
-          <button onclick="submitAuth('login')">Login and authorize</button>
-        </div>
-        <div class="pane">
-          <h3>Register</h3>
-          <label>Email</label>
-          <input id="registerEmail" type="email" placeholder="you@example.com" />
-          <label>Password</label>
-          <input id="registerPassword" type="password" placeholder="At least 6 chars, 1 lower + 1 upper" />
-          <button onclick="submitAuth('register')">Register and authorize</button>
-        </div>
-      </div>
-      <button style="margin-top:16px;background:#455a4c" onclick="denyAuth()">Deny this request</button>
-      <div id="status" class="status"></div>
+  <div class="card">
+    <div class="header">
+      <h1 class="title">Clawtalk</h1>
+      <div class="device">Device Code <strong>${code}</strong></div>
     </div>
+
+    <div class="tabs">
+      <button id="tabLogin" class="tab active" onclick="setMode('login')">Login</button>
+      <button id="tabRegister" class="tab" onclick="setMode('register')">Register</button>
+    </div>
+
+    <div id="panelLogin" class="panel active">
+      <div class="field">
+        <label>Email</label>
+        <input id="loginEmail" type="email" placeholder="you@example.com" />
+      </div>
+      <div class="field">
+        <div class="row" style="margin:0 0 8px;">
+          <label style="margin:0;">Password</label>
+          <a href="javascript:void(0)" onclick="requestPasswordReset()">Forgot password</a>
+        </div>
+        <input id="loginPassword" type="password" placeholder="Enter your password" />
+      </div>
+      <div class="row">
+        <span>No account yet?</span>
+        <span class="switch-link" onclick="setMode('register')">Create one</span>
+      </div>
+      <button class="primary" onclick="submitAuth('login')">Login</button>
+    </div>
+
+    <div id="panelRegister" class="panel">
+      <div class="field">
+        <label>Email</label>
+        <input id="registerEmail" type="email" placeholder="you@example.com" />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input id="registerPassword" type="password" placeholder="At least 6 chars, 1 lower + 1 upper" />
+      </div>
+      <div class="row">
+        <span>Already have an account?</span>
+        <span class="switch-link" onclick="setMode('login')">Go login</span>
+      </div>
+      <button class="primary" onclick="submitAuth('register')">Create account</button>
+    </div>
+
+    <div class="divider">OR</div>
+    ${clerkEnabled
+      ? `<button class="oauth-btn" id="startClerkBtn" onclick="startClerkAuth()">
+          <span style="font-size:18px;">G</span>
+          Continue with Google / SSO
+        </button>
+        ${clerkConfigured ? '' : '<div class="subtle" style="color:#b42318;">Third-party sign-in is temporarily unavailable.</div>'}
+        <div id="clerkMount" class="clerk-mount"></div>
+        <button class="oauth-btn" id="finishClerkBtn" style="display:none;" onclick="finishClerkLogin()">Finish Sign-In</button>`
+      : ''}
+    <div class="subtle">After sign-in, this device will be authorized automatically.</div>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      ${clerkEnabled
+        ? `<div class="field" style="margin-top:8px;">
+            <label>Session Token (manual fallback)</label>
+            <input id="clerkToken" type="password" placeholder="Paste session token" />
+            <button class="oauth-btn" style="margin-top:8px;" onclick="submitClerk()">Authorize with token</button>
+          </div>`
+        : '<div class="subtle" style="text-align:left;">Third-party sign-in is disabled.</div>'}
+    </details>
+
+    <div class="deny-wrap">
+      <button class="deny-btn" onclick="denyAuth()">Deny this request</button>
+    </div>
+    
+    <div>
+      <div id="status" class="status"></div>
+    </div>  
   </div>
+  ${clerkScriptTag}
   <script>
     const USER_CODE = ${JSON.stringify(userCode)};
     const API_BASE = ${JSON.stringify(apiBase)};
+    const CLERK_ENABLED = ${JSON.stringify(clerkEnabled)};
+    const CLERK_PUBLISHABLE_KEY = ${JSON.stringify(publishableKey)};
+    let clerkInstance = null;
+    let clerkAutoSubmitDone = false;
+    let clerkAutoPollTimer = null;
+    function setMode(mode){
+      const loginTab = document.getElementById('tabLogin');
+      const registerTab = document.getElementById('tabRegister');
+      const loginPanel = document.getElementById('panelLogin');
+      const registerPanel = document.getElementById('panelRegister');
+      const isLogin = mode === 'login';
+      if(loginTab) loginTab.classList.toggle('active', isLogin);
+      if(registerTab) registerTab.classList.toggle('active', !isLogin);
+      if(loginPanel) loginPanel.classList.toggle('active', isLogin);
+      if(registerPanel) registerPanel.classList.toggle('active', !isLogin);
+    }
     function setStatus(msg, ok){
       const el = document.getElementById('status');
       el.className = 'status ' + (ok ? 'ok' : 'err');
       el.textContent = msg;
     }
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     async function submitAuth(mode){
       const email = (document.getElementById(mode + 'Email').value || '').trim();
       const password = (document.getElementById(mode + 'Password').value || '').trim();
@@ -159,6 +380,21 @@ function renderDeviceAuthPage(userCode: string, baseApiUrl: string): string {
         setStatus('Success. You can return to OpenClaw now. This page can be closed.', true);
       }catch(e){ setStatus('Network error. Please retry.', false); }
     }
+
+    async function requestPasswordReset(){
+      const email = (document.getElementById('loginEmail').value || '').trim();
+      if(!email){ setStatus('Please input your email first.', false); return; }
+      try {
+        const res = await fetch(API_BASE + '/api/v1/auth/owner/password/forgot', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json().catch(() => ({}));
+        if(!res.ok){ setStatus(data.error || 'Failed to request password reset.', false); return; }
+        setStatus(data.message || 'If this email exists, reset instructions were sent.');
+      } catch(e){ setStatus('Network error while requesting password reset.', false); }
+    }
     async function denyAuth(){
       try{
         const res = await fetch(API_BASE + '/api/v1/auth/device/authorize/deny', {
@@ -171,6 +407,130 @@ function renderDeviceAuthPage(userCode: string, baseApiUrl: string): string {
         setStatus('Request denied. You can close this page.', true);
       }catch(e){ setStatus('Network error. Please retry.', false); }
     }
+    async function submitClerk(){
+      const clerkToken = (document.getElementById('clerkToken')?.value || '').trim();
+      if(!clerkToken){ setStatus('Please paste Clerk session token.', false); return; }
+      await submitClerkWithToken(clerkToken);
+    }
+    async function submitClerkWithToken(clerkToken){
+      try{
+        const res = await fetch(API_BASE + '/api/v1/auth/device/authorize/clerk', {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body: JSON.stringify({ user_code: USER_CODE, clerk_token: clerkToken })
+        });
+        const data = await res.json().catch(()=>({}));
+        if(!res.ok){ setStatus(data.error || 'Clerk authorization failed.', false); return; }
+        setStatus('Success. You can return to OpenClaw now. This page can be closed.', true);
+      }catch(e){ setStatus('Network error. Please retry.', false); }
+    }
+    async function getClerkInstance(){
+      if(!CLERK_ENABLED){ throw new Error('Clerk is disabled on this deployment.'); }
+      if(!CLERK_PUBLISHABLE_KEY){ throw new Error('CLERK_PUBLISHABLE_KEY is not configured on server.'); }
+      if(clerkInstance){ return clerkInstance; }
+      for(let i=0;i<25;i++){
+        if(window.Clerk){ break; }
+        await sleep(200);
+      }
+      if(!window.Clerk){
+        throw new Error('Clerk script failed to load. Try again, or use the legacy email/password fallback.');
+      }
+      if(typeof window.Clerk.load === 'function'){
+        await window.Clerk.load({
+          publishableKey: CLERK_PUBLISHABLE_KEY,
+          signInFallbackRedirectUrl: window.location.href,
+          signUpFallbackRedirectUrl: window.location.href,
+          signInForceRedirectUrl: window.location.href,
+          signUpForceRedirectUrl: window.location.href,
+        });
+        clerkInstance = window.Clerk;
+        return clerkInstance;
+      }
+      if(typeof window.Clerk === 'function'){
+        const inst = new window.Clerk(CLERK_PUBLISHABLE_KEY);
+        await inst.load();
+        clerkInstance = inst;
+        return clerkInstance;
+      }
+      throw new Error('Unsupported Clerk runtime in browser.');
+    }
+    async function tryReadClerkTokenOnce(){
+      const clerk = await getClerkInstance();
+      if(!clerk?.session || typeof clerk.session.getToken !== 'function'){
+        return '';
+      }
+      const token = await clerk.session.getToken();
+      return (token || '').trim();
+    }
+    function startClerkAutoPolling(){
+      if(clerkAutoPollTimer){ return; }
+      clerkAutoPollTimer = setInterval(async () => {
+        if(clerkAutoSubmitDone){ clearInterval(clerkAutoPollTimer); clerkAutoPollTimer = null; return; }
+        try{
+          const token = await tryReadClerkTokenOnce();
+          if(token){
+            clerkAutoSubmitDone = true;
+            clearInterval(clerkAutoPollTimer);
+            clerkAutoPollTimer = null;
+            await submitClerkWithToken(token);
+          }
+        }catch(_e){
+          // Keep polling while user is still signing in.
+        }
+      }, 1500);
+    }
+    async function startClerkAuth(){
+      try{
+        const mount = document.getElementById('clerkMount');
+        const finishBtn = document.getElementById('finishClerkBtn');
+        const clerk = await getClerkInstance();
+        if(mount){
+          mount.style.display = 'block';
+          if(typeof clerk.mountSignIn === 'function'){
+            clerk.mountSignIn(mount, {
+              signInFallbackRedirectUrl: window.location.href,
+              signUpFallbackRedirectUrl: window.location.href,
+              signInForceRedirectUrl: window.location.href,
+              signUpForceRedirectUrl: window.location.href,
+            });
+          } else if (typeof clerk.openSignIn === 'function') {
+            await clerk.openSignIn({
+              signInFallbackRedirectUrl: window.location.href,
+              signUpFallbackRedirectUrl: window.location.href,
+              signInForceRedirectUrl: window.location.href,
+              signUpForceRedirectUrl: window.location.href,
+            });
+          }
+        }
+        if(finishBtn){ finishBtn.style.display = 'inline-block'; }
+        setStatus('Complete sign-in in the popup/panel. We will auto-finish authorization.', true);
+        startClerkAutoPolling();
+      }catch(e){
+        setStatus(e?.message || 'Failed to start third-party sign-in.', false);
+      }
+    }
+    async function finishClerkLogin(){
+      try{
+        const token = await tryReadClerkTokenOnce();
+        if(!token){
+          setStatus('Clerk session not ready yet. Please finish sign-in first.', false);
+          return;
+        }
+        await submitClerkWithToken(token);
+      }catch(e){
+        setStatus(e?.message || 'Failed to finish Clerk login.', false);
+      }
+    }
+    async function initClerkState(){
+      if(!CLERK_ENABLED || !CLERK_PUBLISHABLE_KEY){ return; }
+      try{
+        await getClerkInstance();
+        startClerkAutoPolling();
+      }catch(_e){
+        // User can still use email/password flow.
+      }
+    }
+    initClerkState();
   </script>
 </body>
 </html>`;
@@ -191,8 +551,18 @@ export async function authRoutes(fastify: FastifyInstance) {
         return false;
     };
 
+    const ensureOwnerVerifiedForAgentActions = async (request: any, reply: any): Promise<boolean> => {
+        if (!config.ownerRequireEmailVerified) return true;
+        const owner = await getOwnerProfile(request.ownerId!);
+        if (owner.email_verified_at) return true;
+        reply.code(403).send({
+            error: 'Email not verified. Please verify your owner email before managing agents.',
+        });
+        return false;
+    };
+
     fastify.post('/device/start', {
-        config: authRateLimitConfig,
+        config: deviceStartRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -242,7 +612,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     fastify.post('/device/token', {
-        config: authRateLimitConfig,
+        config: deviceTokenRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -288,11 +658,17 @@ export async function authRoutes(fastify: FastifyInstance) {
         const query = request.query as { user_code?: string };
         const userCode = (query.user_code || '').trim().toUpperCase();
         const base = resolvePublicBase(request);
-        return reply.type('text/html; charset=utf-8').send(renderDeviceAuthPage(userCode, base));
+        return reply.type('text/html; charset=utf-8').send(renderDeviceAuthPage(
+            userCode,
+            base,
+            config.clerkEnabled,
+            config.clerkPublishableKey,
+            config.clerkIssuer
+        ));
     });
 
     fastify.post('/device/authorize/login', {
-        config: authRateLimitConfig,
+        config: deviceAuthorizeRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -339,7 +715,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     fastify.post('/device/authorize/register', {
-        config: authRateLimitConfig,
+        config: deviceAuthorizeRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -375,7 +751,53 @@ export async function authRoutes(fastify: FastifyInstance) {
             return reply.send({
                 ok: true,
                 owner_email: result.owner.email,
-                message: 'Registration successful. Device authorization approved.',
+                owner_email_verified: !!result.owner.email_verified_at,
+                message: result.owner.email_verified_at
+                    ? 'Registration successful. Device authorization approved.'
+                    : 'Registration successful. Please verify your email before completing login on device.',
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/device/authorize/clerk', {
+        config: deviceAuthorizeRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                required: ['user_code', 'clerk_token'],
+                properties: {
+                    user_code: { type: 'string', minLength: 6, maxLength: 32 },
+                    clerk_token: { type: 'string', minLength: 16, maxLength: 8192 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { user_code, clerk_token } = request.body as {
+                user_code: string;
+                clerk_token: string;
+            };
+            const result = await authorizeOwnerDeviceAuthWithClerk({
+                userCode: user_code,
+                clerkToken: clerk_token,
+            });
+            await writeAuditLog({
+                action: 'auth.owner_device_approve_clerk',
+                resourceType: 'owner',
+                resourceId: result.owner.id,
+                metadata: { owner_email: result.owner.email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                owner_email: result.owner.email,
+                message: 'Clerk authorization approved. You can return to OpenClaw.',
             });
         } catch (err) {
             if (err instanceof AuthError) {
@@ -386,7 +808,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     fastify.post('/device/authorize/deny', {
-        config: authRateLimitConfig,
+        config: deviceAuthorizeRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -417,7 +839,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     fastify.get('/device/status', {
-        config: authRateLimitConfig,
+        config: deviceAuthorizeRateLimitConfig,
         schema: {
             querystring: {
                 type: 'object',
@@ -442,7 +864,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     // ── Owner account routes (human identity layer) ───────────────────────────
     fastify.post('/owner/register', {
-        config: authRateLimitConfig,
+        config: ownerCredentialRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -476,6 +898,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 owner_token: result.token,
                 session_id: result.session_id,
                 expires_at: result.expires_at,
+                email_verification: result.email_verification,
             });
         } catch (err: any) {
             if (err instanceof AuthError) {
@@ -489,7 +912,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     fastify.post('/owner/login', {
-        config: authRateLimitConfig,
+        config: ownerCredentialRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -532,9 +955,231 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
     });
 
+    fastify.post('/owner/clerk/exchange', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                required: ['clerk_token'],
+                properties: {
+                    clerk_token: { type: 'string', minLength: 16, maxLength: 8192 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { clerk_token } = request.body as { clerk_token: string };
+            const result = await loginOwnerWithClerk(clerk_token, {
+                issuedVia: 'login',
+                sessionLabel: request.headers['x-device-label'] as string | undefined,
+                channel: 'owner_api',
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string | undefined,
+            });
+            await writeAuditLog({
+                action: 'auth.owner_login_clerk',
+                resourceType: 'owner',
+                resourceId: result.owner.id,
+                metadata: { owner_email: result.owner.email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                owner: result.owner,
+                owner_token: result.token,
+                session_id: result.session_id,
+                expires_at: result.expires_at,
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/owner/password/forgot', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                required: ['email'],
+                properties: {
+                    email: { type: 'string', minLength: 5, maxLength: 320, pattern: EMAIL_PATTERN },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { email } = request.body as { email: string };
+            const result = await requestOwnerPasswordReset(email, {
+                requestIp: request.ip,
+                userAgent: request.headers['user-agent'] as string | undefined,
+            });
+            await writeAuditLog({
+                action: 'auth.owner_password_forgot',
+                resourceType: 'owner',
+                metadata: { email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                sent: result.sent,
+                message: 'If this email exists, reset instructions were sent.',
+                ...(config.nodeEnv !== 'production' && result.reset_url ? { reset_url: result.reset_url } : {}),
+                ...(config.nodeEnv !== 'production' && result.debug_token ? { debug_token: result.debug_token } : {}),
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/owner/password/reset', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                required: ['token', 'password'],
+                properties: {
+                    token: { type: 'string', minLength: 16, maxLength: 512 },
+                    password: { type: 'string', minLength: 6, maxLength: 128 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { token, password } = request.body as { token: string; password: string };
+            const result = await resetOwnerPasswordByToken(token, password);
+            await writeAuditLog({
+                action: 'auth.owner_password_reset',
+                resourceType: 'owner',
+                resourceId: result.owner.id,
+                metadata: { owner_email: result.owner.email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                owner: result.owner,
+                message: 'Password reset complete. Please login again.',
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/owner/verify-email/request', {
+        preHandler: [authenticateOwner],
+        config: ownerActionRateLimitConfig,
+    }, async (request, reply) => {
+        try {
+            const result = await requestOwnerEmailVerification(request.ownerId!, {
+                requestIp: request.ip,
+                userAgent: request.headers['user-agent'] as string | undefined,
+            });
+            await writeAuditLog({
+                action: 'auth.owner_verify_email_request',
+                resourceType: 'owner',
+                resourceId: request.ownerId!,
+                metadata: { sent: result.sent },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                ...result,
+                ...(config.nodeEnv !== 'production' && result.verify_url ? { verify_url: result.verify_url } : {}),
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.get('/owner/verify-email/confirm', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            querystring: {
+                type: 'object',
+                required: ['token'],
+                properties: {
+                    token: { type: 'string', minLength: 16, maxLength: 512 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { token } = request.query as { token: string };
+            const result = await verifyOwnerEmailByToken(token);
+            await writeAuditLog({
+                action: 'auth.owner_verify_email_confirm',
+                resourceType: 'owner',
+                resourceId: result.owner.id,
+                metadata: { owner_email: result.owner.email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                owner: result.owner,
+                message: 'Email verified successfully.',
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/owner/verify-email/confirm', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                required: ['token'],
+                properties: {
+                    token: { type: 'string', minLength: 16, maxLength: 512 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { token } = request.body as { token: string };
+            const result = await verifyOwnerEmailByToken(token);
+            await writeAuditLog({
+                action: 'auth.owner_verify_email_confirm',
+                resourceType: 'owner',
+                resourceId: result.owner.id,
+                metadata: { owner_email: result.owner.email },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({
+                ok: true,
+                owner: result.owner,
+                message: 'Email verified successfully.',
+            });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
     fastify.post('/owner/rotate-token', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
     }, async (request, reply) => {
         try {
             const result = await rotateOwnerToken(request.ownerId!, {
@@ -606,7 +1251,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     fastify.post('/owner/logout', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
     }, async (request, reply) => {
         try {
             const sessionId = request.ownerSessionId;
@@ -635,7 +1280,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     fastify.post('/owner/sessions/revoke', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -672,7 +1317,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     fastify.post('/owner/agents/create', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -686,6 +1331,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             },
         },
     }, async (request, reply) => {
+        if (!(await ensureOwnerVerifiedForAgentActions(request, reply))) return;
         try {
             const {
                 agent_name,
@@ -694,7 +1340,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 friend_zone_visibility,
             } = request.body as {
                 agent_name: string;
-                password: string;
+                password?: string;
                 friend_zone_enabled?: boolean;
                 friend_zone_visibility?: 'friends' | 'public';
             };
@@ -735,7 +1381,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     fastify.post('/owner/agents/bind', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -747,6 +1393,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             },
         },
     }, async (request, reply) => {
+        if (!(await ensureOwnerVerifiedForAgentActions(request, reply))) return;
         try {
             const { agent_name, password } = request.body as { agent_name: string; password: string };
             const result = await bindAgentToOwner(request.ownerId!, agent_name, password);
@@ -780,7 +1427,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     fastify.post('/owner/agents/switch', {
         preHandler: [authenticateOwner],
-        config: authRateLimitConfig,
+        config: ownerActionRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -795,6 +1442,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             },
         },
     }, async (request, reply) => {
+        if (!(await ensureOwnerVerifiedForAgentActions(request, reply))) return;
         try {
             const { agent_name, claw_id } = request.body as {
                 agent_name?: string;
@@ -835,7 +1483,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     // POST /api/v1/auth/register
     fastify.post('/register', {
-        config: authRateLimitConfig,
+        config: agentCredentialRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -901,7 +1549,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     // POST /api/v1/auth/login
     fastify.post('/login', {
-        config: authRateLimitConfig,
+        config: agentCredentialRateLimitConfig,
         schema: {
             body: {
                 type: 'object',
@@ -997,7 +1645,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     // POST /api/v1/auth/rotate-token
     fastify.post('/rotate-token', {
         preHandler: [authenticate],
-        config: authRateLimitConfig,
+        config: agentActionRateLimitConfig,
     }, async (request, reply) => {
         const agentId = request.agentId!;
         const result = await rotateToken(agentId);
@@ -1018,7 +1666,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     // Issue short-lived WebSocket token to avoid exposing access token in URL params.
     fastify.post('/ws-token', {
         preHandler: [authenticate],
-        config: authRateLimitConfig,
+        config: agentActionRateLimitConfig,
     }, async (request, reply) => {
         const result = await createWsToken(request.agentId!);
         return reply.send(result);

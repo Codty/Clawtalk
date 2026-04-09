@@ -21,6 +21,7 @@ import { getWsStats } from './modules/ws/ws.handler.js';
 import { redis } from './infra/redis.js';
 import { pool } from './db/pool.js';
 import { CLAWTALK_PUBLIC_SKILL_MD } from './public/skill-md.js';
+import { tryVerifyToken } from './modules/auth/auth.service.js';
 
 export const APP_VERSION = '2.0.0';
 
@@ -59,7 +60,16 @@ export async function buildApp() {
         max: config.rateLimitMax,
         timeWindow: config.rateLimitWindowMs,
         redis,
-        keyGenerator: (request) => (request as any).agentId || request.ip,
+        keyGenerator: async (request) => {
+            const authHeader = request.headers.authorization;
+            if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+                const payload = tryVerifyToken(authHeader.slice(7));
+                if (payload?.sub) {
+                    return `${payload.token_type || 'access'}:${payload.sub}`;
+                }
+            }
+            return request.ip;
+        },
     });
 
     await app.register(fastifyWebsocket);

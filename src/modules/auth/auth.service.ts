@@ -1,9 +1,11 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createHash, randomBytes } from 'crypto';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { pool } from '../../db/pool.js';
 import { config } from '../../config.js';
 import { redis } from '../../infra/redis.js';
+import { sendEmail } from '../../infra/email.js';
 
 export interface AgentPayload {
     id: string;
@@ -27,6 +29,7 @@ export interface OwnerPayload {
     id: string;
     email: string;
     token_version: number;
+    email_verified_at?: string | null;
 }
 
 export interface OwnerAccessSession {
@@ -84,6 +87,10 @@ export interface OwnerDeviceAuthStartResult extends OwnerDeviceAuthSessionPublic
 
 type OwnerDeviceAuthStatus = 'pending' | 'approved' | 'denied' | 'exchanged' | 'expired';
 type Queryable = { query: (text: string, params?: any[]) => Promise<{ rows: any[]; rowCount?: number }> };
+type ClerkIdentity = {
+    subject: string;
+    email: string;
+};
 
 const USERNAME_REGEX = /^(?!.*[._-]{2})[a-z][a-z0-9._-]{2,22}[a-z0-9]$/;
 const PASSWORD_LOWER_REGEX = /[a-z]/;
@@ -133,6 +140,40 @@ function validatePassword(password: string): void {
     }
 }
 
+function toIsoOrNull(value: any): string | null {
+    if (!value) return null;
+    const ts = new Date(value).getTime();
+    if (!Number.isFinite(ts)) return null;
+    return new Date(ts).toISOString();
+}
+
+function mapOwnerPayload(row: any): OwnerPayload {
+    return {
+        id: row.id,
+        email: row.email,
+        token_version: row.token_version,
+        email_verified_at: toIsoOrNull(row.email_verified_at),
+    };
+}
+
+function assertOwnerEmailVerified(owner: OwnerPayload): void {
+    if (!config.ownerRequireEmailVerified) return;
+    if (owner.email_verified_at) return;
+    throw new AuthError('Email not verified. Please verify your email before logging in.', 403);
+}
+
+function buildOwnerVerificationUrl(token: string): string | null {
+    const base = (config.publicWebBaseUrl || config.publicBaseUrl || '').trim().replace(/\/+$/, '');
+    if (!base) return null;
+    return `${base}/api/v1/auth/owner/verify-email/confirm?token=${encodeURIComponent(token)}`;
+}
+
+function buildOwnerPasswordResetUrl(token: string): string | null {
+    const base = (config.publicWebBaseUrl || config.publicBaseUrl || '').trim().replace(/\/+$/, '');
+    if (!base) return null;
+    return `${base}/reset-password?token=${encodeURIComponent(token)}`;
+}
+
 function hashDeviceCode(deviceCode: string): string {
     return createHash('sha256').update(deviceCode).digest('hex');
 }
@@ -176,6 +217,79 @@ function generateClaimCode(length = 8): string {
 function generateManagedAgentPassword(): string {
     // Hidden owner-managed credential for compatibility with legacy agent login.
     return `Aa${randomBytes(24).toString('base64url')}`;
+}
+
+function generateManagedOwnerPassword(): string {
+    // Hidden owner-managed credential for third-party identity providers.
+    return `Aa${randomBytes(24).toString('base64url')}`;
+}
+
+function generateOpaqueToken(): string {
+    return randomBytes(32).toString('hex');
+}
+
+function hashOpaqueToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+}
+
+let clerkRemoteJwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+function getClerkJwks() {
+    if (!config.clerkJwksUrl) {
+        throw new AuthError('CLERK_JWKS_URL is not configured', 500);
+    }
+    if (!clerkRemoteJwks) {
+        clerkRemoteJwks = createRemoteJWKSet(new URL(config.clerkJwksUrl));
+    }
+    return clerkRemoteJwks;
+}
+
+function extractEmailFromClerkPayload(payload: Record<string, unknown>): string {
+    const candidates = [
+        payload.email,
+        payload.email_address,
+        payload.primary_email_address,
+    ];
+    for (const value of candidates) {
+        if (typeof value === 'string' && EMAIL_REGEX.test(value.trim().toLowerCase())) {
+            return value.trim().toLowerCase();
+        }
+    }
+    throw new AuthError('Clerk token is missing email claim', 400);
+}
+
+async function verifyClerkIdentityToken(clerkTokenRaw: string): Promise<ClerkIdentity> {
+    if (!config.clerkEnabled) {
+        throw new AuthError('Clerk auth is disabled on this deployment', 503);
+    }
+    if (!config.clerkIssuer) {
+        throw new AuthError('CLERK_ISSUER is not configured', 500);
+    }
+
+    const clerkToken = (clerkTokenRaw || '').trim();
+    if (!clerkToken) {
+        throw new AuthError('clerk_token is required', 400);
+    }
+
+    try {
+        const { payload } = await jwtVerify(clerkToken, getClerkJwks(), {
+            issuer: config.clerkIssuer,
+            audience: config.clerkAudience || undefined,
+        });
+        if (!payload.sub) {
+            throw new AuthError('Clerk token missing subject', 400);
+        }
+        const email = extractEmailFromClerkPayload(payload as Record<string, unknown>);
+        return {
+            subject: String(payload.sub),
+            email,
+        };
+    } catch (err: any) {
+        if (err instanceof AuthError) {
+            throw err;
+        }
+        throw new AuthError('Invalid Clerk token', 401);
+    }
 }
 
 function parseDurationSeconds(value: string | undefined, fallbackSec: number): number {
@@ -438,10 +552,10 @@ async function createOwnerAccountRecord(
     const { rows } = await db.query(
         `INSERT INTO owners (email, password_hash)
          VALUES ($1, $2)
-         RETURNING id, email, token_version`,
+         RETURNING id, email, token_version, email_verified_at`,
         [normalizedEmail, hash]
     );
-    return rows[0] as OwnerPayload;
+    return mapOwnerPayload(rows[0]);
 }
 
 async function authenticateOwnerAccount(
@@ -457,7 +571,7 @@ async function authenticateOwnerAccount(
     validateOwnerEmail(normalizedEmail);
 
     const { rows } = await db.query(
-        `SELECT id, email, password_hash, token_version, is_disabled
+        `SELECT id, email, password_hash, token_version, is_disabled, email_verified_at
          FROM owners
          WHERE LOWER(email) = LOWER($1)`,
         [normalizedEmail]
@@ -486,25 +600,134 @@ async function authenticateOwnerAccount(
         );
     }
 
-    return {
-        id: owner.id,
-        email: owner.email,
-        token_version: owner.token_version,
-    };
+    return mapOwnerPayload(owner);
+}
+
+async function resolveOwnerByClerkIdentity(identity: ClerkIdentity): Promise<OwnerPayload> {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const byIdentity = await client.query(
+            `SELECT o.id, o.email, o.token_version, o.is_disabled, o.email_verified_at
+             FROM owner_identities oi
+             JOIN owners o ON o.id = oi.owner_id
+             WHERE oi.provider = 'clerk'
+               AND oi.provider_subject = $1
+             FOR UPDATE`,
+            [identity.subject]
+        );
+        if (byIdentity.rows.length > 0) {
+            const row = byIdentity.rows[0];
+            if (row.is_disabled) {
+                throw new AuthError('Owner account disabled', 403);
+            }
+            await client.query(
+                `UPDATE owners
+                 SET last_login_at = NOW(),
+                     email_verified_at = COALESCE(email_verified_at, NOW()),
+                     updated_at = NOW()
+                 WHERE id = $1`,
+                [row.id]
+            );
+            await client.query(
+                `UPDATE owner_identities
+                 SET provider_email = $3
+                 WHERE provider = 'clerk'
+                   AND provider_subject = $2
+                   AND owner_id = $1`,
+                [row.id, identity.subject, identity.email]
+            );
+            await client.query('COMMIT');
+            return mapOwnerPayload({
+                ...row,
+                email_verified_at: row.email_verified_at || new Date().toISOString(),
+            });
+        }
+
+        let ownerRow: any;
+        const byEmail = await client.query(
+            `SELECT id, email, token_version, is_disabled, email_verified_at
+             FROM owners
+             WHERE LOWER(email) = LOWER($1)
+             FOR UPDATE`,
+            [identity.email]
+        );
+        if (byEmail.rows.length > 0) {
+            ownerRow = byEmail.rows[0];
+            if (ownerRow.is_disabled) {
+                throw new AuthError('Owner account disabled', 403);
+            }
+            await client.query(
+                `UPDATE owners
+                 SET last_login_at = NOW(),
+                     email_verified_at = COALESCE(email_verified_at, NOW()),
+                     updated_at = NOW()
+                 WHERE id = $1`,
+                [ownerRow.id]
+            );
+        } else {
+            const managedPassword = generateManagedOwnerPassword();
+            const hash = await bcrypt.hash(managedPassword, 10);
+            const created = await client.query(
+                `INSERT INTO owners (email, password_hash, last_login_at, email_verified_at)
+                 VALUES ($1, $2, NOW(), NOW())
+                 RETURNING id, email, token_version, is_disabled, email_verified_at`,
+                [identity.email, hash]
+            );
+            ownerRow = created.rows[0];
+        }
+
+        await client.query(
+            `INSERT INTO owner_identities (owner_id, provider, provider_subject, provider_email)
+             VALUES ($1, 'clerk', $2, $3)
+             ON CONFLICT (provider, provider_subject)
+             DO UPDATE SET provider_email = EXCLUDED.provider_email`,
+            [ownerRow.id, identity.subject, identity.email]
+        );
+
+        await client.query('COMMIT');
+        return mapOwnerPayload({
+            ...ownerRow,
+            email_verified_at: ownerRow.email_verified_at || new Date().toISOString(),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
 export async function registerOwner(
     email: string,
     password: string,
     meta: OwnerTokenIssueMeta = { issuedVia: 'register' }
-): Promise<{ owner: OwnerPayload; token: string; session_id: string; expires_at: string }> {
+): Promise<{
+    owner: OwnerPayload;
+    token: string;
+    session_id: string;
+    expires_at: string;
+    email_verification: {
+        already_verified: boolean;
+        sent: boolean;
+        expires_at?: string;
+        verify_url?: string;
+        delivery_message: string;
+    };
+}> {
     const owner = await createOwnerAccountRecord(email, password, pool);
     const issued = await issueOwnerToken(owner, meta);
+    const emailVerification = await requestOwnerEmailVerification(owner.id, {
+        requestIp: meta.ip,
+        userAgent: meta.userAgent,
+    });
     return {
         owner,
         token: issued.token,
         session_id: issued.session_id,
         expires_at: issued.expires_at,
+        email_verification: emailVerification,
     };
 }
 
@@ -517,6 +740,7 @@ export async function loginOwner(
         db: pool,
         updateLastLogin: true,
     });
+    assertOwnerEmailVerified(payload);
     const issued = await issueOwnerToken(payload, meta);
     return {
         owner: payload,
@@ -524,6 +748,303 @@ export async function loginOwner(
         session_id: issued.session_id,
         expires_at: issued.expires_at,
     };
+}
+
+export async function loginOwnerWithClerk(
+    clerkToken: string,
+    meta: OwnerTokenIssueMeta = { issuedVia: 'login' }
+): Promise<{ owner: OwnerPayload; token: string; session_id: string; expires_at: string }> {
+    const identity = await verifyClerkIdentityToken(clerkToken);
+    const owner = await resolveOwnerByClerkIdentity(identity);
+    const issued = await issueOwnerToken(owner, meta);
+    return {
+        owner,
+        token: issued.token,
+        session_id: issued.session_id,
+        expires_at: issued.expires_at,
+    };
+}
+
+async function issueOwnerEmailVerificationToken(
+    owner: OwnerPayload,
+    opts: { db?: Queryable; requestIp?: string; userAgent?: string } = {}
+): Promise<{ token: string; expires_at: string }> {
+    const db = opts.db || pool;
+    const token = generateOpaqueToken();
+    const tokenHash = hashOpaqueToken(token);
+    const requestIp = (opts.requestIp || '').trim().slice(0, 64) || null;
+    const userAgent = (opts.userAgent || '').trim().slice(0, 1024) || null;
+
+    const { rows } = await db.query(
+        `INSERT INTO owner_email_verification_tokens (
+            owner_id, email, token_hash, expires_at, request_ip, user_agent
+         ) VALUES (
+            $1, $2, $3, NOW() + ($4 || ' seconds')::interval, $5, $6
+         )
+         RETURNING expires_at`,
+        [owner.id, owner.email, tokenHash, String(config.ownerEmailVerifyTtlSec), requestIp, userAgent]
+    );
+    return {
+        token,
+        expires_at: new Date(rows[0].expires_at).toISOString(),
+    };
+}
+
+async function issueOwnerPasswordResetToken(
+    owner: OwnerPayload,
+    opts: { db?: Queryable; requestIp?: string; userAgent?: string } = {}
+): Promise<{ token: string; expires_at: string }> {
+    const db = opts.db || pool;
+    const token = generateOpaqueToken();
+    const tokenHash = hashOpaqueToken(token);
+    const requestIp = (opts.requestIp || '').trim().slice(0, 64) || null;
+    const userAgent = (opts.userAgent || '').trim().slice(0, 1024) || null;
+
+    const { rows } = await db.query(
+        `INSERT INTO owner_password_reset_tokens (
+            owner_id, email, token_hash, expires_at, request_ip, user_agent
+         ) VALUES (
+            $1, $2, $3, NOW() + ($4 || ' seconds')::interval, $5, $6
+         )
+         RETURNING expires_at`,
+        [owner.id, owner.email, tokenHash, String(config.ownerPasswordResetTtlSec), requestIp, userAgent]
+    );
+
+    return {
+        token,
+        expires_at: new Date(rows[0].expires_at).toISOString(),
+    };
+}
+
+function buildVerificationEmail(ownerEmail: string, verifyToken: string) {
+    const verifyUrl = buildOwnerVerificationUrl(verifyToken);
+    const subject = 'Verify your Clawtalk account email';
+    const text = verifyUrl
+        ? `Welcome to Clawtalk.\n\nVerify your email by opening this link:\n${verifyUrl}\n\nIf you did not request this, you can ignore this email.`
+        : `Welcome to Clawtalk.\n\nYour verification token is:\n${verifyToken}\n\nAsk your agent to complete email verification with this token.`;
+    const html = verifyUrl
+        ? `<p>Welcome to <strong>Clawtalk</strong>.</p>
+           <p>Please verify your email by clicking the link below:</p>
+           <p><a href="${verifyUrl}">${verifyUrl}</a></p>
+           <p>If you did not request this, you can ignore this email.</p>`
+        : `<p>Welcome to <strong>Clawtalk</strong>.</p>
+           <p>Your verification token is:</p>
+           <pre>${verifyToken}</pre>
+           <p>Ask your agent to complete email verification with this token.</p>`;
+    return {
+        subject,
+        text,
+        html,
+        verify_url: verifyUrl,
+    };
+}
+
+function buildPasswordResetEmail(ownerEmail: string, resetToken: string) {
+    const resetUrl = buildOwnerPasswordResetUrl(resetToken);
+    const subject = 'Reset your Clawtalk account password';
+    const text = resetUrl
+        ? `Reset your Clawtalk password by opening this link:\n${resetUrl}\n\nIf you did not request this, ignore this email.`
+        : `Your Clawtalk password reset token is:\n${resetToken}\n\nUse this token to reset your password.`;
+    const html = resetUrl
+        ? `<p>Reset your Clawtalk password by clicking the link below:</p>
+           <p><a href="${resetUrl}">${resetUrl}</a></p>
+           <p>If you did not request this, ignore this email.</p>`
+        : `<p>Your Clawtalk password reset token is:</p><pre>${resetToken}</pre>`;
+    return {
+        subject,
+        text,
+        html,
+        reset_url: resetUrl,
+    };
+}
+
+export async function requestOwnerEmailVerification(
+    ownerId: string,
+    opts: { requestIp?: string; userAgent?: string } = {}
+): Promise<{ already_verified: boolean; sent: boolean; expires_at?: string; verify_url?: string; delivery_message: string; debug_token?: string }> {
+    const owner = await getOwnerProfile(ownerId);
+    if (owner.email_verified_at) {
+        return {
+            already_verified: true,
+            sent: false,
+            delivery_message: 'Email already verified.',
+        };
+    }
+
+    const issued = await issueOwnerEmailVerificationToken(owner, opts);
+    const template = buildVerificationEmail(owner.email, issued.token);
+    const delivery = await sendEmail({
+        to: owner.email,
+        subject: template.subject,
+        text: template.text,
+        html: template.html,
+    });
+
+    return {
+        already_verified: false,
+        sent: delivery.sent,
+        expires_at: issued.expires_at,
+        verify_url: template.verify_url || undefined,
+        delivery_message: delivery.message,
+        ...(config.nodeEnv !== 'production' ? { debug_token: issued.token } : {}),
+    };
+}
+
+export async function verifyOwnerEmailByToken(tokenRaw: string): Promise<{ owner: OwnerPayload }> {
+    const token = (tokenRaw || '').trim();
+    if (!token) {
+        throw new AuthError('token is required', 400);
+    }
+    const tokenHash = hashOpaqueToken(token);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const found = await client.query(
+            `SELECT t.id, t.owner_id, o.id AS owner_id_ref, o.email, o.token_version, o.email_verified_at
+             FROM owner_email_verification_tokens t
+             JOIN owners o ON o.id = t.owner_id
+             WHERE t.token_hash = $1
+               AND t.used_at IS NULL
+               AND t.expires_at > NOW()
+             FOR UPDATE`,
+            [tokenHash]
+        );
+        if (found.rows.length === 0) {
+            throw new AuthError('Invalid or expired verification token', 400);
+        }
+        const row = found.rows[0];
+        const updatedOwner = await client.query(
+            `UPDATE owners
+             SET email_verified_at = COALESCE(email_verified_at, NOW()),
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING id, email, token_version, email_verified_at`,
+            [row.owner_id]
+        );
+        await client.query(
+            `UPDATE owner_email_verification_tokens
+             SET used_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [row.id]
+        );
+        await client.query('COMMIT');
+        return { owner: mapOwnerPayload(updatedOwner.rows[0]) };
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+export async function requestOwnerPasswordReset(
+    emailRaw: string,
+    opts: { requestIp?: string; userAgent?: string } = {}
+): Promise<{ accepted: true; sent: boolean; reset_url?: string; delivery_message: string; debug_token?: string }> {
+    const email = normalizeOwnerEmail(emailRaw);
+    validateOwnerEmail(email);
+
+    const found = await pool.query(
+        `SELECT id, email, token_version, email_verified_at, is_disabled
+         FROM owners
+         WHERE LOWER(email) = LOWER($1)`,
+        [email]
+    );
+    if (found.rows.length === 0 || found.rows[0].is_disabled) {
+        return {
+            accepted: true,
+            sent: false,
+            delivery_message: 'If this email exists, reset instructions were sent.',
+        };
+    }
+
+    const owner = mapOwnerPayload(found.rows[0]);
+    const issued = await issueOwnerPasswordResetToken(owner, opts);
+    const template = buildPasswordResetEmail(owner.email, issued.token);
+    const delivery = await sendEmail({
+        to: owner.email,
+        subject: template.subject,
+        text: template.text,
+        html: template.html,
+    });
+
+    return {
+        accepted: true,
+        sent: delivery.sent,
+        reset_url: template.reset_url || undefined,
+        delivery_message: delivery.message,
+        ...(config.nodeEnv !== 'production' ? { debug_token: issued.token } : {}),
+    };
+}
+
+export async function resetOwnerPasswordByToken(
+    tokenRaw: string,
+    nextPassword: string
+): Promise<{ owner: OwnerPayload }> {
+    const token = (tokenRaw || '').trim();
+    if (!token) {
+        throw new AuthError('token is required', 400);
+    }
+    validatePassword(nextPassword);
+    const tokenHash = hashOpaqueToken(token);
+    const passwordHash = await bcrypt.hash(nextPassword, 10);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const found = await client.query(
+            `SELECT t.id, t.owner_id
+             FROM owner_password_reset_tokens t
+             WHERE t.token_hash = $1
+               AND t.used_at IS NULL
+               AND t.expires_at > NOW()
+             FOR UPDATE`,
+            [tokenHash]
+        );
+        if (found.rows.length === 0) {
+            throw new AuthError('Invalid or expired reset token', 400);
+        }
+        const row = found.rows[0];
+
+        const ownerUpdated = await client.query(
+            `UPDATE owners
+             SET password_hash = $2,
+                 token_version = token_version + 1,
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING id, email, token_version, email_verified_at`,
+            [row.owner_id, passwordHash]
+        );
+        if (ownerUpdated.rows.length === 0) {
+            throw new AuthError('Owner not found', 404);
+        }
+
+        await client.query(
+            `UPDATE owner_password_reset_tokens
+             SET used_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [row.id]
+        );
+        await client.query(
+            `UPDATE owner_access_sessions
+             SET revoked_at = NOW(),
+                 revoke_reason = COALESCE(revoke_reason, 'password_reset'),
+                 updated_at = NOW()
+             WHERE owner_id = $1
+               AND revoked_at IS NULL`,
+            [row.owner_id]
+        );
+        await client.query('COMMIT');
+        return { owner: mapOwnerPayload(ownerUpdated.rows[0]) };
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
 export async function rotateOwnerToken(
@@ -535,13 +1056,13 @@ export async function rotateOwnerToken(
          SET token_version = token_version + 1,
              updated_at = NOW()
          WHERE id = $1
-         RETURNING id, email, token_version`,
+         RETURNING id, email, token_version, email_verified_at`,
         [ownerId]
     );
     if (rows.length === 0) {
         throw new AuthError('Owner not found', 404);
     }
-    const owner = rows[0] as OwnerPayload;
+    const owner = mapOwnerPayload(rows[0]);
     const issued = await issueOwnerToken(owner, meta);
     return {
         owner,
@@ -553,7 +1074,7 @@ export async function rotateOwnerToken(
 
 export async function getOwnerProfile(ownerId: string): Promise<OwnerPayload> {
     const { rows } = await pool.query(
-        `SELECT id, email, token_version
+        `SELECT id, email, token_version, email_verified_at
          FROM owners
          WHERE id = $1`,
         [ownerId]
@@ -561,7 +1082,7 @@ export async function getOwnerProfile(ownerId: string): Promise<OwnerPayload> {
     if (rows.length === 0) {
         throw new AuthError('Owner not found', 404);
     }
-    return rows[0] as OwnerPayload;
+    return mapOwnerPayload(rows[0]);
 }
 
 function mapOwnerAccessSession(row: any): OwnerAccessSession {
@@ -1014,6 +1535,59 @@ export async function authorizeOwnerDeviceAuth(params: {
                 db: client,
                 updateLastLogin: true,
             });
+            assertOwnerEmailVerified(owner);
+        }
+
+        await updateOwnerDeviceSessionStatus(client, session.id, 'approved', {
+            owner_id: owner.id,
+            approved_at: true,
+        });
+        await client.query('COMMIT');
+        return { owner };
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+export async function authorizeOwnerDeviceAuthWithClerk(params: {
+    userCode: string;
+    clerkToken: string;
+}): Promise<{ owner: OwnerPayload }> {
+    const userCode = normalizeUserCode(params.userCode);
+    if (!userCode || userCode.length < 9) {
+        throw new AuthError('Invalid user code', 400);
+    }
+
+    const identity = await verifyClerkIdentityToken(params.clerkToken);
+    const owner = await resolveOwnerByClerkIdentity(identity);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { rows } = await client.query(
+            `SELECT id, status, expires_at
+             FROM owner_device_auth_sessions
+             WHERE user_code = $1
+             FOR UPDATE`,
+            [userCode]
+        );
+        if (rows.length === 0) {
+            throw new AuthError('User code not found', 404);
+        }
+
+        const session = rows[0];
+        if (session.status === 'denied') throw new AuthError('This request was denied. Start again from your device.', 409);
+        if (session.status === 'exchanged') throw new AuthError('This request is already completed. Start again from your device.', 409);
+        if (session.status === 'approved') throw new AuthError('This request is already approved. Return to your device.', 409);
+        if (session.status === 'expired') throw new AuthError('This request has expired. Start again from your device.', 410);
+
+        const expired = new Date(session.expires_at).getTime() <= Date.now();
+        if (expired) {
+            await updateOwnerDeviceSessionStatus(client, session.id, 'expired');
+            throw new AuthError('This request has expired. Start again from your device.', 410);
         }
 
         await updateOwnerDeviceSessionStatus(client, session.id, 'approved', {
@@ -1109,6 +1683,7 @@ export async function exchangeOwnerDeviceAuthToken(deviceCodeRaw: string): Promi
         if (!session.owner_id) throw new AuthError('Owner is not attached to this device request', 409);
 
         const owner = await getOwnerProfile(session.owner_id);
+        assertOwnerEmailVerified(owner);
         const issued = await issueOwnerToken(owner, {
             issuedVia: 'device',
             sessionLabel: session.device_label || session.client_name || 'owner-device-connect',
@@ -1556,6 +2131,14 @@ export async function clearLoginFailures(agentName: string, ip: string): Promise
 
 export function verifyToken(token: string): TokenPayload {
     return jwt.verify(token, config.jwtSecret) as TokenPayload;
+}
+
+export function tryVerifyToken(token: string): TokenPayload | null {
+    try {
+        return verifyToken(token);
+    } catch {
+        return null;
+    }
 }
 
 export async function validateTokenVersion(payload: TokenPayload): Promise<boolean> {

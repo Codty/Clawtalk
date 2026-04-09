@@ -115,6 +115,31 @@ describe('Auth', () => {
         expect(res.json().owner.email).toBe('owner1@example.com');
         expect(typeof res.json().session_id).toBe('string');
         expect(typeof res.json().expires_at).toBe('string');
+        expect(res.json().email_verification).toBeDefined();
+        expect(typeof res.json().email_verification.delivery_message).toBe('string');
+        expect(typeof res.json().email_verification.debug_token).toBe('string');
+    });
+
+    it('should verify owner email via confirmation token', async () => {
+        const register = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/register',
+            payload: { email: 'owner-verify@example.com', password: 'OwnerPassV' },
+        });
+        expect(register.statusCode).toBe(201);
+        const verifyToken = register.json().email_verification?.debug_token as string;
+        expect(typeof verifyToken).toBe('string');
+        expect(verifyToken.length).toBeGreaterThan(16);
+
+        const verify = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/verify-email/confirm',
+            payload: { token: verifyToken },
+        });
+        expect(verify.statusCode).toBe(200);
+        expect(verify.json().ok).toBe(true);
+        expect(verify.json().owner.email).toBe('owner-verify@example.com');
+        expect(typeof verify.json().owner.email_verified_at).toBe('string');
     });
 
     it('should login owner account and rotate owner token', async () => {
@@ -142,6 +167,59 @@ describe('Auth', () => {
         expect(typeof rotated.json().expires_at).toBe('string');
     });
 
+    it('should support owner password forgot/reset flow', async () => {
+        const register = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/register',
+            payload: { email: 'owner-reset@example.com', password: 'OwnerPassR' },
+        });
+        expect(register.statusCode).toBe(201);
+
+        const forgot = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/password/forgot',
+            payload: { email: 'owner-reset@example.com' },
+        });
+        expect(forgot.statusCode).toBe(200);
+        expect(forgot.json().ok).toBe(true);
+        const resetToken = forgot.json().debug_token as string;
+        expect(typeof resetToken).toBe('string');
+        expect(resetToken.length).toBeGreaterThan(16);
+
+        const reset = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/password/reset',
+            payload: { token: resetToken, password: 'OwnerPassR2' },
+        });
+        expect(reset.statusCode).toBe(200);
+        expect(reset.json().ok).toBe(true);
+
+        const oldLogin = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/login',
+            payload: { email: 'owner-reset@example.com', password: 'OwnerPassR' },
+        });
+        expect(oldLogin.statusCode).toBe(401);
+
+        const newLogin = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/login',
+            payload: { email: 'owner-reset@example.com', password: 'OwnerPassR2' },
+        });
+        expect(newLogin.statusCode).toBe(200);
+        expect(newLogin.json().owner.email).toBe('owner-reset@example.com');
+    });
+
+    it('should expose Clerk exchange endpoint and return disabled when not configured', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/clerk/exchange',
+            payload: { clerk_token: 'mock-clerk-token' },
+        });
+        expect(res.statusCode).toBe(503);
+        expect(res.json().error).toContain('Clerk auth is disabled');
+    });
+
     it('should create owner-managed agent account', async () => {
         const res = await app.inject({
             method: 'POST',
@@ -154,6 +232,26 @@ describe('Auth', () => {
         ownerManagedAgentClawId = res.json().agent.claw_id;
         expect(res.json().agent.agent_name).toBe('owner_agent_01');
         expect(res.json().claim.claim_status).toBe('claimed');
+    });
+
+    it('should not let device-start onboarding traffic exhaust owner action routes', async () => {
+        for (let i = 0; i < 10; i++) {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/v1/auth/device/start',
+                payload: { client_name: `demo-${i}`, device_label: `demo-device-${i}` },
+            });
+            expect(res.statusCode).toBe(200);
+        }
+
+        const switchRes = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/owner/agents/switch',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { agent_name: 'owner_agent_01' },
+        });
+        expect(switchRes.statusCode).toBe(200);
+        expect(switchRes.json().agent.id).toBe(ownerManagedAgentId);
     });
 
     it('should bind existing agent account to owner and list owner agents', async () => {
@@ -333,6 +431,24 @@ describe('Auth', () => {
         });
         expect(exchangedAgain.statusCode).toBe(409);
         expect(exchangedAgain.json().error).toBe('already_used');
+    });
+
+    it('should expose Clerk device approval endpoint and return disabled when not configured', async () => {
+        const start = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/start',
+            payload: { client_name: 'integration-test-clerk' },
+        });
+        expect(start.statusCode).toBe(201);
+        const started = start.json();
+
+        const approve = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/authorize/clerk',
+            payload: { user_code: started.user_code, clerk_token: 'mock-clerk-token' },
+        });
+        expect(approve.statusCode).toBe(503);
+        expect(approve.json().error).toContain('Clerk auth is disabled');
     });
 
     it('should deny owner device authorization request', async () => {
@@ -591,8 +707,8 @@ describe('Message Envelope', () => {
             headers: { authorization: `Bearer ${agentBToken}` },
             payload: { message_ids: [statusLifecycleMessageId] },
         });
-        expect(readCompat.statusCode).toBe(200);
-        expect(readCompat.json().read_count).toBe(0);
+        expect(readCompat.statusCode).toBe(410);
+        expect(readCompat.json().error).toContain('Read receipts are no longer supported');
 
         const statusAfterReadCompat = await app.inject({
             method: 'GET',
@@ -717,24 +833,74 @@ describe('Message Envelope', () => {
         expect(res.json().sender_id).toBe(agentBId);
     });
 
-    it('read endpoint should behave as compatibility no-op', async () => {
+    it('read endpoint should return a deprecation error', async () => {
         const mark = await app.inject({
             method: 'POST',
             url: `/api/v1/conversations/${dmConvId}/messages/read`,
             headers: { authorization: `Bearer ${agentBToken}` },
             payload: { message_ids: [mediaMessageId] },
         });
-        expect(mark.statusCode).toBe(200);
-        expect(mark.json().read_count).toBe(0);
+        expect(mark.statusCode).toBe(410);
+        expect(mark.json().error).toContain('Read receipts are no longer supported');
+    });
 
-        const status = await app.inject({
-            method: 'GET',
-            url: `/api/v1/conversations/${dmConvId}/messages/${mediaMessageId}/status`,
-            headers: { authorization: `Bearer ${agentAToken}` },
-        });
-        expect(status.statusCode).toBe(200);
-        expect(status.json().status).toBe('delivered');
-        expect(status.json().delivered_count).toBeGreaterThanOrEqual(1);
+    it('should keep group history server-backed while DM history becomes local-only', async () => {
+        const { config } = await import('../src/config.js');
+        const originalMode = config.messageStorageMode;
+        config.messageStorageMode = 'local_only';
+
+        try {
+            const group = await app.inject({
+                method: 'POST',
+                url: '/api/v1/conversations/group',
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: { name: 'local-only-group', member_ids: [agentBId] },
+            });
+            expect(group.statusCode).toBe(201);
+            const groupId = group.json().id as string;
+
+            const groupSend = await app.inject({
+                method: 'POST',
+                url: `/api/v1/conversations/${groupId}/messages`,
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: { content: 'group-history-still-server', client_msg_id: 'local-only-group-001' },
+            });
+            expect(groupSend.statusCode).toBe(201);
+
+            const groupHistory = await app.inject({
+                method: 'GET',
+                url: `/api/v1/conversations/${groupId}/messages?limit=20`,
+                headers: { authorization: `Bearer ${agentBToken}` },
+            });
+            expect(groupHistory.statusCode).toBe(200);
+            expect(groupHistory.json().messages.some((m: any) => m.id === groupSend.json().id)).toBe(true);
+
+            const dmSend = await app.inject({
+                method: 'POST',
+                url: `/api/v1/conversations/${dmConvId}/messages`,
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: { content: 'dm-local-only', client_msg_id: 'local-only-dm-001' },
+            });
+            expect(dmSend.statusCode).toBe(201);
+
+            const dmHistory = await app.inject({
+                method: 'GET',
+                url: `/api/v1/conversations/${dmConvId}/messages?limit=20`,
+                headers: { authorization: `Bearer ${agentBToken}` },
+            });
+            expect(dmHistory.statusCode).toBe(200);
+            expect(dmHistory.json().messages).toEqual([]);
+
+            const dmStatus = await app.inject({
+                method: 'GET',
+                url: `/api/v1/conversations/${dmConvId}/messages/${dmSend.json().id}/status`,
+                headers: { authorization: `Bearer ${agentAToken}` },
+            });
+            expect(dmStatus.statusCode).toBe(409);
+            expect(dmStatus.json().error).toContain('MESSAGE_STORAGE_MODE=local_only');
+        } finally {
+            config.messageStorageMode = originalMode;
+        }
     });
 
     it('should allow sender recall message within window', async () => {

@@ -208,7 +208,6 @@ async function markMessagesDeliveredByIds(
     viewerId: string,
     messageIds: string[]
 ): Promise<{ delivered_count: number }> {
-    if (config.messageStorageMode === 'local_only') return { delivered_count: 0 };
     if (!Array.isArray(messageIds) || messageIds.length === 0) return { delivered_count: 0 };
 
     const { rows } = await pool.query(
@@ -353,9 +352,28 @@ async function markSenderFirstMessageFlag(message: MessageRow): Promise<MessageR
     };
 }
 
-function assertServerMessageStorage(featureName: string): void {
-    if (config.messageStorageMode === 'local_only') {
-        throw new MessageError(`${featureName} is unavailable when MESSAGE_STORAGE_MODE=local_only`, 409);
+async function getConversationType(conversationId: string): Promise<'dm' | 'group'> {
+    const { rows } = await pool.query(
+        'SELECT type FROM conversations WHERE id = $1',
+        [conversationId]
+    );
+    if (rows.length === 0) {
+        throw new MessageError('Conversation not found', 404);
+    }
+    return rows[0].type;
+}
+
+async function usesLocalOnlyConversationStorage(conversationId: string): Promise<boolean> {
+    if (config.messageStorageMode !== 'local_only') return false;
+    return (await getConversationType(conversationId)) === 'dm';
+}
+
+async function assertServerMessageStorageForConversation(
+    conversationId: string,
+    featureName: string
+): Promise<void> {
+    if (await usesLocalOnlyConversationStorage(conversationId)) {
+        throw new MessageError(`${featureName} is unavailable when MESSAGE_STORAGE_MODE=local_only for DM conversations`, 409);
     }
 }
 
@@ -399,7 +417,7 @@ export async function sendMessage(
         throw new MessageError('Too many messages. Please slow down.', 429);
     }
 
-    if (config.messageStorageMode === 'local_only') {
+    if (await usesLocalOnlyConversationStorage(conversationId)) {
         const isSenderFirstMessage = await computeLocalOnlyFirstMessage(senderId);
         const message = buildLocalOnlyMessageRow(
             conversationId,
@@ -511,17 +529,13 @@ export async function markMessagesRead(
 ): Promise<{ read_count: number }> {
     await assertMember(conversationId, agentId);
     if (!Array.isArray(messageIds) || messageIds.length === 0) {
-        return { read_count: 0 };
+        throw new MessageError('message_ids is required', 400);
     }
 
-    if (config.messageStorageMode === 'local_only') {
-        return { read_count: 0 };
-    }
-
-    // Compatibility no-op:
-    // The product no longer tracks "read" semantics. We only maintain delivery status.
-    await markMessagesDeliveredByIds(agentId, messageIds);
-    return { read_count: 0 };
+    throw new MessageError(
+        'Read receipts are no longer supported. Use message delivery/status APIs instead.',
+        410
+    );
 }
 
 /**
@@ -533,8 +547,8 @@ export async function recallMessage(
     requesterId: string,
     reason?: string
 ): Promise<MessageRow> {
-    assertServerMessageStorage('Message recall');
     await assertMember(conversationId, requesterId);
+    await assertServerMessageStorageForConversation(conversationId, 'Message recall');
 
     const { rows } = await pool.query(
         `SELECT id, conversation_id, sender_id, created_at, recalled_at, deleted_at
@@ -599,8 +613,8 @@ export async function deleteMessage(
     messageId: string,
     requesterId: string
 ): Promise<void> {
-    assertServerMessageStorage('Message delete');
     await assertMember(conversationId, requesterId);
+    await assertServerMessageStorageForConversation(conversationId, 'Message delete');
     const { rows } = await pool.query(
         `SELECT sender_id, deleted_at
          FROM messages
@@ -647,7 +661,7 @@ export async function getMessages(
     agentId: string,
     options: { before?: string; limit?: number } = {}
 ): Promise<MessageRow[]> {
-    if (config.messageStorageMode === 'local_only') {
+    if (await usesLocalOnlyConversationStorage(conversationId)) {
         await assertMember(conversationId, agentId);
         return [];
     }
@@ -725,8 +739,8 @@ export async function getMessageStatus(
     delivered_count: number;
     delivered_at: string | null;
 }> {
-    assertServerMessageStorage('Message status');
     await assertMember(conversationId, viewerId);
+    await assertServerMessageStorageForConversation(conversationId, 'Message status');
     await markMessagesDeliveredByIds(viewerId, [messageId]);
 
     const { rows } = await pool.query(

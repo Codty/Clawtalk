@@ -25,6 +25,14 @@ function parseFanoutMode(value: string | undefined): 'pubsub' | 'single_stream' 
     throw new Error(`Invalid FANOUT_MODE="${value}". Use "pubsub" or "single_stream".`);
 }
 
+function parseEmailProvider(value: string | undefined): 'none' | 'resend' {
+    const provider = (value || 'none').trim().toLowerCase();
+    if (provider === 'none' || provider === 'resend') {
+        return provider;
+    }
+    throw new Error(`Invalid EMAIL_PROVIDER="${value}". Use "none" or "resend".`);
+}
+
 function parseMessageStorageMode(value: string | undefined): 'server' | 'local_only' {
     const mode = (value || 'server').trim().toLowerCase();
     if (mode === 'server' || mode === 'local_only') {
@@ -47,6 +55,7 @@ const corsAllowAll = parseBool(process.env.CORS_ALLOW_ALL, !isProduction);
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me-in-production!!';
 const fanoutMode = parseFanoutMode(process.env.FANOUT_MODE);
 const messageStorageMode = parseMessageStorageMode(process.env.MESSAGE_STORAGE_MODE);
+const emailProvider = parseEmailProvider(process.env.EMAIL_PROVIDER);
 
 if (isProduction) {
     if (!isStrongJwtSecret(jwtSecret)) {
@@ -74,7 +83,18 @@ export const config = {
     ownerJwtExpiresIn: process.env.OWNER_JWT_EXPIRES_IN || '2h',
     ownerSessionSidRequired: parseBool(process.env.OWNER_SESSION_SID_REQUIRED, false),
     ownerPasswordlessAgentEnabled: parseBool(process.env.OWNER_PASSWORDLESS_AGENT_ENABLED, true),
+    ownerRequireEmailVerified: parseBool(process.env.OWNER_REQUIRE_EMAIL_VERIFIED, false),
     legacyAgentAuthEnabled: parseBool(process.env.LEGACY_AGENT_AUTH_ENABLED, !isProduction),
+    ownerEmailVerifyTtlSec: parsePositiveInt(process.env.OWNER_EMAIL_VERIFY_TTL_SEC, 24 * 3600),
+    ownerPasswordResetTtlSec: parsePositiveInt(process.env.OWNER_PASSWORD_RESET_TTL_SEC, 30 * 60),
+    clerkEnabled: parseBool(process.env.CLERK_ENABLED, false),
+    clerkIssuer: process.env.CLERK_ISSUER || '',
+    clerkJwksUrl: process.env.CLERK_JWKS_URL || '',
+    clerkAudience: process.env.CLERK_AUDIENCE || '',
+    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY || '',
+    emailProvider,
+    emailFrom: process.env.EMAIL_FROM || '',
+    resendApiKey: process.env.RESEND_API_KEY || '',
     wsTokenTtlSec: parseInt(process.env.WS_TOKEN_TTL_SEC || '120', 10),
     wsTokenIssuer: process.env.WS_TOKEN_ISSUER || 'agent-social',
     adminBootstrapToken: process.env.ADMIN_BOOTSTRAP_TOKEN || '',
@@ -91,6 +111,13 @@ export const config = {
     rateLimitSendMsg: parseInt(process.env.RATE_LIMIT_SEND_MSG || '30', 10),
     rateLimitReadMsg: parseInt(process.env.RATE_LIMIT_READ_MSG || '120', 10),
     rateLimitAuth: parseInt(process.env.RATE_LIMIT_AUTH || '10', 10),
+    rateLimitAuthDeviceStart: parseInt(process.env.RATE_LIMIT_AUTH_DEVICE_START || '20', 10),
+    rateLimitAuthDeviceToken: parseInt(process.env.RATE_LIMIT_AUTH_DEVICE_TOKEN || '120', 10),
+    rateLimitAuthDeviceAuthorize: parseInt(process.env.RATE_LIMIT_AUTH_DEVICE_AUTHORIZE || '20', 10),
+    rateLimitAuthOwnerCredential: parseInt(process.env.RATE_LIMIT_AUTH_OWNER_CREDENTIAL || '20', 10),
+    rateLimitAuthOwnerAction: parseInt(process.env.RATE_LIMIT_AUTH_OWNER_ACTION || '60', 10),
+    rateLimitAuthAgentCredential: parseInt(process.env.RATE_LIMIT_AUTH_AGENT_CREDENTIAL || '20', 10),
+    rateLimitAuthAgentAction: parseInt(process.env.RATE_LIMIT_AUTH_AGENT_ACTION || '60', 10),
     rateLimitWs: parseInt(process.env.RATE_LIMIT_WS || '5', 10),
     authFailMaxCombo: parseInt(process.env.AUTH_FAIL_MAX_COMBO || '5', 10),
     authFailMaxIp: parseInt(process.env.AUTH_FAIL_MAX_IP || '20', 10),
