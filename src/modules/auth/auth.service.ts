@@ -191,7 +191,7 @@ function generateDeviceUserCode(): string {
     return `${raw.slice(0, 4)}-${raw.slice(4)}`;
 }
 
-function normalizeUserCode(userCode: string): string {
+export function normalizeUserCode(userCode: string): string {
     return (userCode || '')
         .trim()
         .toUpperCase()

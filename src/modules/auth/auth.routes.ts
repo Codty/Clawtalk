@@ -35,6 +35,7 @@ import {
     getAgentAccessState,
     AuthError,
     tryVerifyToken,
+    normalizeUserCode,
 } from './auth.service.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -158,6 +159,54 @@ function escapeHtml(value: string): string {
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
+}
+
+function firstForwardedValue(value: unknown): string {
+    if (Array.isArray(value)) return firstForwardedValue(value[0]);
+    if (typeof value !== 'string') return '';
+    return value.split(',')[0]?.trim() || '';
+}
+
+function resolveRequestOrigin(request: any): string {
+    const proto = firstForwardedValue(request.headers['x-forwarded-proto']) || request.protocol || 'http';
+    const host = firstForwardedValue(request.headers['x-forwarded-host'])
+        || request.headers.host
+        || `localhost:${config.port}`;
+    return `${proto}://${host}`.replace(/\/+$/, '');
+}
+
+function normalizeOriginCandidate(value: string): string {
+    try {
+        const parsed = new URL(value);
+        return parsed.origin.replace(/\/+$/, '');
+    } catch {
+        return '';
+    }
+}
+
+function resolveAuthPublicBase(request: any): string {
+    const requestOrigin = normalizeOriginCandidate(resolveRequestOrigin(request));
+    const configuredOrigin = normalizeOriginCandidate(config.publicBaseUrl);
+
+    if (configuredOrigin) {
+        try {
+            const configured = new URL(configuredOrigin);
+            const observed = requestOrigin ? new URL(requestOrigin) : null;
+            if (
+                observed
+                && observed.protocol === 'https:'
+                && configured.protocol === 'http:'
+                && configured.host === observed.host
+            ) {
+                return observed.origin;
+            }
+        } catch {
+            // Fall through to configured origin.
+        }
+        return configuredOrigin;
+    }
+
+    return requestOrigin || `http://localhost:${config.port}`;
 }
 
 function renderDeviceAuthPage(
@@ -342,7 +391,7 @@ function renderDeviceAuthPage(
   ${clerkScriptTag}
   <script>
     const USER_CODE = ${JSON.stringify(userCode)};
-    const API_BASE = ${JSON.stringify(apiBase)};
+    const API_BASE = (window.location && window.location.origin) || ${JSON.stringify(apiBase)};
     const CLERK_ENABLED = ${JSON.stringify(clerkEnabled)};
     const CLERK_PUBLISHABLE_KEY = ${JSON.stringify(publishableKey)};
     let clerkInstance = null;
@@ -537,12 +586,6 @@ function renderDeviceAuthPage(
 }
 
 export async function authRoutes(fastify: FastifyInstance) {
-    const resolvePublicBase = (request: any): string => {
-        if (config.publicBaseUrl) return config.publicBaseUrl.replace(/\/+$/, '');
-        if (config.publicWebBaseUrl) return config.publicWebBaseUrl.replace(/\/+$/, '');
-        return `${request.protocol || 'http'}://${request.headers.host || 'localhost:3000'}`;
-    };
-
     const ensureLegacyAgentAuthEnabled = (reply: any): boolean => {
         if (config.legacyAgentAuthEnabled) return true;
         reply.code(410).send({
@@ -586,7 +629,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 scopes?: string[];
             };
             const result = await startOwnerDeviceAuth({
-                verificationBaseUrl: resolvePublicBase(request),
+                verificationBaseUrl: resolveAuthPublicBase(request),
                 clientName: client_name,
                 deviceLabel: device_label,
                 scopes,
@@ -656,8 +699,8 @@ export async function authRoutes(fastify: FastifyInstance) {
         config: { rateLimit: false },
     }, async (request, reply) => {
         const query = request.query as { user_code?: string };
-        const userCode = (query.user_code || '').trim().toUpperCase();
-        const base = resolvePublicBase(request);
+        const userCode = normalizeUserCode(query.user_code || '');
+        const base = resolveAuthPublicBase(request);
         return reply.type('text/html; charset=utf-8').send(renderDeviceAuthPage(
             userCode,
             base,

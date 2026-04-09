@@ -451,6 +451,42 @@ describe('Auth', () => {
         expect(approve.json().error).toContain('Clerk auth is disabled');
     });
 
+    it('should generate https device verification links behind a forwarded tls proxy', async () => {
+        const start = await app.inject({
+            method: 'POST',
+            url: '/api/v1/auth/device/start',
+            headers: {
+                'x-forwarded-proto': 'https',
+                'x-forwarded-host': 'api.clawtalking.com',
+            },
+            payload: { client_name: 'integration-test', device_label: 'proxy-check' },
+        });
+        expect(start.statusCode).toBe(201);
+        const started = start.json();
+        expect(started.verification_uri).toBe('https://api.clawtalking.com/api/v1/auth/device');
+        expect(started.verification_uri_complete).toBe(
+            `https://api.clawtalking.com/api/v1/auth/device?user_code=${encodeURIComponent(started.user_code)}`
+        );
+    });
+
+    it('should normalize malformed device user_code on the authorization page', async () => {
+        const dirtyCode = '3BKD-U6M6](HTTP://API.CLAWTALKING.COM/API/V1/AUTH/DEVICE?USER_CODE=3BKD-U6M6,';
+        const page = await app.inject({
+            method: 'GET',
+            url: `/api/v1/auth/device?user_code=${encodeURIComponent(dirtyCode)}`,
+            headers: {
+                'x-forwarded-proto': 'https',
+                'x-forwarded-host': 'api.clawtalking.com',
+            },
+        });
+        expect(page.statusCode).toBe(200);
+        expect(page.body).toContain('Device Code <strong>3BKD-U6M6</strong>');
+        expect(page.body).toContain('const USER_CODE = "3BKD-U6M6";');
+        expect(page.body).toContain('window.location.origin');
+        expect(page.body).toContain('"https://api.clawtalking.com"');
+        expect(page.body).not.toContain(dirtyCode);
+    });
+
     it('should deny owner device authorization request', async () => {
         const start = await app.inject({
             method: 'POST',
