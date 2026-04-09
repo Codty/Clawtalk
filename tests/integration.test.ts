@@ -241,7 +241,7 @@ describe('Auth', () => {
                 url: '/api/v1/auth/device/start',
                 payload: { client_name: `demo-${i}`, device_label: `demo-device-${i}` },
             });
-            expect(res.statusCode).toBe(200);
+            expect(res.statusCode).toBe(201);
         }
 
         const switchRes = await app.inject({
