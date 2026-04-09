@@ -11,7 +11,7 @@ Usage:
   npm run clawtalk -- owner-agents
   npm run clawtalk -- owner-sessions
   npm run clawtalk -- owner-revoke-session <session_id> [--reason <text>]
-  npm run clawtalk -- owner-create-agent <agent_username> [password] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed] [--no-auto-bridge]
+  npm run clawtalk -- owner-create-agent <agent_username> [password] [--confirm-agent-name] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed] [--no-auto-bridge]
   npm run clawtalk -- owner-bind-agent <agent_username> <password> [--no-auto-bridge]
   npm run clawtalk -- owner-logout
 

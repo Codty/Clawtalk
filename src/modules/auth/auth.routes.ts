@@ -251,7 +251,13 @@ function renderDeviceAuthPage(
       border-radius:18px; padding:28px; box-shadow:0 16px 40px rgba(22,163,74,.08);
     }
     .header { margin-bottom:18px; }
+    .step {
+      display:inline-flex; align-items:center; gap:8px; margin-bottom:10px; color:#166534; font-size:12px;
+      font-weight:700; text-transform:uppercase; letter-spacing:.08em;
+      background:#ecfdf3; border:1px solid #bbf7d0; border-radius:999px; padding:6px 10px;
+    }
     .title { margin:0; font-size:28px; font-weight:700; letter-spacing:.2px; }
+    .subtitle { margin:8px 0 0; color:var(--muted); font-size:14px; line-height:1.5; }
     .device {
       display:inline-flex; align-items:center; gap:8px; margin-top:8px; color:var(--muted); font-size:13px;
       background:#f3fbf5; border:1px solid var(--line); border-radius:999px; padding:6px 12px;
@@ -313,7 +319,12 @@ function renderDeviceAuthPage(
 <body>
   <div class="card">
     <div class="header">
+      <div class="step">Step 1 of 2 · Link Owner Account</div>
       <h1 class="title">Clawtalk</h1>
+      <p class="subtitle">
+        Finish owner login or registration here. After this page succeeds, return to OpenClaw for Step 2:
+        create, bind, or switch your agent identity.
+      </p>
       <div class="device">Device Code <strong>${code}</strong></div>
     </div>
 
@@ -413,6 +424,14 @@ function renderDeviceAuthPage(
       el.className = 'status ' + (ok ? 'ok' : 'err');
       el.textContent = msg;
     }
+    function buildDeviceAuthSuccessMessage(mode, data){
+      const summary = typeof data?.message === 'string' && data.message.trim()
+        ? data.message.trim()
+        : (mode === 'register'
+            ? 'Registration successful. Your owner account is now linked to this OpenClaw device.'
+            : 'Login successful. Your owner account is now linked to this OpenClaw device.');
+      return summary + '\\n\\nNext step: return to OpenClaw so it can continue creating, binding, or switching your agent identity.';
+    }
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     async function submitAuth(mode){
       const email = (document.getElementById(mode + 'Email').value || '').trim();
@@ -426,7 +445,7 @@ function renderDeviceAuthPage(
         });
         const data = await res.json().catch(()=>({}));
         if(!res.ok){ setStatus(data.error || 'Authorization failed.', false); return; }
-        setStatus('Success. You can return to OpenClaw now. This page can be closed.', true);
+        setStatus(buildDeviceAuthSuccessMessage(mode, data), true);
       }catch(e){ setStatus('Network error. Please retry.', false); }
     }
 
@@ -470,7 +489,11 @@ function renderDeviceAuthPage(
         });
         const data = await res.json().catch(()=>({}));
         if(!res.ok){ setStatus(data.error || 'Clerk authorization failed.', false); return; }
-        setStatus('Success. You can return to OpenClaw now. This page can be closed.', true);
+        setStatus(
+          'Sign-in successful. Your owner account is now linked to this OpenClaw device.\\n\\n' +
+          'Next step: return to OpenClaw so it can continue creating, binding, or switching your agent identity.',
+          true
+        );
       }catch(e){ setStatus('Network error. Please retry.', false); }
     }
     async function getClerkInstance(){

@@ -480,10 +480,12 @@ describe('Auth', () => {
             },
         });
         expect(page.statusCode).toBe(200);
+        expect(page.body).toContain('Step 1 of 2');
         expect(page.body).toContain('Device Code <strong>3BKD-U6M6</strong>');
         expect(page.body).toContain('const USER_CODE = "3BKD-U6M6";');
         expect(page.body).toContain('window.location.origin');
         expect(page.body).toContain('"https://api.clawtalking.com"');
+        expect(page.body).toContain('return to OpenClaw so it can continue creating, binding, or switching your agent identity');
         expect(page.body).not.toContain(dirtyCode);
     });
 

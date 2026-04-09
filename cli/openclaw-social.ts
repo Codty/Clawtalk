@@ -455,6 +455,7 @@ async function waitOwnerDeviceConnect(params: {
 }): Promise<OwnerSession> {
     const start = Date.now();
     let nextWaitSec = Math.max(1, params.intervalSec);
+    let emailVerificationPendingNotified = false;
 
     while (Date.now() - start < params.timeoutSec * 1000) {
         try {
@@ -474,6 +475,22 @@ async function waitOwnerDeviceConnect(params: {
             }
             if (err?.status === 403 && err?.data?.error === 'access_denied') {
                 throw new Error('Device authorization was denied in browser.');
+            }
+            if (
+                err?.status === 403
+                && typeof err?.data?.error === 'string'
+                && err.data.error.toLowerCase().includes('email not verified')
+            ) {
+                if (!emailVerificationPendingNotified) {
+                    params.onTick?.(
+                        'Registration is complete, but email verification is still pending. ' +
+                        'Open the verification link in your email, then OpenClaw will continue automatically.'
+                    );
+                    emailVerificationPendingNotified = true;
+                }
+                nextWaitSec = Math.max(nextWaitSec, 10);
+                await sleep(nextWaitSec * 1000);
+                continue;
             }
             if (err?.status === 410 && err?.data?.error === 'expired_token') {
                 throw new Error('Device authorization expired. Please start again.');
@@ -854,11 +871,13 @@ function parseAuthArgs(
     autoBridge: boolean;
     friendZoneEnabled?: boolean;
     friendZoneVisibility?: 'friends' | 'public';
+    confirmAgentName?: boolean;
 } {
     const positionals: string[] = [];
     let autoBridge = true;
     let friendZoneEnabled: boolean | undefined;
     let friendZoneVisibility: 'friends' | 'public' | undefined;
+    let confirmAgentName = false;
 
     for (const arg of args) {
         if (arg === '--no-auto-bridge') {
@@ -892,6 +911,13 @@ function parseAuthArgs(
             friendZoneEnabled = false;
             continue;
         }
+        if (arg === '--confirm-agent-name') {
+            if (commandName !== 'owner-create-agent') {
+                throw new Error(`Unknown option for ${commandName}: ${arg}`);
+            }
+            confirmAgentName = true;
+            continue;
+        }
         if (arg.startsWith('--')) {
             throw new Error(`Unknown option for ${commandName}: ${arg}`);
         }
@@ -902,7 +928,7 @@ function parseAuthArgs(
     if (!agentName || (!password && commandName !== 'owner-create-agent')) {
         if (commandName === 'owner-create-agent') {
             throw new Error(
-                `Usage: clawtalk ${commandName} <agent_username> [password] [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]`
+                `Usage: clawtalk ${commandName} <agent_username> [password] [--confirm-agent-name] [--no-auto-bridge] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed]`
             );
         }
         if (commandName === 'onboard') {
@@ -913,7 +939,32 @@ function parseAuthArgs(
         throw new Error(`Usage: clawtalk ${commandName} <agent_username> <password> [--no-auto-bridge]`);
     }
 
-    return { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility };
+    return { agentName, password, autoBridge, friendZoneEnabled, friendZoneVisibility, confirmAgentName };
+}
+
+async function ensureAgentNameConfirmed(agentName: string, alreadyConfirmed = false): Promise<void> {
+    if (alreadyConfirmed) return;
+
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error(
+            `owner-create-agent requires explicit username confirmation. Re-run with --confirm-agent-name after confirming "${agentName}" with the user.`
+        );
+    }
+
+    const rl = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+    try {
+        const answer = (await rl.question(
+            `Create new owner-managed agent "${agentName}" now? [y/N]: `
+        )).trim().toLowerCase();
+        if (answer !== 'y' && answer !== 'yes') {
+            throw new Error('Agent creation cancelled. Choose or confirm a different Agent Username first.');
+        }
+    } finally {
+        rl.close();
+    }
 }
 
 function parseDownloadAttachmentArgs(args: string[]): { ref: string; outputPath?: string } {
@@ -1004,6 +1055,7 @@ async function commandOwnerConnect(args: string[], state: LocalState): Promise<v
     });
 
     console.log('[Clawtalk Owner Connect]');
+    console.log('Step 1/2: link your owner account in the browser.');
     console.log(`1) Open this link in your browser: ${connect.verification_uri_complete}`);
     console.log(`2) Complete login/register there (code: ${connect.user_code})`);
     console.log(`This request expires in ${Math.max(1, Math.floor(connect.expires_in_sec / 60))} minute(s).`);
@@ -1021,7 +1073,8 @@ async function commandOwnerConnect(args: string[], state: LocalState): Promise<v
     });
     saveOwnerSession(state, owner);
     await saveState(state);
-    console.log(`Owner connected successfully: ${owner.email}`);
+    console.log(`Step 1/2 complete: owner connected successfully: ${owner.email}`);
+    console.log('Step 2/2: return to OpenClaw to create, bind, or switch your agent identity.');
 }
 
 async function commandOwnerRotateToken(state: LocalState): Promise<void> {
@@ -1140,7 +1193,9 @@ async function commandOwnerCreateAgent(args: string[], state: LocalState): Promi
         autoBridge,
         friendZoneEnabled,
         friendZoneVisibility,
+        confirmAgentName,
     } = parseAuthArgs(args, 'owner-create-agent');
+    await ensureAgentNameConfirmed(agentName, confirmAgentName);
 
     const result = await api(
         'POST',
@@ -4535,6 +4590,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
     let shuttingDown = false;
     let connecting = false;
     let hasConnectedOnce = false;
+    let reconnectDelayMs = WATCH_WS_RECONNECT_MS;
 
     function connectWebSocket() {
         if (shuttingDown || connecting) return;
@@ -4547,6 +4603,7 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
 
         current.on('open', () => {
             connecting = false;
+            reconnectDelayMs = WATCH_WS_RECONNECT_MS;
             if (!hasConnectedOnce) {
                 const pref = currentNotifyPref();
                 console.log(`WebSocket connected, current agent: ${session.agent_name}`);
@@ -4573,11 +4630,13 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
             }
             connecting = false;
             if (shuttingDown) return;
+            const retryDelayMs = reconnectDelayMs;
             console.warn(
                 `[watch] websocket disconnected (${code}): ${reason.toString()}. ` +
-                `Will retry in ${WATCH_WS_RECONNECT_MS}ms; polling fallback remains active.`
+                `Will retry in ${retryDelayMs}ms; polling fallback remains active.`
             );
-            setTimeout(() => connectWebSocket(), WATCH_WS_RECONNECT_MS);
+            reconnectDelayMs = Math.min(reconnectDelayMs * 2, 60000);
+            setTimeout(() => connectWebSocket(), retryDelayMs);
         });
 
         current.on('error', (err) => {
@@ -5115,10 +5174,11 @@ async function commandGuided(state: LocalState): Promise<void> {
                 deviceLabel: `${os.hostname()} (${process.platform})`,
             });
             console.log('');
+            console.log('Step 1/2: link your owner account in the browser.');
             console.log('No owner session found. Please open this page in your browser and login/register:');
             console.log(connect.verification_uri_complete);
             console.log(`(code: ${connect.user_code}, expires in ~${Math.max(1, Math.floor(connect.expires_in_sec / 60))} min)`);
-            await rl.question('Press Enter after finishing browser login/register...');
+            console.log('OpenClaw will detect completion automatically. No extra message is needed after the browser step.');
 
             const owner = await waitOwnerDeviceConnect({
                 deviceCode: connect.device_code,
@@ -5128,12 +5188,16 @@ async function commandGuided(state: LocalState): Promise<void> {
             });
             saveOwnerSession(state, owner);
             await saveState(state);
-            console.log(`Owner connected: ${owner.email}`);
+            console.log(`Step 1/2 complete: owner connected: ${owner.email}`);
         }
 
         const owner = getOwnerSessionOrThrow(state);
         const ownerMe = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
         const existingAgents = Array.isArray(ownerMe.agents) ? ownerMe.agents : [];
+        console.log('Step 2/2: choose which agent identity you want to use.');
+        if (existingAgents.length === 0) {
+            console.log('You do not have an agent yet. Next, create a new one or bind an existing account.');
+        }
         if (existingAgents.length > 0) {
             console.log('Your existing agents:');
             for (const item of existingAgents) {
@@ -5161,6 +5225,12 @@ async function commandGuided(state: LocalState): Promise<void> {
             if (!agentUsername) {
                 throw new Error('Agent Username cannot be empty.');
             }
+            const confirmCreate = (await rl.question(
+                `Confirm new Agent Username "${agentUsername}"? [Y/n]: `
+            )).trim().toLowerCase();
+            if (confirmCreate === 'n' || confirmCreate === 'no') {
+                throw new Error('Agent creation cancelled. Restart guided setup and choose a different Agent Username.');
+            }
             const authArgs = [agentUsername];
             const friendZoneRaw = (await rl.question(
                 'Friend Zone visibility [friends/public/closed] (default: friends): '
@@ -5172,6 +5242,7 @@ async function commandGuided(state: LocalState): Promise<void> {
             } else {
                 authArgs.push('--friend-zone-friends');
             }
+            authArgs.push('--confirm-agent-name');
             await commandOwnerCreateAgent(authArgs, state);
         } else {
             const agentUsername = (await rl.question('Bind Agent Username: ')).trim();
