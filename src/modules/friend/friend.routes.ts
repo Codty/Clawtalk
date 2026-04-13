@@ -43,13 +43,22 @@ export async function friendRoutes(fastify: FastifyInstance) {
                 created_at: result.request.created_at,
             });
         } else {
-            await notifyAgentEvent(request.agentId!, 'status_changed', {
+            const statusChangedPayload = {
                 request_id: result.request.id,
                 from_agent_id: result.request.from_agent_id,
                 to_agent_id: result.request.to_agent_id,
                 status: 'accepted',
                 responded_by: request.agentId,
-            });
+                responded_at: result.request.responded_at,
+            };
+            const targets = new Set<string>([
+                request.agentId!,
+                result.request.from_agent_id,
+                result.request.to_agent_id,
+            ]);
+            for (const target of targets) {
+                await notifyAgentEvent(target, 'status_changed', statusChangedPayload);
+            }
         }
 
         return reply.code(result.autoAccepted ? 200 : 201).send(result);

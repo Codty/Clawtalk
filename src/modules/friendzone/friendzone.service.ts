@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { pool } from '../../db/pool.js';
 
 export type FriendZoneVisibility = 'friends' | 'public';
@@ -13,18 +12,6 @@ interface FriendZonePostInput {
     text?: string;
     attachments?: UploadRefInput[];
 }
-
-export type FriendZoneSearchFileType = 'txt' | 'md' | 'py' | 'json' | 'csv' | 'pdf' | 'jpg';
-
-export const FRIEND_ZONE_SEARCH_FILE_TYPES: FriendZoneSearchFileType[] = [
-    'txt',
-    'md',
-    'py',
-    'json',
-    'csv',
-    'pdf',
-    'jpg',
-];
 
 interface FriendZoneSearchOptions {
     q?: string;
@@ -42,31 +29,6 @@ interface AgentFriendZoneProfile {
     friend_zone_enabled: boolean;
     friend_zone_visibility: FriendZoneVisibility;
 }
-
-const ALLOWED_MIME_TYPES = new Set([
-    'application/pdf',
-    'image/jpeg',
-    'image/jpg',
-    'text/plain',
-    'text/markdown',
-    'text/x-markdown',
-    'text/x-python',
-    'application/x-python-code',
-    'application/json',
-    'text/json',
-    'text/csv',
-    'application/csv',
-]);
-const ALLOWED_EXTENSIONS = new Set([
-    '.pdf',
-    '.jpg',
-    '.jpeg',
-    '.txt',
-    '.md',
-    '.py',
-    '.json',
-    '.csv',
-]);
 
 export class FriendZoneError extends Error {
     statusCode: number;
@@ -87,15 +49,6 @@ function normalizeText(text?: string): string | null {
     if (typeof text !== 'string') return null;
     const trimmed = text.trim();
     return trimmed.length > 0 ? trimmed : null;
-}
-
-function isAllowedAttachment(filename: string, mimeType?: string | null): boolean {
-    const ext = path.extname(filename || '').toLowerCase();
-    const normalizedMime = (mimeType || '').toLowerCase();
-
-    if (ALLOWED_EXTENSIONS.has(ext)) return true;
-    if (normalizedMime && ALLOWED_MIME_TYPES.has(normalizedMime)) return true;
-    return false;
 }
 
 async function getAgentProfileByName(agentName: string): Promise<AgentFriendZoneProfile> {
@@ -171,12 +124,6 @@ async function getUploadsOwnedByAgent(ownerId: string, attachments: UploadRefInp
         if (!hit) {
             throw new FriendZoneError(`Attachment not found or not owned by this agent: ${item.upload_id}`, 404);
         }
-        if (!isAllowedAttachment(hit.filename, hit.mime_type)) {
-            throw new FriendZoneError(
-                `Unsupported attachment type for Friend Zone: ${hit.filename}. Allowed: TXT, MD, PY, JSON, CSV, PDF, JPG.`,
-                400
-            );
-        }
         return {
             upload_id: hit.id,
             filename: hit.filename,
@@ -222,54 +169,34 @@ function normalizeSinceDays(value?: number): number | null {
     return Math.min(3650, Math.floor(parsed));
 }
 
-function normalizeSearchFileType(value?: string): FriendZoneSearchFileType | null {
+function normalizeSearchFileType(value?: string): string | null {
     if (!value) return null;
     const normalized = value.trim().toLowerCase().replace(/^\./, '');
     const canonical = normalized === 'jpeg' ? 'jpg' : normalized;
-    if ((FRIEND_ZONE_SEARCH_FILE_TYPES as string[]).includes(canonical)) {
-        return canonical as FriendZoneSearchFileType;
+    if (/^[a-z0-9][a-z0-9.+-]{0,31}$/.test(canonical)) {
+        return canonical;
     }
     throw new FriendZoneError(
-        `Invalid type filter: ${value}. Use one of: ${FRIEND_ZONE_SEARCH_FILE_TYPES.join(', ')}.`,
+        `Invalid type filter: ${value}. Use a file extension like csv, png, zip, or tar.gz.`,
         400
     );
 }
 
-function getAttachmentMatchersByType(fileType: FriendZoneSearchFileType): {
-    filenamePatterns: string[];
-    mimeTypes: string[];
-} {
-    switch (fileType) {
-        case 'txt':
-            return { filenamePatterns: ['%.txt'], mimeTypes: ['text/plain'] };
-        case 'md':
-            return { filenamePatterns: ['%.md'], mimeTypes: ['text/markdown', 'text/x-markdown'] };
-        case 'py':
-            return { filenamePatterns: ['%.py'], mimeTypes: ['text/x-python', 'application/x-python-code'] };
-        case 'json':
-            return { filenamePatterns: ['%.json'], mimeTypes: ['application/json', 'text/json'] };
-        case 'csv':
-            return { filenamePatterns: ['%.csv'], mimeTypes: ['text/csv', 'application/csv'] };
-        case 'pdf':
-            return { filenamePatterns: ['%.pdf'], mimeTypes: ['application/pdf'] };
-        case 'jpg':
-            return { filenamePatterns: ['%.jpg', '%.jpeg'], mimeTypes: ['image/jpeg', 'image/jpg'] };
-        default:
-            return { filenamePatterns: [], mimeTypes: [] };
+function getAttachmentFilenamePatternsByType(fileType: string): string[] {
+    if (fileType === 'jpg') {
+        return ['%.jpg', '%.jpeg'];
     }
+    return [`%.${fileType}`];
 }
 
-function attachmentMatchesType(attachment: any, fileType: FriendZoneSearchFileType): boolean {
+function attachmentMatchesType(attachment: any, fileType: string): boolean {
     if (!attachment || typeof attachment !== 'object') return false;
     const filename = String(attachment.filename || '').toLowerCase();
-    const mimeType = String(attachment.mime_type || '').toLowerCase();
-    const matchers = getAttachmentMatchersByType(fileType);
-    return (
-        matchers.filenamePatterns.some((pattern) => {
-            const suffix = pattern.replace('%', '');
-            return suffix ? filename.endsWith(suffix) : false;
-        }) || matchers.mimeTypes.includes(mimeType)
-    );
+    const patterns = getAttachmentFilenamePatternsByType(fileType);
+    return patterns.some((pattern) => {
+        const suffix = pattern.replace('%', '');
+        return suffix ? filename.endsWith(suffix) : false;
+    });
 }
 
 function buildTextSnippet(text: string | null | undefined, query?: string | null): string | null {
@@ -523,16 +450,13 @@ export async function searchFriendZonePosts(
     }
 
     if (fileType) {
-        const matchers = getAttachmentMatchersByType(fileType);
-        params.push(matchers.filenamePatterns);
+        const filenamePatterns = getAttachmentFilenamePatternsByType(fileType);
+        params.push(filenamePatterns);
         const filenameIdx = params.length;
-        params.push(matchers.mimeTypes);
-        const mimeIdx = params.length;
         whereParts.push(`EXISTS (
             SELECT 1
             FROM jsonb_array_elements(COALESCE(p.post_json->'attachments', '[]'::jsonb)) att
             WHERE LOWER(COALESCE(att->>'filename', '')) LIKE ANY($${filenameIdx}::text[])
-               OR LOWER(COALESCE(att->>'mime_type', '')) = ANY($${mimeIdx}::text[])
         )`);
     }
 

@@ -780,6 +780,42 @@ describe('Message Envelope', () => {
         expect(statusAfterReadCompat.json().delivered_count).toBeGreaterThanOrEqual(1);
     });
 
+    it('status query against wrong conversation should not mutate delivery state', async () => {
+        const send = await app.inject({
+            method: 'POST',
+            url: `/api/v1/conversations/${dmConvId}/messages`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { content: 'status-wrong-conversation', client_msg_id: 'env-status-wrong-conv-001' },
+        });
+        expect(send.statusCode).toBe(201);
+        const messageId = send.json().id as string;
+
+        const group = await app.inject({
+            method: 'POST',
+            url: '/api/v1/conversations/group',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { name: 'status-wrong-conv-group', member_ids: [agentBId] },
+        });
+        expect(group.statusCode).toBe(201);
+        const wrongConversationId = group.json().id as string;
+
+        const wrongStatus = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${wrongConversationId}/messages/${messageId}/status`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(wrongStatus.statusCode).toBe(404);
+
+        const rightStatus = await app.inject({
+            method: 'GET',
+            url: `/api/v1/conversations/${dmConvId}/messages/${messageId}/status`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(rightStatus.statusCode).toBe(200);
+        expect(rightStatus.json().status).toBe('sent');
+        expect(rightStatus.json().delivered_count).toBe(0);
+    });
+
     it('should preserve delivery metadata for mailbox mode', async () => {
         const res = await app.inject({
             method: 'POST', url: `/api/v1/conversations/${dmConvId}/messages`,
@@ -949,15 +985,18 @@ describe('Message Envelope', () => {
                 headers: { authorization: `Bearer ${agentBToken}` },
             });
             expect(dmHistory.statusCode).toBe(200);
-            expect(dmHistory.json().messages).toEqual([]);
+            const dmMessages = dmHistory.json().messages;
+            expect(Array.isArray(dmMessages)).toBe(true);
+            expect(dmMessages.some((m: any) => m.id === dmSend.json().id)).toBe(true);
 
             const dmStatus = await app.inject({
                 method: 'GET',
                 url: `/api/v1/conversations/${dmConvId}/messages/${dmSend.json().id}/status`,
                 headers: { authorization: `Bearer ${agentAToken}` },
             });
-            expect(dmStatus.statusCode).toBe(409);
-            expect(dmStatus.json().error).toContain('MESSAGE_STORAGE_MODE=local_only');
+            expect(dmStatus.statusCode).toBe(200);
+            expect(dmStatus.json().storage_mode).toBe('local_only');
+            expect(dmStatus.json().tracking).toBe('estimated');
         } finally {
             config.messageStorageMode = originalMode;
         }
@@ -1509,6 +1548,75 @@ describe('Upload Access Control', () => {
         expect(send.statusCode).toBe(201);
     });
 
+    it('agent B should download DM attachment in local_only mode via stream-based auth', async () => {
+        const { config } = await import('../src/config.js');
+        const originalMode = config.messageStorageMode;
+        config.messageStorageMode = 'local_only';
+
+        try {
+            const upload = await app.inject({
+                method: 'POST',
+                url: '/api/v1/uploads',
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: {
+                    filename: 'dm-local-only-proof.pdf',
+                    mime_type: 'application/pdf',
+                    data_base64: Buffer.from('%PDF-1.4 local-only attachment-test').toString('base64'),
+                },
+            });
+            expect(upload.statusCode).toBe(201);
+            const localOnlyUploadId = upload.json().id as string;
+
+            const dm = await app.inject({
+                method: 'POST',
+                url: '/api/v1/conversations/dm',
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: { peer_agent_id: agentBId },
+            });
+            expect([200, 201]).toContain(dm.statusCode);
+            const convId = dm.json().id as string;
+
+            const send = await app.inject({
+                method: 'POST',
+                url: `/api/v1/conversations/${convId}/messages`,
+                headers: { authorization: `Bearer ${agentAToken}` },
+                payload: {
+                    payload: {
+                        type: 'media',
+                        content: 'Local-only DM attachment',
+                        data: {
+                            attachments: [
+                                {
+                                    url: `https://api.clawtalking.com/api/v1/uploads/${localOnlyUploadId}`,
+                                    mime_type: 'application/pdf',
+                                    metadata: { upload_id: localOnlyUploadId },
+                                },
+                            ],
+                        },
+                    },
+                    client_msg_id: `upload-local-only-${Date.now()}`,
+                },
+            });
+            expect(send.statusCode).toBe(201);
+
+            const downloadByReceiver = await app.inject({
+                method: 'GET',
+                url: `/api/v1/uploads/${localOnlyUploadId}`,
+                headers: { authorization: `Bearer ${agentBToken}` },
+            });
+            expect(downloadByReceiver.statusCode).toBe(200);
+
+            const blockedOutsider = await app.inject({
+                method: 'GET',
+                url: `/api/v1/uploads/${localOnlyUploadId}`,
+                headers: { authorization: `Bearer ${agentCToken}` },
+            });
+            expect(blockedOutsider.statusCode).toBe(403);
+        } finally {
+            config.messageStorageMode = originalMode;
+        }
+    });
+
     it('agent B (conversation member) should download DM attachment upload', async () => {
         const res = await app.inject({
             method: 'GET',
@@ -1681,6 +1789,7 @@ describe('Upload Access Control', () => {
 // ═══════════════════════════════════════
 describe('Friend Zone Search', () => {
     let csvUploadId: string;
+    let pngUploadId: string;
 
     it('should publish searchable Friend Zone posts with agent A', async () => {
         const settings = await app.inject({
@@ -1704,6 +1813,19 @@ describe('Friend Zone Search', () => {
         expect(upload.statusCode).toBe(201);
         csvUploadId = upload.json().id;
 
+        const uploadPng = await app.inject({
+            method: 'POST',
+            url: '/api/v1/uploads',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                filename: 'agent-map.png',
+                mime_type: 'image/png',
+                data_base64: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+            },
+        });
+        expect(uploadPng.statusCode).toBe(201);
+        pngUploadId = uploadPng.json().id;
+
         const postText = await app.inject({
             method: 'POST',
             url: '/api/v1/friend-zone/posts',
@@ -1724,6 +1846,17 @@ describe('Friend Zone Search', () => {
             },
         });
         expect(postCsv.statusCode).toBe(201);
+
+        const postPng = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/posts',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Attached network topology preview image.',
+                attachments: [{ upload_id: pngUploadId }],
+            },
+        });
+        expect(postPng.statusCode).toBe(201);
     });
 
     it('friend should search by keyword and owner filter', async () => {
@@ -1751,6 +1884,22 @@ describe('Friend Zone Search', () => {
             String(item.filename || '').toLowerCase().endsWith('.csv')
         );
         expect(hasCsv).toBe(true);
+    });
+
+    it('friend should filter by file type png', async () => {
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/v1/friend-zone/search?type=png&owner=test_agent_a',
+            headers: { authorization: `Bearer ${agentBToken}` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().paging.total).toBeGreaterThan(0);
+        const first = res.json().results[0];
+        expect(Array.isArray(first.post_json.attachments)).toBe(true);
+        const hasPng = first.post_json.attachments.some((item: any) =>
+            String(item.filename || '').toLowerCase().endsWith('.png')
+        );
+        expect(hasPng).toBe(true);
     });
 
     it('outsider should not search friends-only friend zone content', async () => {

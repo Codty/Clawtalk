@@ -138,6 +138,147 @@ function extractContent(envelope: MessageEnvelope): string {
     return `[${envelope.type}]`;
 }
 
+interface LocalOnlyStreamRow {
+    id: string;
+    conversation_id: string;
+    sender_id: string;
+    content: string;
+    payload: MessageEnvelope;
+    created_at: string;
+}
+
+function parseStreamFields(fields: string[]): Record<string, string> {
+    const data: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i += 2) {
+        data[fields[i]] = fields[i + 1];
+    }
+    return data;
+}
+
+function normalizeStreamEnvelope(raw: unknown, fallbackContent: string): MessageEnvelope {
+    if (raw && typeof raw === 'object' && 'type' in raw) {
+        const maybeType = String((raw as any).type || '');
+        if (VALID_ENVELOPE_TYPES.has(maybeType as any)) {
+            return raw as MessageEnvelope;
+        }
+    }
+    return {
+        type: 'text',
+        content: fallbackContent || '[message]',
+    };
+}
+
+function parseLocalOnlyStreamEntry(entry: any): LocalOnlyStreamRow | null {
+    if (!Array.isArray(entry) || entry.length < 2) return null;
+    const eventId = String(entry[0] || '');
+    const rawFields = entry[1];
+    if (!Array.isArray(rawFields)) return null;
+
+    const fields = parseStreamFields(rawFields as string[]);
+    const fallbackContent = String(fields.content || '');
+    let parsedPayload: unknown = undefined;
+    if (fields.payload) {
+        try {
+            parsedPayload = JSON.parse(fields.payload);
+        } catch {
+            parsedPayload = undefined;
+        }
+    }
+
+    const createdAtRaw = String(fields.created_at || '');
+    const createdAt = Number.isFinite(new Date(createdAtRaw).getTime())
+        ? new Date(createdAtRaw).toISOString()
+        : new Date().toISOString();
+
+    return {
+        id: String(fields.id || eventId),
+        conversation_id: String(fields.conversation_id || ''),
+        sender_id: String(fields.sender_id || ''),
+        content: fallbackContent,
+        payload: normalizeStreamEnvelope(parsedPayload, fallbackContent),
+        created_at: createdAt,
+    };
+}
+
+async function getLocalOnlyMessagesFromStream(
+    conversationId: string,
+    viewerId: string,
+    options: { before?: string; limit?: number }
+): Promise<MessageRow[]> {
+    const limit = Math.min(options.limit || 50, 100);
+    const beforeTs = options.before ? new Date(options.before).getTime() : NaN;
+    const streamKey = `stream:conv:${conversationId}`;
+    const scanCount = Math.max(limit * 5, 200);
+
+    let entries: any[] = [];
+    try {
+        const raw = await (redis as any).xrevrange(streamKey, '+', '-', 'COUNT', scanCount);
+        entries = Array.isArray(raw) ? raw : [];
+    } catch (err) {
+        // In local_only mode, missing/failed stream should degrade gracefully.
+        console.error('[local_only] Failed to read DM stream history:', err);
+        return [];
+    }
+
+    const rows: MessageRow[] = [];
+    for (const entry of entries) {
+        const parsed = parseLocalOnlyStreamEntry(entry);
+        if (!parsed) continue;
+        if (parsed.conversation_id !== conversationId) continue;
+
+        const createdTs = new Date(parsed.created_at).getTime();
+        if (Number.isFinite(beforeTs) && Number.isFinite(createdTs) && createdTs >= beforeTs) {
+            continue;
+        }
+
+        const isSender = parsed.sender_id === viewerId;
+        const attachments = parsed.payload.type === 'media' && Array.isArray(parsed.payload?.data?.attachments)
+            ? parsed.payload.data.attachments
+            : [];
+
+        const row = sanitizeMessageForClient({
+            id: parsed.id,
+            conversation_id: parsed.conversation_id,
+            sender_id: parsed.sender_id,
+            content: parsed.content,
+            payload: parsed.payload,
+            client_msg_id: null,
+            created_at: parsed.created_at,
+            delivered_at: isSender ? null : parsed.created_at,
+            delivered_count: isSender ? 0 : 1,
+            status: isSender ? 'sent' : 'delivered',
+            attachments,
+        });
+        rows.push(row);
+        if (rows.length >= limit) break;
+    }
+
+    return rows;
+}
+
+async function findLocalOnlyMessageInStream(
+    conversationId: string,
+    messageId: string
+): Promise<LocalOnlyStreamRow | null> {
+    const streamKey = `stream:conv:${conversationId}`;
+    const scanCount = Math.max(500, Math.min(10000, config.realtimeStreamMaxLen || 5000));
+
+    try {
+        const raw = await (redis as any).xrevrange(streamKey, '+', '-', 'COUNT', scanCount);
+        const entries = Array.isArray(raw) ? raw : [];
+        for (const entry of entries) {
+            const parsed = parseLocalOnlyStreamEntry(entry);
+            if (!parsed) continue;
+            if (parsed.conversation_id !== conversationId) continue;
+            if (parsed.id === messageId) return parsed;
+        }
+        return null;
+    } catch (err) {
+        console.error('[local_only] Failed to scan DM stream for message status:', err);
+        return null;
+    }
+}
+
 /**
  * Get conversation policy, merging with defaults.
  */
@@ -206,7 +347,8 @@ async function hydrateMessages(rows: any[], viewerId: string): Promise<MessageRo
 
 async function markMessagesDeliveredByIds(
     viewerId: string,
-    messageIds: string[]
+    messageIds: string[],
+    conversationId?: string
 ): Promise<{ delivered_count: number }> {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return { delivered_count: 0 };
 
@@ -215,12 +357,13 @@ async function markMessagesDeliveredByIds(
          SELECT m.id, $2, NOW()
          FROM messages m
          WHERE m.id = ANY($1::uuid[])
+           AND ($3::uuid IS NULL OR m.conversation_id = $3::uuid)
            AND m.deleted_at IS NULL
            AND m.sender_id <> $2
          ON CONFLICT (message_id, agent_id)
          DO NOTHING
          RETURNING message_id`,
-        [messageIds, viewerId]
+        [messageIds, viewerId, conversationId || null]
     );
     return { delivered_count: rows.length };
 }
@@ -663,7 +806,7 @@ export async function getMessages(
 ): Promise<MessageRow[]> {
     if (await usesLocalOnlyConversationStorage(conversationId)) {
         await assertMember(conversationId, agentId);
-        return [];
+        return getLocalOnlyMessagesFromStream(conversationId, agentId, options);
     }
     await assertMember(conversationId, agentId);
 
@@ -719,7 +862,7 @@ export async function getMessages(
         .filter((row: any) => row.sender_id !== agentId)
         .map((row: any) => row.id);
 
-    const deliveryUpsert = await markMessagesDeliveredByIds(agentId, incomingMessageIds);
+    const deliveryUpsert = await markMessagesDeliveredByIds(agentId, incomingMessageIds, conversationId);
     if (deliveryUpsert.delivered_count > 0) {
         const refreshed = await pool.query(query, params);
         rows = refreshed.rows;
@@ -738,10 +881,40 @@ export async function getMessageStatus(
     status: MessageStatus;
     delivered_count: number;
     delivered_at: string | null;
+    storage_mode?: 'server' | 'local_only';
+    tracking?: 'confirmed' | 'estimated' | 'unavailable';
+    note?: string;
 }> {
     await assertMember(conversationId, viewerId);
-    await assertServerMessageStorageForConversation(conversationId, 'Message status');
-    await markMessagesDeliveredByIds(viewerId, [messageId]);
+    if (await usesLocalOnlyConversationStorage(conversationId)) {
+        const row = await findLocalOnlyMessageInStream(conversationId, messageId);
+        if (!row) {
+            return {
+                message_id: messageId,
+                conversation_id: conversationId,
+                status: 'sent',
+                delivered_count: 0,
+                delivered_at: null,
+                storage_mode: 'local_only',
+                tracking: 'unavailable',
+                note: 'Server delivery receipts are disabled in local_only DM mode; message not found in recent realtime stream window.',
+            };
+        }
+
+        const isSender = row.sender_id === viewerId;
+        return {
+            message_id: messageId,
+            conversation_id: conversationId,
+            status: isSender ? 'sent' : 'delivered',
+            delivered_count: isSender ? 0 : 1,
+            delivered_at: isSender ? null : row.created_at,
+            storage_mode: 'local_only',
+            tracking: 'estimated',
+            note: 'This status is inferred from local_only realtime stream replay and is not a database-backed delivery receipt.',
+        };
+    }
+
+    await markMessagesDeliveredByIds(viewerId, [messageId], conversationId);
 
     const { rows } = await pool.query(
         `SELECT m.id,
@@ -774,5 +947,7 @@ export async function getMessageStatus(
         status: computeMessageStatusForViewer(row, viewerId),
         delivered_count: Number(row.delivered_count || 0),
         delivered_at: toIsoOrNull(row.delivered_at),
+        storage_mode: 'server',
+        tracking: 'confirmed',
     };
 }

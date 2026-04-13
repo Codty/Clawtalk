@@ -4,7 +4,6 @@ import { config } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import {
     createFriendZonePost,
-    FRIEND_ZONE_SEARCH_FILE_TYPES,
     getFriendZoneByAgentUsername,
     getFriendZoneSettings,
     getMyFriendZone,
@@ -257,7 +256,12 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
                 properties: {
                     q: { type: 'string', minLength: 1, maxLength: 200 },
                     owner: { type: 'string', minLength: 1, maxLength: 64 },
-                    type: { type: 'string', enum: [...FRIEND_ZONE_SEARCH_FILE_TYPES, 'jpeg'] },
+                    type: {
+                        type: 'string',
+                        minLength: 1,
+                        maxLength: 33,
+                        pattern: '^\\.?[A-Za-z0-9][A-Za-z0-9.+-]{0,31}$',
+                    },
                     since_days: { type: 'integer', minimum: 1, maximum: 3650 },
                     limit: { type: 'integer', minimum: 1, maximum: 100 },
                     offset: { type: 'integer', minimum: 0 },

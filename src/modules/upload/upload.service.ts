@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { pool } from '../../db/pool.js';
 import { config } from '../../config.js';
+import { redis } from '../../infra/redis.js';
 
 export class UploadError extends Error {
     statusCode: number;
@@ -223,6 +224,97 @@ async function hasConversationAttachmentAccess(uploadId: string, viewerId: strin
     return (rowCount || 0) > 0;
 }
 
+function parseStreamFields(fields: string[]): Record<string, string> {
+    const data: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i += 2) {
+        data[fields[i]] = fields[i + 1];
+    }
+    return data;
+}
+
+function extractUploadIdFromAttachment(attachment: any): string | null {
+    if (!attachment || typeof attachment !== 'object') return null;
+
+    const metadataUploadId = attachment.metadata?.upload_id;
+    if (typeof metadataUploadId === 'string' && metadataUploadId.trim().length > 0) {
+        return metadataUploadId.trim();
+    }
+
+    const directUploadId = attachment.upload_id;
+    if (typeof directUploadId === 'string' && directUploadId.trim().length > 0) {
+        return directUploadId.trim();
+    }
+
+    const url = typeof attachment.url === 'string' ? attachment.url : '';
+    const match = url.match(/\/api\/v1\/uploads\/([0-9a-f-]{36})(?:[/?#]|$)/i);
+    if (match?.[1]) {
+        return match[1];
+    }
+
+    return null;
+}
+
+function payloadContainsUploadId(payload: any, uploadId: string): boolean {
+    if (!payload || typeof payload !== 'object') return false;
+    const attachments = payload?.data?.attachments;
+    if (!Array.isArray(attachments) || attachments.length === 0) return false;
+
+    return attachments.some((attachment) => extractUploadIdFromAttachment(attachment) === uploadId);
+}
+
+async function hasLocalOnlyDmAttachmentAccess(uploadId: string, viewerId: string, uploaderId: string): Promise<boolean> {
+    if (config.messageStorageMode !== 'local_only') return false;
+
+    const { rows: dmRows } = await pool.query(
+        `SELECT DISTINCT c.id
+         FROM conversations c
+         JOIN conversation_members cm_viewer
+           ON cm_viewer.conversation_id = c.id
+          AND cm_viewer.agent_id = $1
+         JOIN conversation_members cm_uploader
+           ON cm_uploader.conversation_id = c.id
+          AND cm_uploader.agent_id = $2
+         WHERE c.type = 'dm'`,
+        [viewerId, uploaderId]
+    );
+    if (dmRows.length === 0) return false;
+
+    const scanCount = Math.max(500, Math.min(10000, config.realtimeStreamMaxLen || 5000));
+    for (const row of dmRows) {
+        const streamKey = `stream:conv:${row.id}`;
+        let entries: any[] = [];
+        try {
+            const raw = await (redis as any).xrevrange(streamKey, '+', '-', 'COUNT', scanCount);
+            entries = Array.isArray(raw) ? raw : [];
+        } catch {
+            continue;
+        }
+
+        for (const entry of entries) {
+            if (!Array.isArray(entry) || entry.length < 2) continue;
+            const rawFields = entry[1];
+            if (!Array.isArray(rawFields)) continue;
+            const fields = parseStreamFields(rawFields as string[]);
+            const senderId = String(fields.sender_id || '');
+            if (senderId !== uploaderId) continue;
+            if (!fields.payload) continue;
+
+            let payload: any = null;
+            try {
+                payload = JSON.parse(fields.payload);
+            } catch {
+                payload = null;
+            }
+
+            if (payloadContainsUploadId(payload, uploadId)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 async function hasFriendZoneAttachmentAccess(uploadId: string, viewerId: string): Promise<boolean> {
     const { rows } = await pool.query(
         `SELECT p.owner_id,
@@ -273,6 +365,7 @@ async function assertUploadDownloadAccess(uploadId: string, viewerId: string, up
     if (viewerId === uploaderId) return;
 
     if (await hasConversationAttachmentAccess(uploadId, viewerId)) return;
+    if (await hasLocalOnlyDmAttachmentAccess(uploadId, viewerId, uploaderId)) return;
     if (await hasFriendZoneAttachmentAccess(uploadId, viewerId)) return;
 
     throw new UploadError('Not authorized to download this upload', 403);

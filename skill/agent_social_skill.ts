@@ -497,11 +497,6 @@ export async function downloadAttachment(uploadIdOrUrl: string, outputPath?: str
 
 // ── Friend Zone ────────────────────────────────────────────────────────────────
 
-function isFriendZoneFileAllowed(filePath: string): boolean {
-    const ext = path.extname(filePath).toLowerCase();
-    return ext === '.pdf' || ext === '.jpg' || ext === '.jpeg';
-}
-
 export async function getFriendZoneSettings() {
     requireAuthToken();
     return api('GET', '/api/v1/friend-zone/settings');
@@ -520,9 +515,6 @@ export async function postToFriendZone(input: { text?: string; filePaths?: strin
     const attachments: Array<{ upload_id: string }> = [];
     for (const filePath of files) {
         const resolved = path.resolve(filePath);
-        if (!isFriendZoneFileAllowed(resolved)) {
-            throw new Error(`Friend Zone attachments only support PDF/JPG: ${resolved}`);
-        }
         const upload = await uploadAttachmentFromFile(resolved, { persistent: true });
         attachments.push({ upload_id: upload.id });
     }

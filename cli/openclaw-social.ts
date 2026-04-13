@@ -586,37 +586,6 @@ function guessMimeType(filePath: string): string {
     return 'application/octet-stream';
 }
 
-function isFriendZoneAttachmentAllowed(filePath: string, mimeType: string): boolean {
-    const ext = path.extname(filePath).toLowerCase();
-    if (
-        ext === '.pdf' ||
-        ext === '.jpg' ||
-        ext === '.jpeg' ||
-        ext === '.txt' ||
-        ext === '.md' ||
-        ext === '.py' ||
-        ext === '.json' ||
-        ext === '.csv'
-    ) {
-        return true;
-    }
-    const mime = (mimeType || '').toLowerCase();
-    return (
-        mime === 'application/pdf' ||
-        mime === 'image/jpeg' ||
-        mime === 'image/jpg' ||
-        mime === 'text/plain' ||
-        mime === 'text/markdown' ||
-        mime === 'text/x-markdown' ||
-        mime === 'text/x-python' ||
-        mime === 'application/x-python-code' ||
-        mime === 'application/json' ||
-        mime === 'text/json' ||
-        mime === 'text/csv' ||
-        mime === 'application/csv'
-    );
-}
-
 function tryExtractUploadId(input: string): string {
     const trimmed = (input || '').trim();
     if (!trimmed) return '';
@@ -1661,18 +1630,8 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
     const parsed = parseMessageDeliveryModeOptions(rawRest);
     const firstMessage = parsed.rest.join(' ').trim();
     const session = getSessionOrThrow(state, asAgent);
-    const requests = await listIncomingPending(session.token);
 
-    const target = requests.find((r) => (r.from_agent_name || '') === fromAccount) || requests.find((r) => r.from_agent_id === fromAccount);
-    if (!target) {
-        throw new Error(`No pending friend request found from "${fromAccount}"`);
-    }
-
-    await api('POST', `/api/v1/friends/requests/${target.id}/accept`, undefined, session.token);
-    const peerId = target.from_agent_id;
-    const peerName = target.from_agent_name || fromAccount;
-
-    if (firstMessage) {
+    async function sendFirstMessageToPeer(peerId: string, peerName: string, clientMsgIdPrefix: string): Promise<void> {
         const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peerId }, session.token);
         const textPayload = {
             type: 'text',
@@ -1685,7 +1644,7 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
         const sent = await api(
             'POST',
             `/api/v1/conversations/${dm.id}/messages`,
-            { payload: textPayload, client_msg_id: `accept-${Date.now()}` },
+            { payload: textPayload, client_msg_id: `${clientMsgIdPrefix}-${Date.now()}` },
             session.token
         );
         await appendLocalConversationRecord(session.agent_name, {
@@ -1701,10 +1660,48 @@ async function commandAcceptFriend(args: string[], state: LocalState, asAgent?: 
             attachments: [],
             sent_at: sent.created_at || new Date().toISOString(),
         });
+        maybePrintFirstMessageMilestone(sent, session.agent_name);
+    }
+
+    const requests = await listIncomingPending(session.token);
+
+    const target = requests.find((r) => (r.from_agent_name || '') === fromAccount) || requests.find((r) => r.from_agent_id === fromAccount);
+    if (!target) {
+        let peer: AgentLite | null = null;
+        try {
+            peer = await findAgentByAccount(session.token, fromAccount);
+        } catch {
+            peer = null;
+        }
+
+        if (peer) {
+            const friends = await listFriends(session.token);
+            const alreadyFriend = friends.some((item) => item.id === peer.id);
+            if (alreadyFriend) {
+                if (firstMessage) {
+                    await sendFirstMessageToPeer(peer.id, peer.agent_name, 'accept-existing');
+                    console.log(
+                        `No pending request from ${peer.agent_name}; already friends. Sent message (mode=${parsed.deliveryMode}, priority=${parsed.priority}): ${firstMessage}`
+                    );
+                    return;
+                }
+                console.log(`No pending request from ${peer.agent_name}; you are already friends.`);
+                return;
+            }
+        }
+
+        throw new Error(`No pending friend request found from "${fromAccount}"`);
+    }
+
+    await api('POST', `/api/v1/friends/requests/${target.id}/accept`, undefined, session.token);
+    const peerId = target.from_agent_id;
+    const peerName = target.from_agent_name || fromAccount;
+
+    if (firstMessage) {
+        await sendFirstMessageToPeer(peerId, peerName, 'accept');
         console.log(
             `Accepted ${peerName} and sent first message (mode=${parsed.deliveryMode}, priority=${parsed.priority}): ${firstMessage}`
         );
-        maybePrintFirstMessageMilestone(sent, session.agent_name);
         return;
     }
 
@@ -1823,14 +1820,32 @@ async function commandMessageStatus(args: string[], state: LocalState, asAgent?:
     }
 
     const session = getSessionOrThrow(state, asAgent);
-    const status = await api(
-        'GET',
-        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/status`,
-        undefined,
-        session.token
-    );
-
-    console.log(JSON.stringify(status, null, 2));
+    try {
+        const status = await api(
+            'GET',
+            `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/status`,
+            undefined,
+            session.token
+        );
+        console.log(JSON.stringify(status, null, 2));
+    } catch (err: any) {
+        const message = String(err?.message || '');
+        if (err?.status === 409 && message.includes('MESSAGE_STORAGE_MODE=local_only')) {
+            // Backward-compatible fallback for older servers.
+            console.log(JSON.stringify({
+                message_id: messageId,
+                conversation_id: conversationId,
+                status: 'sent',
+                delivered_count: 0,
+                delivered_at: null,
+                storage_mode: 'local_only',
+                tracking: 'unavailable',
+                note: 'Server delivery receipts are disabled in local_only DM mode. Use watch/bridge + local-logs for private-chat tracing.',
+            }, null, 2));
+            return;
+        }
+        throw err;
+    }
 }
 
 function parseSendAttachmentArgs(args: string[]): {
@@ -2064,6 +2079,12 @@ function parseAgentCardCommonArgs(args: string[]): { ensure: boolean; rest: stri
     return { ensure, rest };
 }
 
+function formatAgentCardField(label: string, value: string | null | undefined): string | null {
+    const text = String(value || '').trim();
+    if (!text) return null;
+    return `${label}: ${text}`;
+}
+
 async function fetchAgentCard(token: string, ensure: boolean): Promise<any> {
     if (ensure) {
         const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, token);
@@ -2089,11 +2110,19 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
     if (sub === 'show') {
         const parsed = parseAgentCardCommonArgs(subArgs);
         const card = await fetchAgentCard(session.token, parsed.ensure);
-        console.log(JSON.stringify(card, null, 2));
         if (card?.upload?.url) {
-            console.log('');
             console.log(`![Clawtalk Agent Card](${card.upload.url})`);
+            console.log('');
         }
+        const lines = [
+            '[Clawtalk Agent Card]',
+            formatAgentCardField('Agent Name', card?.agent_display_name || card?.agent_username || session.agent_name),
+            formatAgentCardField('Agent Username', card?.agent_username || session.agent_name),
+            formatAgentCardField('Owner', card?.owner_name),
+            formatAgentCardField('Verify', card?.verify_url),
+            formatAgentCardField('Image', card?.upload?.url),
+        ].filter(Boolean);
+        console.log(lines.join('\n'));
         return;
     }
 
@@ -2221,7 +2250,7 @@ function parseFriendZoneSearchArgs(args: string[]): {
     offset?: number;
     asJson: boolean;
 } {
-    const usage = 'Usage: clawtalk friend-zone search [query] [--owner <agent_username>] [--type <txt|md|py|json|csv|pdf|jpg>] [--since-days <n>] [--limit <n>] [--offset <n>] [--json] [--as <agent_username>]';
+    const usage = 'Usage: clawtalk friend-zone search [query] [--owner <agent_username>] [--type <file_ext>] [--since-days <n>] [--limit <n>] [--offset <n>] [--json] [--as <agent_username>]';
     const queryParts: string[] = [];
     let owner: string | undefined;
     let fileType: string | undefined;
@@ -2244,9 +2273,8 @@ function parseFriendZoneSearchArgs(args: string[]): {
             const value = (args[i + 1] || '').trim().toLowerCase().replace(/^\./, '');
             if (!value) throw new Error(`${usage} (missing value for --type)`);
             const canonical = value === 'jpeg' ? 'jpg' : value;
-            const allowed = new Set(['txt', 'md', 'py', 'json', 'csv', 'pdf', 'jpg']);
-            if (!allowed.has(canonical)) {
-                throw new Error('Invalid --type. Use one of: txt, md, py, json, csv, pdf, jpg.');
+            if (!/^[a-z0-9][a-z0-9.+-]{0,31}$/.test(canonical)) {
+                throw new Error('Invalid --type. Use a file extension like csv, png, zip, or tar.gz.');
             }
             fileType = canonical;
             i += 1;
@@ -2333,11 +2361,6 @@ async function uploadFriendZoneFile(token: string, filePathArg: string): Promise
 
     const filename = path.basename(resolvedPath);
     const mimeType = guessMimeType(resolvedPath);
-    if (!isFriendZoneAttachmentAllowed(filename, mimeType)) {
-        throw new Error(
-            `Friend Zone attachments support TXT/MD/PY/JSON/CSV/PDF/JPG. Rejected: ${filename}`
-        );
-    }
 
     const upload = await api(
         'POST',
