@@ -2,6 +2,7 @@ import { pool } from '../../db/pool.js';
 import { disconnectAgentFromConversation, addAgentToConversation } from '../ws/ws.handler.js';
 import type { ConversationPolicy } from '../../config.js';
 import { config } from '../../config.js';
+import { isBlockedEitherDirection } from '../friend/block.service.js';
 
 export class ConversationError extends Error {
     statusCode: number;
@@ -38,6 +39,39 @@ export async function createOrGetDM(agentId: string, peerAgentId: string) {
             'Peer agent must complete claim verification before DM can be created',
             403
         );
+    }
+
+    // Issue #9: Check block status before DM creation
+    if (await isBlockedEitherDirection(agentId, peerAgentId)) {
+        throw new ConversationError('This interaction is blocked', 403);
+    }
+
+    // Issue #1: Enforce friendship requirement for new DMs (configurable)
+    if (config.dmRequiresFriendship) {
+        // Allow re-opening existing DMs even without friendship
+        const { rows: existingDm } = await pool.query(
+            `SELECT c.id
+             FROM conversations c
+             JOIN conversation_members cm1 ON cm1.conversation_id = c.id AND cm1.agent_id = $1
+             JOIN conversation_members cm2 ON cm2.conversation_id = c.id AND cm2.agent_id = $2
+             WHERE c.type = 'dm'
+             LIMIT 1`,
+            [agentId, peerAgentId]
+        );
+        if (existingDm.length === 0) {
+            const { rowCount: isFriend } = await pool.query(
+                `SELECT 1 FROM friendships
+                 WHERE agent_id = $1 AND friend_id = $2
+                 LIMIT 1`,
+                [agentId, peerAgentId]
+            );
+            if (!isFriend) {
+                throw new ConversationError(
+                    'You must be friends before creating a DM. Send a friend request first.',
+                    403
+                );
+            }
+        }
     }
 
     const client = await pool.connect();
@@ -93,6 +127,33 @@ export async function createOrGetDM(agentId: string, peerAgentId: string) {
  */
 export async function createGroup(ownerId: string, name: string, memberIds: string[]) {
     const allMembers = new Set([ownerId, ...memberIds]);
+
+    // Issue #11: Validate friendship for all members when DM_REQUIRES_FRIENDSHIP is enabled
+    if (config.dmRequiresFriendship) {
+        const nonFriendIds: string[] = [];
+        for (const memberId of memberIds) {
+            if (memberId === ownerId) continue;
+            const { rowCount } = await pool.query(
+                'SELECT 1 FROM friendships WHERE agent_id = $1 AND friend_id = $2',
+                [ownerId, memberId]
+            );
+            if (!rowCount) nonFriendIds.push(memberId);
+        }
+        if (nonFriendIds.length > 0) {
+            throw new ConversationError(
+                `Cannot add non-friends to group. Send friend requests first.`,
+                403
+            );
+        }
+    }
+
+    // Issue #9: Check block status for all members
+    for (const memberId of memberIds) {
+        if (memberId === ownerId) continue;
+        if (await isBlockedEitherDirection(ownerId, memberId)) {
+            throw new ConversationError('Cannot add blocked agents to group', 403);
+        }
+    }
 
     const client = await pool.connect();
     try {
@@ -247,6 +308,20 @@ async function assertCanUpdatePolicy(conversationId: string, requesterId: string
 export async function addMember(conversationId: string, requesterId: string, newAgentId: string) {
     await assertOwner(conversationId, requesterId);
 
+    if (config.dmRequiresFriendship) {
+        const { rowCount: isFriend } = await pool.query(
+            'SELECT 1 FROM friendships WHERE agent_id = $1 AND friend_id = $2 LIMIT 1',
+            [requesterId, newAgentId]
+        );
+        if (!isFriend) {
+            throw new ConversationError('Cannot add non-friends to group. Send friend requests first.', 403);
+        }
+    }
+
+    if (await isBlockedEitherDirection(requesterId, newAgentId)) {
+        throw new ConversationError('Cannot add blocked agents to group', 403);
+    }
+
     try {
         await pool.query(
             `INSERT INTO conversation_members (conversation_id, agent_id, role) VALUES ($1, $2, 'member')`,
@@ -315,5 +390,77 @@ async function assertOwner(conversationId: string, agentId: string) {
     }
     if (rows[0].owner_id !== agentId) {
         throw new ConversationError('Only the group owner can manage members', 403);
+    }
+}
+
+/**
+ * Issue #5: Allow non-owner members to leave a group conversation.
+ */
+export async function leaveGroup(conversationId: string, agentId: string): Promise<void> {
+    const { rows } = await pool.query(
+        'SELECT type, owner_id FROM conversations WHERE id = $1',
+        [conversationId]
+    );
+    if (rows.length === 0) {
+        throw new ConversationError('Conversation not found', 404);
+    }
+    if (rows[0].type !== 'group') {
+        throw new ConversationError('Cannot leave a DM conversation', 400);
+    }
+    if (rows[0].owner_id === agentId) {
+        throw new ConversationError(
+            'Owner cannot leave the group. Transfer ownership first or delete the group.',
+            400
+        );
+    }
+
+    const { rowCount } = await pool.query(
+        'DELETE FROM conversation_members WHERE conversation_id = $1 AND agent_id = $2',
+        [conversationId, agentId]
+    );
+    if (rowCount === 0) {
+        throw new ConversationError('Not a member of this group', 404);
+    }
+    disconnectAgentFromConversation(conversationId, agentId);
+}
+
+/**
+ * Issue #14: Transfer group ownership to another member.
+ */
+export async function transferOwnership(
+    conversationId: string,
+    currentOwnerId: string,
+    newOwnerId: string
+): Promise<void> {
+    if (currentOwnerId === newOwnerId) {
+        throw new ConversationError('New owner must be different from current owner', 400);
+    }
+
+    await assertOwner(conversationId, currentOwnerId);
+    await assertMember(conversationId, newOwnerId);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query(
+            'UPDATE conversations SET owner_id = $1 WHERE id = $2',
+            [newOwnerId, conversationId]
+        );
+        await client.query(
+            `UPDATE conversation_members SET role = 'member'
+             WHERE conversation_id = $1 AND agent_id = $2`,
+            [conversationId, currentOwnerId]
+        );
+        await client.query(
+            `UPDATE conversation_members SET role = 'owner'
+             WHERE conversation_id = $1 AND agent_id = $2`,
+            [conversationId, newOwnerId]
+        );
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
     }
 }

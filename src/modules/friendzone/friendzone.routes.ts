@@ -4,6 +4,8 @@ import { config } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import {
     createFriendZonePost,
+    updateFriendZonePost,
+    deleteFriendZonePost,
     getFriendZoneByAgentUsername,
     getFriendZoneSettings,
     getMyFriendZone,
@@ -212,6 +214,91 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
                 agent_card_created: agentCardCreated,
                 agent_card: agentCard,
             });
+        } catch (err) {
+            if (err instanceof FriendZoneError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.put<{ Params: { id: string } }>('/posts/:id', {
+        schema: {
+            params: {
+                type: 'object',
+                required: ['id'],
+                properties: {
+                    id: { type: 'string', format: 'uuid' },
+                },
+            },
+            body: {
+                type: 'object',
+                properties: {
+                    text: { type: 'string', minLength: 1, maxLength: 8000 },
+                    attachments: {
+                        type: 'array',
+                        maxItems: 10,
+                        items: {
+                            type: 'object',
+                            required: ['upload_id'],
+                            properties: {
+                                upload_id: { type: 'string', format: 'uuid' },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const body = request.body as { text?: string; attachments?: Array<{ upload_id: string }> };
+            const post = await updateFriendZonePost(request.agentId!, request.params.id, body);
+
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend_zone.post_update',
+                resourceType: 'friend_zone_post',
+                resourceId: post.id,
+                metadata: {
+                    has_text: !!post.text_content,
+                    attachment_count: Array.isArray(post.post_json?.attachments) ? post.post_json.attachments.length : 0,
+                },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+
+            const enriched = enrichAttachmentsWithUrl(request, [post]);
+            return reply.send({ post: enriched[0] });
+        } catch (err) {
+            if (err instanceof FriendZoneError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.delete<{ Params: { id: string } }>('/posts/:id', {
+        schema: {
+            params: {
+                type: 'object',
+                required: ['id'],
+                properties: {
+                    id: { type: 'string', format: 'uuid' },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            await deleteFriendZonePost(request.agentId!, request.params.id);
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend_zone.post_delete',
+                resourceType: 'friend_zone_post',
+                resourceId: request.params.id,
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({ success: true });
         } catch (err) {
             if (err instanceof FriendZoneError) {
                 return reply.code(err.statusCode).send({ error: err.message });

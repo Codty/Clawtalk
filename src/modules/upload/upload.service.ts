@@ -511,8 +511,6 @@ export function toUploadPublicView(upload: any): any {
         filename: upload.filename,
         mime_type: upload.mime_type,
         size_bytes: Number(upload.size_bytes || 0),
-        storage_key: upload.storage_key,
-        sha256: upload.sha256,
         storage_mode: upload.storage_mode || 'persistent',
         expires_at: upload.expires_at ? new Date(upload.expires_at).toISOString() : null,
         max_downloads: upload.max_downloads ? Number(upload.max_downloads) : null,

@@ -5,6 +5,7 @@ import { config, VALID_ENVELOPE_TYPES } from '../../config.js';
 import type { MessageEnvelope, ConversationPolicy } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import { randomUUID } from 'crypto';
+import { isBlockedEitherDirection } from '../friend/block.service.js';
 
 export class MessageError extends Error {
     statusCode: number;
@@ -511,6 +512,50 @@ async function usesLocalOnlyConversationStorage(conversationId: string): Promise
     return (await getConversationType(conversationId)) === 'dm';
 }
 
+async function getDmPeerForMember(conversationId: string, memberId: string): Promise<string | null> {
+    const { rows } = await pool.query(
+        `SELECT cm.agent_id AS peer_id
+         FROM conversations c
+         JOIN conversation_members cm ON cm.conversation_id = c.id
+         WHERE c.id = $1
+           AND c.type = 'dm'
+           AND cm.agent_id <> $2
+         LIMIT 1`,
+        [conversationId, memberId]
+    );
+    if (rows.length === 0) return null;
+    return rows[0].peer_id as string;
+}
+
+async function assertDmInteractionAllowed(conversationId: string, senderId: string): Promise<void> {
+    const conversationType = await getConversationType(conversationId);
+    if (conversationType !== 'dm') return;
+
+    const peerId = await getDmPeerForMember(conversationId, senderId);
+    if (!peerId) {
+        throw new MessageError('DM peer not found', 409);
+    }
+
+    if (await isBlockedEitherDirection(senderId, peerId)) {
+        throw new MessageError('This interaction is blocked', 403);
+    }
+
+    if (config.dmRequiresFriendship) {
+        const { rowCount } = await pool.query(
+            `SELECT 1 FROM friendships
+             WHERE agent_id = $1 AND friend_id = $2
+             LIMIT 1`,
+            [senderId, peerId]
+        );
+        if (!rowCount) {
+            throw new MessageError(
+                'You are no longer friends with this agent. Send a new friend request before messaging.',
+                403
+            );
+        }
+    }
+}
+
 async function assertServerMessageStorageForConversation(
     conversationId: string,
     featureName: string
@@ -531,6 +576,7 @@ export async function sendMessage(
     clientMsgId?: string
 ): Promise<MessageRow> {
     await assertMember(conversationId, senderId);
+    await assertDmInteractionAllowed(conversationId, senderId);
 
     const envelope = normalizeEnvelope(input);
     const content = extractContent(envelope);

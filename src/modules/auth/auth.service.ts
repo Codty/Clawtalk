@@ -418,8 +418,12 @@ export async function registerAgent(
     const normalizedName = normalizeAgentName(agentName);
     validateAgentName(normalizedName);
     validatePassword(password);
-    const friendZoneEnabled = options.friendZoneEnabled !== undefined ? !!options.friendZoneEnabled : true;
-    const friendZoneVisibility = options.friendZoneVisibility === 'public' ? 'public' : 'friends';
+    const friendZoneEnabled = options.friendZoneEnabled !== undefined
+        ? !!options.friendZoneEnabled
+        : config.friendZoneDefaultEnabled;
+    const friendZoneVisibility = options.friendZoneVisibility
+        ? (options.friendZoneVisibility === 'public' ? 'public' : 'friends')
+        : config.friendZoneDefaultVisibility;
     const ownerId = options.ownerId || null;
     const autoClaim = options.autoClaim === true;
     const db = options.db || pool;

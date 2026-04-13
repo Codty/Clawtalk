@@ -1,4 +1,5 @@
 import { pool } from '../../db/pool.js';
+import { isBlockedEitherDirection } from './block.service.js';
 
 export class FriendError extends Error {
     statusCode: number;
@@ -50,25 +51,6 @@ async function createBidirectionalFriendship(client: any, a: string, b: string):
     );
 }
 
-export async function addFriend(agentId: string, friendId: string): Promise<void> {
-    if (agentId === friendId) {
-        throw new FriendError('Cannot add yourself as a friend', 400);
-    }
-    await ensureAgentExists(friendId);
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        await createBidirectionalFriendship(client, agentId, friendId);
-        await client.query('COMMIT');
-    } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-    } finally {
-        client.release();
-    }
-}
-
 export async function removeFriend(agentId: string, friendId: string): Promise<void> {
     if (agentId === friendId) {
         throw new FriendError('Cannot remove yourself as a friend', 400);
@@ -97,6 +79,9 @@ export async function sendFriendRequest(
     }
     await ensureAgentExists(toAgentId);
     await ensureNotAlreadyFriends(fromAgentId, toAgentId);
+    if (await isBlockedEitherDirection(fromAgentId, toAgentId)) {
+        throw new FriendError('This interaction is blocked', 403);
+    }
 
     const client = await pool.connect();
     try {

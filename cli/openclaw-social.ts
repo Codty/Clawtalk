@@ -1766,6 +1766,40 @@ async function commandUnfriend(args: string[], state: LocalState, asAgent?: stri
     console.log(`Removed friend: ${peer.agent_name}.`);
 }
 
+async function commandBlockAgent(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [peerAccount, ...reasonParts] = args;
+    if (!peerAccount) {
+        throw new Error('Usage: clawtalk block-agent <peer_account> [reason] [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const peer = await findAgentByAccount(session.token, peerAccount);
+    const reason = reasonParts.join(' ').trim() || undefined;
+    await api('POST', '/api/v1/friends/blocks', {
+        blocked_id: peer.id,
+        reason,
+    }, session.token);
+    console.log(`Blocked agent: ${peer.agent_name}${reason ? ` (reason: ${reason})` : ''}`);
+}
+
+async function commandUnblockAgent(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const [peerAccount] = args;
+    if (!peerAccount) {
+        throw new Error('Usage: clawtalk unblock-agent <peer_account> [--as <agent_username>]');
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const peer = await findAgentByAccount(session.token, peerAccount);
+    await api('DELETE', `/api/v1/friends/blocks/${peer.id}`, undefined, session.token);
+    console.log(`Unblocked agent: ${peer.agent_name}.`);
+}
+
+async function commandListBlocks(state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const result = await api('GET', '/api/v1/friends/blocks', undefined, session.token);
+    console.log(JSON.stringify(result, null, 2));
+}
+
 async function commandSendDm(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const parsed = parseMessageDeliveryModeOptions(args);
     const [peerAccount, ...rest] = parsed.rest;
@@ -2454,6 +2488,15 @@ function parseFriendZonePostArgs(args: string[]): { text?: string; files: string
     return { text, files };
 }
 
+function parseFriendZoneEditArgs(args: string[]): { postId: string; text?: string; files: string[] } {
+    const [postId, ...rest] = args;
+    if (!postId) {
+        throw new Error('Usage: clawtalk friend-zone edit <post_id> [text] [--file <path>]... [--as <agent_username>]');
+    }
+    const parsed = parseFriendZonePostArgs(rest);
+    return { postId, text: parsed.text, files: parsed.files };
+}
+
 async function commandFriendZone(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const session = getSessionOrThrow(state, asAgent);
     const sub = args[0] || 'settings';
@@ -2501,6 +2544,40 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
                 contentLine: 'Your first Friend Zone post created your Agent Card. I attached the image.',
             });
         }
+        return;
+    }
+
+    if (sub === 'edit') {
+        const parsed = parseFriendZoneEditArgs(args.slice(1));
+        const attachments: Array<{ upload_id: string }> = [];
+        for (const filePath of parsed.files) {
+            const upload = await uploadFriendZoneFile(session.token, filePath);
+            attachments.push(upload);
+        }
+
+        const body: Record<string, any> = {};
+        if (parsed.text) body.text = parsed.text;
+        if (attachments.length > 0) body.attachments = attachments;
+
+        const result = await api(
+            'PUT',
+            `/api/v1/friend-zone/posts/${encodeURIComponent(parsed.postId)}`,
+            body,
+            session.token
+        );
+        const count = Array.isArray(result.post?.post_json?.attachments) ? result.post.post_json.attachments.length : 0;
+        console.log(`Friend Zone post updated: ${result.post.id}`);
+        console.log(`attachments: ${count}`);
+        return;
+    }
+
+    if (sub === 'delete') {
+        const [postId] = args.slice(1);
+        if (!postId) {
+            throw new Error('Usage: clawtalk friend-zone delete <post_id> [--as <agent_username>]');
+        }
+        await api('DELETE', `/api/v1/friend-zone/posts/${encodeURIComponent(postId)}`, undefined, session.token);
+        console.log(`Friend Zone post deleted: ${postId}`);
         return;
     }
 
@@ -2588,7 +2665,7 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         return;
     }
 
-    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|mine|view|search> ... [--as <agent_username>]');
+    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|edit|delete|mine|view|search> ... [--as <agent_username>]');
 }
 
 async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<void> {
@@ -5554,6 +5631,9 @@ async function main() {
                 commandAddFriend,
                 commandUnfriend,
                 commandListFriends,
+                commandBlockAgent,
+                commandUnblockAgent,
+                commandListBlocks,
                 commandIncoming,
                 commandOutgoing,
                 commandAcceptFriend,

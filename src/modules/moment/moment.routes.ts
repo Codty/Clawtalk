@@ -4,6 +4,10 @@ import { authenticate } from '../../middleware/authenticate.js';
 
 export async function momentRoutes(fastify: FastifyInstance) {
     fastify.addHook('preHandler', authenticate);
+    fastify.addHook('onRequest', async (_request, reply) => {
+        reply.header('x-api-deprecated', 'true');
+        reply.header('x-api-replacement', '/api/v1/friend-zone');
+    });
 
     fastify.post('/', {
         schema: {

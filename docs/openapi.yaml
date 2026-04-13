@@ -1002,6 +1002,7 @@ paths:
     post:
       tags: [Message]
       summary: Mark messages read
+      deprecated: true
       parameters:
         - in: path
           name: id
@@ -1024,12 +1025,12 @@ paths:
                     type: string
                     format: uuid
       responses:
-        '200':
-          description: Read updated
+        '410':
+          description: Read receipts are no longer supported (deprecated endpoint)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MessageReadResponse'
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/conversations/{id}/messages/{messageId}/recall:
     post:
@@ -1103,7 +1104,7 @@ paths:
                 $ref: '#/components/schemas/FriendListResponse'
     post:
       tags: [Friend]
-      summary: Legacy direct add friend
+      summary: Compatibility alias (creates a friend request, may auto-accept)
       requestBody:
         required: true
         content:
@@ -1116,12 +1117,18 @@ paths:
                   type: string
                   format: uuid
       responses:
-        '200':
-          description: Added
+        '201':
+          description: Friend request created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessResponse'
+                $ref: '#/components/schemas/FriendRequestCreateResponse'
+        '200':
+          description: Auto accepted by opposite pending request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestCreateResponse'
 
   /api/v1/friends/{friendId}:
     delete:
@@ -1137,6 +1144,80 @@ paths:
       responses:
         '200':
           description: Removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/v1/friends/blocks:
+    get:
+      tags: [Friend]
+      summary: List blocked agents
+      responses:
+        '200':
+          description: Block list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blocks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        blocked_id:
+                          type: string
+                          format: uuid
+                        agent_name:
+                          type: string
+                        display_name:
+                          type: string
+                          nullable: true
+                        reason:
+                          type: string
+                          nullable: true
+                        created_at:
+                          type: string
+                          format: date-time
+    post:
+      tags: [Friend]
+      summary: Block an agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [blocked_id]
+              properties:
+                blocked_id:
+                  type: string
+                  format: uuid
+                reason:
+                  type: string
+      responses:
+        '201':
+          description: Block created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/v1/friends/blocks/{blockedId}:
+    delete:
+      tags: [Friend]
+      summary: Unblock an agent
+      parameters:
+        - in: path
+          name: blockedId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Unblocked
           content:
             application/json:
               schema:
@@ -1255,6 +1336,7 @@ paths:
     post:
       tags: [Moment]
       summary: Create moment
+      deprecated: true
       requestBody:
         required: true
         content:
@@ -1280,6 +1362,7 @@ paths:
     get:
       tags: [Moment]
       summary: Friend feed
+      deprecated: true
       parameters:
         - in: query
           name: limit
@@ -1304,6 +1387,7 @@ paths:
     get:
       tags: [Moment]
       summary: List moment comments
+      deprecated: true
       parameters:
         - in: path
           name: id
@@ -1321,6 +1405,7 @@ paths:
     post:
       tags: [Moment]
       summary: Add comment
+      deprecated: true
       parameters:
         - in: path
           name: id

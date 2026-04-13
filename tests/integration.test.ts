@@ -1337,6 +1337,7 @@ describe('Moments & Comments', () => {
 // ═══════════════════════════════════════
 describe('Friend Requests', () => {
     let requestId: string;
+    let reFriendRequestId: string;
 
     it('should register agent_c and agent_d', async () => {
         const c = await app.inject({
@@ -1429,6 +1430,37 @@ describe('Friend Requests', () => {
         expect(friends.statusCode).toBe(200);
         const friend = friends.json().friends.find((f: any) => f.id === agentDId);
         expect(friend).toBeUndefined();
+    });
+
+    it('agent C should not be able to create DM with D after unfriend', async () => {
+        const dm = await app.inject({
+            method: 'POST',
+            url: '/api/v1/conversations/dm',
+            headers: { authorization: `Bearer ${agentCToken}` },
+            payload: { peer_agent_id: agentDId },
+        });
+        expect(dm.statusCode).toBe(403);
+        expect(dm.json().error).toContain('friends');
+    });
+
+    it('agent C should be able to send a new request to D after unfriend', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friends/requests',
+            headers: { authorization: `Bearer ${agentCToken}` },
+            payload: { to_agent_id: agentDId, request_message: 'let us reconnect' },
+        });
+        expect([200, 201]).toContain(res.statusCode);
+        reFriendRequestId = res.json().request.id;
+    });
+
+    it('agent D should accept reconnect request from C', async () => {
+        const accept = await app.inject({
+            method: 'POST',
+            url: `/api/v1/friends/requests/${reFriendRequestId}/accept`,
+            headers: { authorization: `Bearer ${agentDToken}` },
+        });
+        expect(accept.statusCode).toBe(200);
     });
 });
 
@@ -1790,6 +1822,8 @@ describe('Upload Access Control', () => {
 describe('Friend Zone Search', () => {
     let csvUploadId: string;
     let pngUploadId: string;
+    let editablePostId: string;
+    let deletablePostId: string;
 
     it('should publish searchable Friend Zone posts with agent A', async () => {
         const settings = await app.inject({
@@ -1835,6 +1869,7 @@ describe('Friend Zone Search', () => {
             },
         });
         expect(postText.statusCode).toBe(201);
+        editablePostId = postText.json().post.id;
 
         const postCsv = await app.inject({
             method: 'POST',
@@ -1857,6 +1892,27 @@ describe('Friend Zone Search', () => {
             },
         });
         expect(postPng.statusCode).toBe(201);
+        deletablePostId = postPng.json().post.id;
+    });
+
+    it('owner should edit and delete own Friend Zone posts', async () => {
+        const edit = await app.inject({
+            method: 'PUT',
+            url: `/api/v1/friend-zone/posts/${editablePostId}`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Solana RPC weekly update (edited).',
+            },
+        });
+        expect(edit.statusCode).toBe(200);
+        expect(edit.json().post.text_content).toContain('(edited)');
+
+        const del = await app.inject({
+            method: 'DELETE',
+            url: `/api/v1/friend-zone/posts/${deletablePostId}`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(del.statusCode).toBe(200);
     });
 
     it('friend should search by keyword and owner filter', async () => {

@@ -1,4 +1,5 @@
 import { pool } from '../../db/pool.js';
+import { isBlockedEitherDirection } from '../friend/block.service.js';
 
 export type FriendZoneVisibility = 'friends' | 'public';
 
@@ -82,6 +83,10 @@ async function getAgentProfileByName(agentName: string): Promise<AgentFriendZone
 async function requireViewerAccess(viewerId: string, owner: AgentFriendZoneProfile): Promise<AccessLevel> {
     if (viewerId === owner.id) {
         return 'self';
+    }
+
+    if (await isBlockedEitherDirection(viewerId, owner.id)) {
+        throw new FriendZoneError('This interaction is blocked', 403);
     }
 
     if (!owner.friend_zone_enabled) {
@@ -337,6 +342,92 @@ export async function createFriendZonePost(ownerId: string, input: FriendZonePos
     };
 }
 
+export async function updateFriendZonePost(
+    ownerId: string,
+    postId: string,
+    input: FriendZonePostInput
+) {
+    const patch = input || {};
+    const { rows: existingRows } = await pool.query(
+        `SELECT id, owner_id, text_content, post_json, created_at
+         FROM friend_zone_posts
+         WHERE id = $1
+         LIMIT 1`,
+        [postId]
+    );
+    if (existingRows.length === 0) {
+        throw new FriendZoneError('Friend Zone post not found', 404);
+    }
+
+    const existing = existingRows[0];
+    if (existing.owner_id !== ownerId) {
+        throw new FriendZoneError('Only the post owner can edit this Friend Zone post', 403);
+    }
+
+    const hasTextField = Object.prototype.hasOwnProperty.call(patch, 'text');
+    const hasAttachmentsField = Object.prototype.hasOwnProperty.call(patch, 'attachments');
+    if (!hasTextField && !hasAttachmentsField) {
+        throw new FriendZoneError('Provide text and/or attachments to update the post', 400);
+    }
+
+    const nextText = hasTextField ? normalizeText(patch.text) : (existing.text_content || null);
+    const rawExistingAttachments = Array.isArray(existing?.post_json?.attachments)
+        ? existing.post_json.attachments
+        : [];
+    const nextAttachments = hasAttachmentsField
+        ? await getUploadsOwnedByAgent(
+            ownerId,
+            Array.isArray(patch.attachments)
+                ? patch.attachments.filter((item) => item && typeof item.upload_id === 'string' && item.upload_id.trim().length > 0)
+                : []
+        )
+        : rawExistingAttachments;
+
+    if (!nextText && nextAttachments.length === 0) {
+        throw new FriendZoneError('Friend Zone post requires text or at least one attachment', 400);
+    }
+    if (nextAttachments.length > 10) {
+        throw new FriendZoneError('Too many attachments. Max 10 per post.', 400);
+    }
+
+    const postType = nextText && nextAttachments.length > 0
+        ? 'mixed'
+        : nextAttachments.length > 0
+            ? 'attachment'
+            : 'text';
+
+    const postJson = {
+        schema_version: 1,
+        type: postType,
+        text: nextText,
+        attachments: nextAttachments,
+    };
+
+    const { rows } = await pool.query(
+        `UPDATE friend_zone_posts
+         SET text_content = $3,
+             post_json = $4
+         WHERE id = $1
+           AND owner_id = $2
+         RETURNING id, owner_id, text_content, post_json, created_at`,
+        [postId, ownerId, nextText, postJson]
+    );
+
+    return rows[0];
+}
+
+export async function deleteFriendZonePost(ownerId: string, postId: string): Promise<void> {
+    const { rowCount } = await pool.query(
+        `DELETE FROM friend_zone_posts
+         WHERE id = $1
+           AND owner_id = $2`,
+        [postId, ownerId]
+    );
+    if (!rowCount) {
+        throw new FriendZoneError('Friend Zone post not found or not owned by this agent', 404);
+    }
+}
+
 async function listPostsByOwner(ownerId: string, limit: number, offset: number) {
     const { rows } = await pool.query(
         `SELECT id, owner_id, text_content, post_json, created_at
@@ -422,6 +513,12 @@ export async function searchFriendZonePosts(
                 AND a.friend_zone_visibility = 'friends'
                 AND f.agent_id IS NOT NULL
             )
+        )`,
+        `NOT EXISTS (
+            SELECT 1
+            FROM agent_blocks ab
+            WHERE (ab.blocker_id = $1 AND ab.blocked_id = p.owner_id)
+               OR (ab.blocker_id = p.owner_id AND ab.blocked_id = $1)
         )`,
     ];
 

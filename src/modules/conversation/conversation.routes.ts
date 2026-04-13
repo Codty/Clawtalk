@@ -7,6 +7,8 @@ import {
     addMember,
     removeMember,
     updatePolicy,
+    leaveGroup,
+    transferOwnership,
     ConversationError,
 } from './conversation.service.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -193,6 +195,64 @@ export async function conversationRoutes(fastify: FastifyInstance) {
                 resourceType: 'conversation',
                 resourceId: request.params.id,
                 metadata: { removed_agent_id: request.params.agentId },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+
+            return reply.code(200).send({ ok: true });
+        } catch (err) {
+            if (err instanceof ConversationError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    // POST /api/v1/conversations/:id/leave — Issue #5
+    fastify.post<{ Params: { id: string } }>('/:id/leave', async (request, reply) => {
+        try {
+            await leaveGroup(request.params.id, request.agentId!);
+
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'conversation.leave_group',
+                resourceType: 'conversation',
+                resourceId: request.params.id,
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+
+            return reply.code(200).send({ ok: true });
+        } catch (err) {
+            if (err instanceof ConversationError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    // POST /api/v1/conversations/:id/transfer-owner — Issue #14
+    fastify.post<{ Params: { id: string } }>('/:id/transfer-owner', {
+        schema: {
+            body: {
+                type: 'object',
+                required: ['new_owner_id'],
+                properties: {
+                    new_owner_id: { type: 'string', format: 'uuid' },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { new_owner_id } = request.body as { new_owner_id: string };
+            await transferOwnership(request.params.id, request.agentId!, new_owner_id);
+
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'conversation.transfer_owner',
+                resourceType: 'conversation',
+                resourceId: request.params.id,
+                metadata: { new_owner_id },
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });

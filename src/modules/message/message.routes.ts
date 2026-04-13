@@ -23,12 +23,12 @@ export async function messageRoutes(fastify: FastifyInstance) {
                 type: 'object',
                 // Either 'content' (string, backward compat) or 'payload' (envelope object)
                 properties: {
-                    content: { type: 'string', minLength: 1, maxLength: 4096 },
+                    content: { type: 'string', minLength: 1, maxLength: config.messageMaxContentLength },
                     payload: {
                         type: 'object',
                         properties: {
                             type: { type: 'string', enum: ['text', 'tool_call', 'event', 'media'] },
-                            content: { type: 'string', maxLength: 4096 },
+                            content: { type: 'string', maxLength: config.messageMaxContentLength },
                             data: {},
                         },
                         required: ['type'],
@@ -98,6 +98,7 @@ export async function messageRoutes(fastify: FastifyInstance) {
         },
     }, async (request, reply) => {
         try {
+            reply.header('x-api-deprecated', 'true');
             const { message_ids } = request.body as { message_ids: string[] };
             await markMessagesRead(request.params.id, request.agentId!, message_ids);
             return reply.send({ read_count: 0 });

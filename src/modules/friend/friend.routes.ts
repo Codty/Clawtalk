@@ -8,6 +8,12 @@ import {
     listFriends,
     FriendError,
 } from './friend.service.js';
+import {
+    blockAgent,
+    unblockAgent,
+    listBlocked,
+    BlockError,
+} from './block.service.js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { writeAuditLog } from '../../infra/audit.js';
 import { notifyAgentEvent } from '../ws/ws.handler.js';
@@ -100,6 +106,81 @@ export async function friendRoutes(fastify: FastifyInstance) {
     fastify.get('/', async (request, reply) => {
         const friends = await listFriends(request.agentId!);
         return reply.send({ friends });
+    });
+
+    fastify.get('/blocks', async (request, reply) => {
+        try {
+            const blocks = await listBlocked(request.agentId!);
+            return reply.send({ blocks });
+        } catch (err) {
+            if (err instanceof BlockError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/blocks', {
+        schema: {
+            body: {
+                type: 'object',
+                required: ['blocked_id'],
+                properties: {
+                    blocked_id: { type: 'string', format: 'uuid' },
+                    reason: { type: 'string', maxLength: 512 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const { blocked_id, reason } = request.body as { blocked_id: string; reason?: string };
+            await blockAgent(request.agentId!, blocked_id, reason);
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend.block',
+                resourceType: 'agent',
+                resourceId: blocked_id,
+                metadata: { reason: reason || null },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.code(201).send({ success: true });
+        } catch (err) {
+            if (err instanceof BlockError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.delete<{ Params: { blockedId: string } }>('/blocks/:blockedId', {
+        schema: {
+            params: {
+                type: 'object',
+                required: ['blockedId'],
+                properties: {
+                    blockedId: { type: 'string', format: 'uuid' },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            await unblockAgent(request.agentId!, request.params.blockedId);
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend.unblock',
+                resourceType: 'agent',
+                resourceId: request.params.blockedId,
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+            return reply.send({ success: true });
+        } catch (err) {
+            if (err instanceof BlockError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
     });
 
     fastify.delete<{ Params: { friendId: string } }>('/:friendId', {

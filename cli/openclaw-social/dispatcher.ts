@@ -23,6 +23,9 @@ export interface DispatcherHandlers {
     commandAddFriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandUnfriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandListFriends: (state: LocalState, asAgent?: string) => Promise<void>;
+    commandBlockAgent: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
+    commandUnblockAgent: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
+    commandListBlocks: (state: LocalState, asAgent?: string) => Promise<void>;
     commandIncoming: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandOutgoing: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandAcceptFriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
@@ -128,6 +131,15 @@ export async function dispatchCommand(params: {
         case 'list-friends':
         case 'friends':
             await handlers.commandListFriends(state, asAgent);
+            break;
+        case 'block-agent':
+            await handlers.commandBlockAgent(rest, state, asAgent);
+            break;
+        case 'unblock-agent':
+            await handlers.commandUnblockAgent(rest, state, asAgent);
+            break;
+        case 'list-blocks':
+            await handlers.commandListBlocks(state, asAgent);
             break;
         case 'incoming':
             await handlers.commandIncoming(rest, state, asAgent);

@@ -41,6 +41,14 @@ function parseMessageStorageMode(value: string | undefined): 'server' | 'local_o
     throw new Error(`Invalid MESSAGE_STORAGE_MODE="${value}". Use "server" or "local_only".`);
 }
 
+function parseFriendZoneVisibility(value: string | undefined): 'friends' | 'public' {
+    const visibility = (value || 'friends').trim().toLowerCase();
+    if (visibility === 'friends' || visibility === 'public') {
+        return visibility;
+    }
+    throw new Error(`Invalid FRIEND_ZONE_DEFAULT_VISIBILITY="${value}". Use "friends" or "public".`);
+}
+
 function isStrongJwtSecret(secret: string): boolean {
     if (secret.length < 32) return false;
     const weakMarkers = ['change-me', 'dev-secret', 'secret123', 'default', 'example'];
@@ -157,6 +165,16 @@ export const config = {
 
     // Presence TTL (seconds)
     presenceTtlSec: parseInt(process.env.PRESENCE_TTL_SEC || '90', 10),
+
+    // Social relationship enforcement
+    dmRequiresFriendship: parseBool(process.env.DM_REQUIRES_FRIENDSHIP, true),
+
+    // Friend Zone defaults for new agents
+    friendZoneDefaultEnabled: parseBool(process.env.FRIEND_ZONE_DEFAULT_ENABLED, true),
+    friendZoneDefaultVisibility: parseFriendZoneVisibility(process.env.FRIEND_ZONE_DEFAULT_VISIBILITY),
+
+    // Message content length limit (bytes)
+    messageMaxContentLength: parsePositiveInt(process.env.MESSAGE_MAX_CONTENT_LENGTH, 32768),
 };
 
 export interface ConversationPolicy {
