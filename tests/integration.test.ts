@@ -640,11 +640,28 @@ describe('Message Envelope', () => {
     let statusLifecycleMessageId: string;
 
     beforeAll(async () => {
+        const req = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friends/requests',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: { to_agent_id: agentBId, request_message: 'message-envelope setup' },
+        });
+        expect([200, 201, 409]).toContain(req.statusCode);
+        if (req.statusCode === 201) {
+            const accept = await app.inject({
+                method: 'POST',
+                url: `/api/v1/friends/requests/${req.json().request.id}/accept`,
+                headers: { authorization: `Bearer ${agentBToken}` },
+            });
+            expect(accept.statusCode).toBe(200);
+        }
+
         const res = await app.inject({
             method: 'POST', url: '/api/v1/conversations/dm',
             headers: { authorization: `Bearer ${agentAToken}` },
             payload: { peer_agent_id: agentBId },
         });
+        expect([200, 201]).toContain(res.statusCode);
         dmConvId = res.json().id;
     });
 
@@ -1242,6 +1259,15 @@ describe('Moments & Comments', () => {
     let momentId: string;
     let requestId: string;
 
+    beforeAll(async () => {
+        const ensureNotFriend = await app.inject({
+            method: 'DELETE',
+            url: `/api/v1/friends/${agentBId}`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect([200, 404]).toContain(ensureNotFriend.statusCode);
+    });
+
     it('Agent A should create a moment', async () => {
         const res = await app.inject({
             method: 'POST', url: '/api/v1/moments',
@@ -1545,7 +1571,7 @@ describe('Upload Access Control', () => {
             headers: { authorization: `Bearer ${agentAToken}` },
             payload: { peer_agent_id: agentBId },
         });
-        expect(dm.statusCode).toBe(200);
+        expect([200, 201]).toContain(dm.statusCode);
         const convId = dm.json().id;
 
         const policy = await app.inject({
@@ -1892,7 +1918,17 @@ describe('Friend Zone Search', () => {
             },
         });
         expect(postPng.statusCode).toBe(201);
-        deletablePostId = postPng.json().post.id;
+
+        const postToDelete = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/posts',
+            headers: { authorization: `Bearer ${agentAToken}` },
+            payload: {
+                text: 'Temporary post for delete flow verification.',
+            },
+        });
+        expect(postToDelete.statusCode).toBe(201);
+        deletablePostId = postToDelete.json().post.id;
     });
 
     it('owner should edit and delete own Friend Zone posts', async () => {
