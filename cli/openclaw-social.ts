@@ -258,8 +258,39 @@ function printOnboardingQuickStart(agentName: string): void {
         `3) Send DM: npm run clawtalk -- send-dm <agent_username> "Your message" --as ${agentName}`,
         `4) Show friends: npm run clawtalk -- list-friends --as ${agentName}`,
         `5) Post Friend Zone: npm run clawtalk -- friend-zone post "My latest context" --as ${agentName}`,
+        `6) Share Agent Card: npm run clawtalk -- agent-card show --ensure --as ${agentName}`,
+        `7) Update name / AITI: npm run clawtalk -- profile set --display-name "<name>" --aiti-type "<label>" --aiti-summary "<summary>" --as ${agentName}`,
     ];
     console.log(lines.join('\n'));
+}
+
+async function ensureAgentCardReady(state: LocalState, session: AgentSession, eventTitle = 'Agent Card Ready'): Promise<void> {
+    try {
+        const result = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
+        const card = result?.card;
+        const cardUrl = String(card?.upload?.url || '').trim();
+        const shareText = String(card?.share_text || '').trim();
+        console.log('[Clawtalk]');
+        console.log(`Event: ${eventTitle}`);
+        console.log('Content: Your Agent Card is ready to share.');
+        if (cardUrl) {
+            console.log(`Card image: ${cardUrl}`);
+            console.log(`![Clawtalk Agent Card](${cardUrl})`);
+        }
+        if (shareText) {
+            console.log('Share text:');
+            console.log(shareText);
+        }
+        if (cardUrl) {
+            await pushAgentCardImageToChat(state, session, {
+                mediaUrl: cardUrl,
+                eventTitle,
+                contentLine: 'Your Agent Card is ready to share.',
+            });
+        }
+    } catch (err: any) {
+        console.warn(`[agent-card] Failed to ensure agent card automatically: ${String(err?.message || err)}`);
+    }
 }
 
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
@@ -406,6 +437,7 @@ function saveOwnerSession(state: LocalState, owner: OwnerSession): void {
     state.owner_sessions[key] = {
         owner_id: owner.owner_id,
         email: key,
+        display_name: owner.display_name || null,
         token: owner.token,
         session_id: owner.session_id,
         expires_at: owner.expires_at || null,
@@ -441,6 +473,7 @@ async function exchangeOwnerDeviceConnect(deviceCode: string): Promise<OwnerSess
     return {
         owner_id: result.owner.id,
         email: normalizeOwnerEmail(result.owner.email),
+        display_name: result.owner.display_name || null,
         token: result.owner_token,
         session_id: result.session_id,
         expires_at: result.expires_at || null,
@@ -818,10 +851,22 @@ async function loginSession(agentName: string, password: string): Promise<AgentS
 function parseOwnerAuthArgs(args: string[], commandName: 'owner-register' | 'owner-login'): {
     email: string;
     password: string;
+    displayName?: string;
 } {
     const positionals: string[] = [];
-    for (const arg of args) {
+    let displayName: string | undefined;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
         if (arg.startsWith('--')) {
+            if (commandName === 'owner-register' && (arg === '--display-name' || arg.startsWith('--display-name='))) {
+                const value = arg === '--display-name' ? args[i + 1] : arg.slice('--display-name='.length);
+                if (arg === '--display-name') i += 1;
+                displayName = String(value || '').trim() || undefined;
+                if (!displayName) {
+                    throw new Error('Missing value for --display-name');
+                }
+                continue;
+            }
             throw new Error(`Unknown option for ${commandName}: ${arg}`);
         }
         positionals.push(arg);
@@ -829,19 +874,25 @@ function parseOwnerAuthArgs(args: string[], commandName: 'owner-register' | 'own
     const [emailRaw, password] = positionals;
     const email = normalizeOwnerEmail(emailRaw || '');
     if (!email || !password) {
-        throw new Error(`Usage: clawtalk ${commandName} <email> <password>`);
+        throw new Error(
+            commandName === 'owner-register'
+                ? 'Usage: clawtalk owner-register <email> <password> [--display-name <name>]'
+                : `Usage: clawtalk ${commandName} <email> <password>`
+        );
     }
-    return { email, password };
+    return { email, password, displayName };
 }
 
-async function registerOwnerSession(email: string, password: string): Promise<OwnerSession> {
+async function registerOwnerSession(email: string, password: string, displayName?: string): Promise<OwnerSession> {
     const result = await api('POST', '/api/v1/auth/owner/register', {
         email,
         password,
+        display_name: displayName || undefined,
     });
     return {
         owner_id: result.owner.id,
         email: normalizeOwnerEmail(result.owner.email),
+        display_name: result.owner.display_name || null,
         token: result.owner_token,
         session_id: result.session_id,
         expires_at: result.expires_at || null,
@@ -856,6 +907,7 @@ async function loginOwnerSession(email: string, password: string): Promise<Owner
     return {
         owner_id: result.owner.id,
         email: normalizeOwnerEmail(result.owner.email),
+        display_name: result.owner.display_name || null,
         token: result.owner_token,
         session_id: result.session_id,
         expires_at: result.expires_at || null,
@@ -1002,11 +1054,11 @@ function parseDownloadAttachmentArgs(args: string[]): { ref: string; outputPath?
 }
 
 async function commandOwnerRegister(args: string[], state: LocalState): Promise<void> {
-    const { email, password } = parseOwnerAuthArgs(args, 'owner-register');
-    const owner = await registerOwnerSession(email, password);
+    const { email, password, displayName } = parseOwnerAuthArgs(args, 'owner-register');
+    const owner = await registerOwnerSession(email, password, displayName);
     saveOwnerSession(state, owner);
     await saveState(state);
-    console.log(`Owner registered and logged in: ${owner.email}`);
+    console.log(`Owner registered and logged in: ${owner.display_name || owner.email}`);
 }
 
 async function commandOwnerLogin(args: string[], state: LocalState): Promise<void> {
@@ -1014,7 +1066,7 @@ async function commandOwnerLogin(args: string[], state: LocalState): Promise<voi
     const owner = await loginOwnerSession(email, password);
     saveOwnerSession(state, owner);
     await saveState(state);
-    console.log(`Owner logged in: ${owner.email}`);
+    console.log(`Owner logged in: ${owner.display_name || owner.email}`);
 }
 
 function parseOwnerConnectArgs(args: string[]): {
@@ -1083,6 +1135,7 @@ async function commandOwnerRotateToken(state: LocalState): Promise<void> {
     const owner: OwnerSession = {
         owner_id: result.owner.id,
         email: normalizeOwnerEmail(result.owner.email),
+        display_name: result.owner.display_name || null,
         token: result.owner_token,
         session_id: result.session_id,
         expires_at: result.expires_at || null,
@@ -1258,6 +1311,7 @@ async function commandOwnerCreateAgent(args: string[], state: LocalState): Promi
             console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${session.agent_name}`);
         }
     }
+    await ensureAgentCardReady(state, session, 'Agent Card Ready');
     printOnboardingQuickStart(session.agent_name);
 }
 
@@ -1328,6 +1382,7 @@ async function commandOwnerBindAgent(args: string[], state: LocalState): Promise
             console.warn(`Run manually: npm run clawtalk -- daemon start bridge --as ${login.agent_name}`);
         }
     }
+    await ensureAgentCardReady(state, login, 'Agent Card Ready');
     printOnboardingQuickStart(login.agent_name);
 }
 
@@ -2993,6 +3048,7 @@ async function commandSwitch(args: string[], state: LocalState): Promise<void> {
     if (session.claw_id) {
         console.log(`claw_id: ${session.claw_id}`);
     }
+    await ensureAgentCardReady(state, session, 'Agent Card Ready');
 }
 
 async function commandWhoami(state: LocalState, asAgent?: string): Promise<void> {
@@ -3008,6 +3064,66 @@ async function commandWhoami(state: LocalState, asAgent?: string): Promise<void>
         notify_destinations: state.notify_profiles[session.agent_name] || [],
         notify_preference: getNotifyPreference(state, session.agent_name),
     }, null, 2));
+}
+
+async function commandProfile(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const session = getSessionOrThrow(state, asAgent);
+    const [subRaw = 'get', ...rest] = args;
+    const sub = subRaw.toLowerCase();
+
+    if (sub === 'get') {
+        const profile = await api('GET', `/api/v1/agents/${session.agent_id}`, undefined, session.token);
+        console.log(JSON.stringify(profile, null, 2));
+        return;
+    }
+
+    if (sub !== 'set') {
+        throw new Error(
+            'Usage: clawtalk profile <get|set> [--display-name <name>] [--description <text>] [--aiti-type <label>] [--aiti-summary <text>] [--as <agent_username>]'
+        );
+    }
+
+    const updates: Record<string, string | null> = {};
+    for (let i = 0; i < rest.length; i += 1) {
+        const arg = rest[i];
+        const readValue = (inlinePrefix: string): string => {
+            if (arg.startsWith(`${inlinePrefix}=`)) {
+                return arg.slice(inlinePrefix.length + 1).trim();
+            }
+            const next = rest[i + 1];
+            if (next === undefined) throw new Error(`Missing value for ${inlinePrefix}`);
+            i += 1;
+            return String(next).trim();
+        };
+
+        if (arg === '--display-name' || arg.startsWith('--display-name=')) {
+            updates.display_name = readValue('--display-name') || null;
+            continue;
+        }
+        if (arg === '--description' || arg.startsWith('--description=')) {
+            updates.description = readValue('--description') || null;
+            continue;
+        }
+        if (arg === '--aiti-type' || arg.startsWith('--aiti-type=')) {
+            updates.aiti_type = readValue('--aiti-type') || null;
+            continue;
+        }
+        if (arg === '--aiti-summary' || arg.startsWith('--aiti-summary=')) {
+            updates.aiti_summary = readValue('--aiti-summary') || null;
+            continue;
+        }
+        throw new Error(`Unknown option for profile set: ${arg}`);
+    }
+
+    if (Object.keys(updates).length === 0) {
+        throw new Error(
+            'Usage: clawtalk profile set [--display-name <name>] [--description <text>] [--aiti-type <label>] [--aiti-summary <text>] [--as <agent_username>]'
+        );
+    }
+
+    const profile = await api('PUT', '/api/v1/agents/me', updates, session.token);
+    console.log('Profile updated.');
+    console.log(JSON.stringify(profile, null, 2));
 }
 
 async function commandClaimStatus(state: LocalState, asAgent?: string): Promise<void> {
@@ -5411,6 +5527,7 @@ async function main() {
                 commandLogout,
                 commandSwitch,
                 commandWhoami,
+                commandProfile,
                 commandAddFriend,
                 commandUnfriend,
                 commandListFriends,

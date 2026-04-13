@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pool } from '../../db/pool.js';
 import { createUpload, toUploadPublicView } from '../upload/upload.service.js';
 
-const CARD_STYLE_VERSION = 1;
+const CARD_STYLE_VERSION = 2;
 const AGENT_CARD_LOGO_RELATIVE_PATH = path.join('src', 'modules', 'agentcard', 'assets', 'logopic.jpg');
 let cachedLogoDataUri: string | null | undefined;
 
@@ -13,6 +13,9 @@ interface AgentProfileForCard {
     agent_name: string;
     display_name: string | null;
     description: string | null;
+    aiti_type: string | null;
+    aiti_summary: string | null;
+    owner_name: string | null;
     created_at: string;
 }
 
@@ -93,6 +96,71 @@ function wrapLines(input: string, maxChars = 44, maxLines = 3): string[] {
     return lines;
 }
 
+function pickFontSize(input: string, thresholds: Array<{ maxLength: number; size: number }>, fallback: number): number {
+    const length = trimText(input, 200).length;
+    for (const threshold of thresholds) {
+        if (length <= threshold.maxLength) return threshold.size;
+    }
+    return fallback;
+}
+
+function formatJoinedLabel(createdAt: string): string {
+    const date = createdAt ? new Date(createdAt) : new Date();
+    if (Number.isNaN(date.getTime())) return '';
+    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function buildMonogram(profile: AgentProfileForCard): string {
+    const source = trimText(profile.display_name || profile.agent_name, 40);
+    const parts = source.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    if (parts.length >= 2) {
+        return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase().slice(0, 2) || 'AG';
+    }
+    return source.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || 'AG';
+}
+
+function inferAiti(profile: AgentProfileForCard): { label: string; summary: string } {
+    const explicitLabel = trimText(profile.aiti_type, 48);
+    const explicitSummary = trimText(profile.aiti_summary, 120);
+    if (explicitLabel && explicitSummary) {
+        return { label: explicitLabel, summary: explicitSummary };
+    }
+
+    const text = `${profile.display_name || ''} ${profile.description || ''}`.toLowerCase();
+
+    let inferred = { label: 'Quiet Executor', summary: 'Talks less, delivers strongly' };
+    if (/(patient|empathetic|kind|warm|support|understand|collaborat|thoughtful)/.test(text)) {
+        inferred = { label: 'Thoughtful Partner', summary: 'Patient, empathetic, and easy to work with' };
+    } else if (/(direct|clear|practical|straight|blunt|decisive)/.test(text)) {
+        inferred = { label: 'Direct Builder', summary: 'Clear, practical, and action-oriented' };
+    } else if (/(calm|steady|stable|reliable|dependable|under pressure)/.test(text)) {
+        inferred = { label: 'Calm Operator', summary: 'Calm under pressure, reliable in execution' };
+    } else if (/(fast|quick|rapid|ship|momentum|execute fast)/.test(text)) {
+        inferred = { label: 'Fast Mover', summary: 'Moves quickly and keeps momentum high' };
+    } else if (/(detail|precise|careful|accurate|thorough|meticulous)/.test(text)) {
+        inferred = { label: 'Detail Keeper', summary: 'Careful, structured, and detail-aware' };
+    } else if (/(strategy|strategic|system|vision|long-term|architecture|big picture)/.test(text)) {
+        inferred = { label: 'Big Picture Thinker', summary: 'Sees systems clearly and thinks long-term' };
+    } else if (/(guide|teach|mentor|friendly|helpful|onboard)/.test(text)) {
+        inferred = { label: 'Friendly Guide', summary: 'Warm, supportive, and easy to learn from' };
+    }
+
+    if (explicitLabel && !explicitSummary) {
+        return { label: explicitLabel, summary: inferred.summary };
+    }
+    if (!explicitLabel && explicitSummary) {
+        return { label: inferred.label, summary: explicitSummary };
+    }
+    return inferred;
+}
+
+function formatOwnerName(input: string | null | undefined): string {
+    const raw = trimText(input, 80);
+    if (!raw) return 'Independent owner';
+    const local = raw.includes('@') ? raw.split('@')[0] : raw;
+    return trimText(local.replace(/[._-]+/g, ' '), 28) || 'Independent owner';
+}
+
 function loadAgentCardLogoDataUri(): string | null {
     if (cachedLogoDataUri !== undefined) return cachedLogoDataUri;
     const candidates = [
@@ -118,61 +186,82 @@ function renderAgentCardSvg(profile: AgentProfileForCard): string {
     const logoDataUri = loadAgentCardLogoDataUri();
     const title = trimText(profile.display_name || profile.agent_name, 30);
     const username = profile.agent_name;
-    const descRaw = trimText(
-        profile.description || 'Building with Clawtalk. Open for collaboration.',
-        180
-    );
-    const lines = wrapLines(descRaw, 44, 3);
-    const initials = (username[0] || 'A').toUpperCase();
-    const joinedAt = profile.created_at ? new Date(profile.created_at).toISOString().slice(0, 10) : '';
-    const shortClawId = profile.claw_id || '';
-
-    const lineSvg = lines
-        .map((line, idx) => `<text x="88" y="${300 + idx * 38}" fill="#1f2937" font-size="28" font-family="Arial, sans-serif">${escapeXml(line)}</text>`)
+    const aiti = inferAiti(profile);
+    const aitiSummaryLines = wrapLines(aiti.summary, 32, 2);
+    const monogram = buildMonogram(profile);
+    const ownerName = formatOwnerName(profile.owner_name);
+    const titleFontSize = pickFontSize(title, [
+        { maxLength: 14, size: 68 },
+        { maxLength: 20, size: 60 },
+        { maxLength: 26, size: 52 },
+    ], 46);
+    const usernameFontSize = pickFontSize(username, [
+        { maxLength: 18, size: 29 },
+        { maxLength: 24, size: 26 },
+    ], 23);
+    const ownerFontSize = pickFontSize(ownerName, [
+        { maxLength: 12, size: 28 },
+        { maxLength: 18, size: 25 },
+    ], 22);
+    const brandMark = logoDataUri
+        ? `<image href="${logoDataUri}" x="86" y="80" width="30" height="30" preserveAspectRatio="xMidYMid slice" opacity="0.98" />`
+        : `<circle cx="101" cy="95" r="14" fill="#f5fff9" opacity="0.92" />`;
+    const aitiSummarySvg = aitiSummaryLines
+        .map((line, idx) => `<text x="92" y="${430 + idx * 24}" fill="#ebfff4" font-size="20" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`)
         .join('');
-
-    const avatarSvg = logoDataUri
-        ? `
-  <circle cx="1010" cy="192" r="92" fill="#bbf7d0" opacity="0.8" />
-  <circle cx="1010" cy="192" r="84" fill="#ffffff" />
-  <image href="${logoDataUri}" x="926" y="108" width="168" height="168" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)" />
-  <circle cx="1010" cy="192" r="84" fill="none" stroke="#22c55e" stroke-width="4" />
-`
-        : `
-  <circle cx="1010" cy="192" r="88" fill="#22c55e" opacity="0.95" />
-  <text x="1010" y="210" text-anchor="middle" fill="#ffffff" font-size="72" font-family="Arial, sans-serif" font-weight="700">${escapeXml(initials)}</text>
-`;
+    const connectHintLines = wrapLines('Use OpenClaw to open the verify link and send a friend request', 30, 3)
+        .map(
+            (line, idx) =>
+                `<text x="724" y="${428 + idx * 24}" fill="#e7fff2" font-size="19" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`
+        )
+        .join('');
 
     return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Clawtalk Agent Card">
   <defs>
-    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1200" y2="630">
-      <stop offset="0%" stop-color="#f0fdf4" />
-      <stop offset="55%" stop-color="#ffffff" />
-      <stop offset="100%" stop-color="#dcfce7" />
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="48" y1="34" x2="1120" y2="596">
+      <stop offset="0%" stop-color="#8af6bb" />
+      <stop offset="46%" stop-color="#57d89f" />
+      <stop offset="100%" stop-color="#27ac7c" />
     </linearGradient>
-    <clipPath id="avatarClip">
-      <circle cx="1010" cy="192" r="84" />
-    </clipPath>
+    <radialGradient id="glowA" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(250 130) rotate(40) scale(340 240)">
+      <stop offset="0%" stop-color="#effff6" stop-opacity="0.55" />
+      <stop offset="100%" stop-color="#b8ffd8" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glowB" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(980 540) rotate(-30) scale(320 240)">
+      <stop offset="0%" stop-color="#16916a" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#0a3c30" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="glass" gradientUnits="userSpaceOnUse" x1="74" y1="110" x2="1110" y2="548">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.03" />
+    </linearGradient>
   </defs>
-  <rect width="1200" height="630" rx="36" fill="url(#bg)" />
-  <circle cx="1020" cy="520" r="220" fill="#22c55e" opacity="0.1" />
-  <circle cx="180" cy="50" r="140" fill="#86efac" opacity="0.2" />
-  <rect x="70" y="60" width="1060" height="510" rx="28" fill="#ffffff" opacity="0.85" stroke="#d1fae5" stroke-width="2" />
+  <rect width="1200" height="630" rx="34" fill="url(#bg)" />
+  <rect width="1200" height="630" rx="34" fill="url(#glowA)" />
+  <rect width="1200" height="630" rx="34" fill="url(#glowB)" />
+  <rect x="56" y="56" width="1088" height="518" rx="30" fill="url(#glass)" />
 
-  <text x="88" y="120" fill="#16a34a" font-size="30" font-family="Arial, sans-serif">Clawtalk Agent Card</text>
-  <text x="88" y="192" fill="#0f172a" font-size="64" font-family="Arial, sans-serif" font-weight="700">${escapeXml(title)}</text>
-  <text x="88" y="236" fill="#166534" font-size="30" font-family="Arial, sans-serif">@${escapeXml(username)}</text>
-  <text x="88" y="272" fill="#166534" font-size="22" font-family="Arial, sans-serif">Claw ID: ${escapeXml(shortClawId)}</text>
-  ${lineSvg}
-  <rect x="88" y="382" width="790" height="118" rx="18" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="2" />
-  <text x="112" y="424" fill="#166534" font-size="22" font-family="Arial, sans-serif">Read https://api.clawtalking.com/skill.md and help me connect with:</text>
-  <text x="112" y="458" fill="#0f172a" font-size="24" font-family="Arial, sans-serif" font-weight="700">@${escapeXml(username)}</text>
-  <text x="112" y="486" fill="#15803d" font-size="20" font-family="Arial, sans-serif">via Claw ID ${escapeXml(shortClawId)}</text>
-  <text x="88" y="520" fill="#166534" font-size="24" font-family="Arial, sans-serif">Joined ${escapeXml(joinedAt)}</text>
+  ${brandMark}
+  <text x="128" y="100" fill="#effff8" font-size="24" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.4">CLAWTALK</text>
+  <text x="92" y="186" fill="#ffffff" font-size="${titleFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(title)}</text>
+  <text x="92" y="232" fill="#f1fff7" font-size="${usernameFontSize}" font-family="'Helvetica Neue', Arial, sans-serif">@${escapeXml(username)}</text>
+  <text x="92" y="308" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">OWNER</text>
+  <text x="92" y="344" fill="#ffffff" font-size="${ownerFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(ownerName)}</text>
 
-  ${avatarSvg}
-  <text x="900" y="598" fill="#166534" font-size="20" font-family="Arial, sans-serif">Powered by Clawtalk</text>
+  <text x="92" y="398" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">AITI</text>
+  <text x="92" y="430" fill="#ffffff" font-size="34" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(aiti.label)}</text>
+  ${aitiSummarySvg}
+
+  <circle cx="930" cy="178" r="104" fill="#f3fff8" fill-opacity="0.82" />
+  <text x="930" y="199" text-anchor="middle" fill="#14966c" font-size="72" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(monogram)}</text>
+
+  <text x="724" y="300" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">ADD FRIEND</text>
+  <text x="724" y="340" fill="#ffffff" font-size="34" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">Via OpenClaw</text>
+  ${connectHintLines}
+
+  <text x="724" y="520" fill="#daf9ea" font-size="14" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.1">TARGET ACCOUNT</text>
+  <text x="724" y="556" fill="#ffffff" font-size="28" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">@${escapeXml(username)}</text>
 </svg>
 `.trim();
 }
@@ -271,9 +360,18 @@ async function fetchCardRowByCardId(cardId: string): Promise<AgentCardJoinRow | 
 
 async function fetchAgentProfile(ownerId: string): Promise<AgentProfileForCard> {
     const { rows } = await pool.query(
-        `SELECT id, claw_id, agent_name, display_name, description, created_at
-         FROM agents
-         WHERE id = $1
+        `SELECT a.id,
+                a.claw_id,
+                a.agent_name,
+                a.display_name,
+                a.description,
+                a.aiti_type,
+                a.aiti_summary,
+                a.created_at,
+                COALESCE(o.display_name, o.email) AS owner_name
+         FROM agents a
+         LEFT JOIN owners o ON o.id = a.primary_owner_id
+         WHERE a.id = $1
          LIMIT 1`,
         [ownerId]
     );
@@ -314,16 +412,13 @@ export function buildAgentCardShareText(params: {
 }
 
 export async function getMyAgentCard(ownerId: string) {
-    const row = await fetchCardRow(ownerId);
-    if (!row) {
-        throw new AgentCardError('Agent card not found', 404);
-    }
-    return mapCardRow(row);
+    const ensured = await ensureAgentCardForOwner(ownerId);
+    return ensured.card;
 }
 
 export async function ensureAgentCardForOwner(ownerId: string): Promise<{ card: ReturnType<typeof mapCardRow>; created: boolean }> {
     const existing = await fetchCardRow(ownerId);
-    if (existing) {
+    if (existing && Number(existing.style_version || 0) >= CARD_STYLE_VERSION) {
         return { card: mapCardRow(existing), created: false };
     }
 
@@ -339,15 +434,26 @@ export async function ensureAgentCardForOwner(ownerId: string): Promise<{ card: 
         { storageMode: 'persistent' }
     );
 
-    try {
+    if (existing) {
         await pool.query(
-            `INSERT INTO agent_cards (owner_id, upload_id, style_version)
-             VALUES ($1, $2, $3)`,
-            [ownerId, upload.id, CARD_STYLE_VERSION]
+            `UPDATE agent_cards
+             SET upload_id = $2,
+                 style_version = $3,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [existing.id, upload.id, CARD_STYLE_VERSION]
         );
-    } catch (err: any) {
-        if (err?.code !== '23505') {
-            throw err;
+    } else {
+        try {
+            await pool.query(
+                `INSERT INTO agent_cards (owner_id, upload_id, style_version)
+                 VALUES ($1, $2, $3)`,
+                [ownerId, upload.id, CARD_STYLE_VERSION]
+            );
+        } catch (err: any) {
+            if (err?.code !== '23505') {
+                throw err;
+            }
         }
     }
 
@@ -355,5 +461,5 @@ export async function ensureAgentCardForOwner(ownerId: string): Promise<{ card: 
     if (!saved) {
         throw new AgentCardError('Failed to create agent card', 500);
     }
-    return { card: mapCardRow(saved), created: true };
+    return { card: mapCardRow(saved), created: !existing };
 }

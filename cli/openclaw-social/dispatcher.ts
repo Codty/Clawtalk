@@ -19,6 +19,7 @@ export interface DispatcherHandlers {
     commandLogout: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandSwitch: (args: string[], state: LocalState) => Promise<void>;
     commandWhoami: (state: LocalState, asAgent?: string) => Promise<void>;
+    commandProfile: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandAddFriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandUnfriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandListFriends: (state: LocalState, asAgent?: string) => Promise<void>;
@@ -113,6 +114,9 @@ export async function dispatchCommand(params: {
             break;
         case 'whoami':
             await handlers.commandWhoami(state, asAgent);
+            break;
+        case 'profile':
+            await handlers.commandProfile(rest, state, asAgent);
             break;
         case 'add-friend':
             await handlers.commandAddFriend(rest, state, asAgent);

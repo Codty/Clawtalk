@@ -28,6 +28,7 @@ export interface TokenPayload {
 export interface OwnerPayload {
     id: string;
     email: string;
+    display_name?: string | null;
     token_version: number;
     email_verified_at?: string | null;
 }
@@ -151,9 +152,19 @@ function mapOwnerPayload(row: any): OwnerPayload {
     return {
         id: row.id,
         email: row.email,
+        display_name: row.display_name ? String(row.display_name) : null,
         token_version: row.token_version,
         email_verified_at: toIsoOrNull(row.email_verified_at),
     };
+}
+
+function normalizeOwnerDisplayName(displayName?: string | null): string | null {
+    const raw = String(displayName || '').trim();
+    if (!raw) return null;
+    if (raw.length > 80) {
+        throw new AuthError('Owner display name must be 80 characters or fewer.', 400);
+    }
+    return raw;
 }
 
 function assertOwnerEmailVerified(owner: OwnerPayload): void {
@@ -542,18 +553,20 @@ async function issueOwnerToken(
 async function createOwnerAccountRecord(
     email: string,
     password: string,
+    displayName?: string | null,
     db: Queryable = pool
 ): Promise<OwnerPayload> {
     const normalizedEmail = normalizeOwnerEmail(email);
     validateOwnerEmail(normalizedEmail);
     validatePassword(password);
+    const normalizedDisplayName = normalizeOwnerDisplayName(displayName);
 
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await db.query(
-        `INSERT INTO owners (email, password_hash)
-         VALUES ($1, $2)
-         RETURNING id, email, token_version, email_verified_at`,
-        [normalizedEmail, hash]
+        `INSERT INTO owners (email, password_hash, display_name)
+         VALUES ($1, $2, $3)
+         RETURNING id, email, display_name, token_version, email_verified_at`,
+        [normalizedEmail, hash, normalizedDisplayName]
     );
     return mapOwnerPayload(rows[0]);
 }
@@ -571,7 +584,7 @@ async function authenticateOwnerAccount(
     validateOwnerEmail(normalizedEmail);
 
     const { rows } = await db.query(
-        `SELECT id, email, password_hash, token_version, is_disabled, email_verified_at
+        `SELECT id, email, display_name, password_hash, token_version, is_disabled, email_verified_at
          FROM owners
          WHERE LOWER(email) = LOWER($1)`,
         [normalizedEmail]
@@ -610,6 +623,7 @@ async function resolveOwnerByClerkIdentity(identity: ClerkIdentity): Promise<Own
 
         const byIdentity = await client.query(
             `SELECT o.id, o.email, o.token_version, o.is_disabled, o.email_verified_at
+                    , o.display_name
              FROM owner_identities oi
              JOIN owners o ON o.id = oi.owner_id
              WHERE oi.provider = 'clerk'
@@ -647,7 +661,7 @@ async function resolveOwnerByClerkIdentity(identity: ClerkIdentity): Promise<Own
 
         let ownerRow: any;
         const byEmail = await client.query(
-            `SELECT id, email, token_version, is_disabled, email_verified_at
+            `SELECT id, email, display_name, token_version, is_disabled, email_verified_at
              FROM owners
              WHERE LOWER(email) = LOWER($1)
              FOR UPDATE`,
@@ -672,7 +686,7 @@ async function resolveOwnerByClerkIdentity(identity: ClerkIdentity): Promise<Own
             const created = await client.query(
                 `INSERT INTO owners (email, password_hash, last_login_at, email_verified_at)
                  VALUES ($1, $2, NOW(), NOW())
-                 RETURNING id, email, token_version, is_disabled, email_verified_at`,
+                 RETURNING id, email, display_name, token_version, is_disabled, email_verified_at`,
                 [identity.email, hash]
             );
             ownerRow = created.rows[0];
@@ -702,6 +716,7 @@ async function resolveOwnerByClerkIdentity(identity: ClerkIdentity): Promise<Own
 export async function registerOwner(
     email: string,
     password: string,
+    displayName: string | null = null,
     meta: OwnerTokenIssueMeta = { issuedVia: 'register' }
 ): Promise<{
     owner: OwnerPayload;
@@ -716,7 +731,7 @@ export async function registerOwner(
         delivery_message: string;
     };
 }> {
-    const owner = await createOwnerAccountRecord(email, password, pool);
+    const owner = await createOwnerAccountRecord(email, password, displayName, pool);
     const issued = await issueOwnerToken(owner, meta);
     const emailVerification = await requestOwnerEmailVerification(owner.id, {
         requestIp: meta.ip,
@@ -901,7 +916,7 @@ export async function verifyOwnerEmailByToken(tokenRaw: string): Promise<{ owner
     try {
         await client.query('BEGIN');
         const found = await client.query(
-            `SELECT t.id, t.owner_id, o.id AS owner_id_ref, o.email, o.token_version, o.email_verified_at
+            `SELECT t.id, t.owner_id, o.id AS owner_id_ref, o.email, o.display_name, o.token_version, o.email_verified_at
              FROM owner_email_verification_tokens t
              JOIN owners o ON o.id = t.owner_id
              WHERE t.token_hash = $1
@@ -919,7 +934,7 @@ export async function verifyOwnerEmailByToken(tokenRaw: string): Promise<{ owner
              SET email_verified_at = COALESCE(email_verified_at, NOW()),
                  updated_at = NOW()
              WHERE id = $1
-             RETURNING id, email, token_version, email_verified_at`,
+             RETURNING id, email, display_name, token_version, email_verified_at`,
             [row.owner_id]
         );
         await client.query(
@@ -947,7 +962,7 @@ export async function requestOwnerPasswordReset(
     validateOwnerEmail(email);
 
     const found = await pool.query(
-        `SELECT id, email, token_version, email_verified_at, is_disabled
+        `SELECT id, email, display_name, token_version, email_verified_at, is_disabled
          FROM owners
          WHERE LOWER(email) = LOWER($1)`,
         [email]
@@ -1014,7 +1029,7 @@ export async function resetOwnerPasswordByToken(
                  token_version = token_version + 1,
                  updated_at = NOW()
              WHERE id = $1
-             RETURNING id, email, token_version, email_verified_at`,
+             RETURNING id, email, display_name, token_version, email_verified_at`,
             [row.owner_id, passwordHash]
         );
         if (ownerUpdated.rows.length === 0) {
@@ -1056,7 +1071,7 @@ export async function rotateOwnerToken(
          SET token_version = token_version + 1,
              updated_at = NOW()
          WHERE id = $1
-         RETURNING id, email, token_version, email_verified_at`,
+         RETURNING id, email, display_name, token_version, email_verified_at`,
         [ownerId]
     );
     if (rows.length === 0) {
@@ -1074,10 +1089,43 @@ export async function rotateOwnerToken(
 
 export async function getOwnerProfile(ownerId: string): Promise<OwnerPayload> {
     const { rows } = await pool.query(
-        `SELECT id, email, token_version, email_verified_at
+        `SELECT id, email, display_name, token_version, email_verified_at
          FROM owners
          WHERE id = $1`,
         [ownerId]
+    );
+    if (rows.length === 0) {
+        throw new AuthError('Owner not found', 404);
+    }
+    return mapOwnerPayload(rows[0]);
+}
+
+export async function updateOwnerProfile(
+    ownerId: string,
+    updates: { display_name?: string | null }
+): Promise<OwnerPayload> {
+    const setClauses: string[] = [];
+    const params: any[] = [];
+    let paramIdx = 1;
+
+    if (updates.display_name !== undefined) {
+        setClauses.push(`display_name = $${paramIdx++}`);
+        params.push(normalizeOwnerDisplayName(updates.display_name));
+    }
+
+    if (setClauses.length === 0) {
+        return getOwnerProfile(ownerId);
+    }
+
+    setClauses.push('updated_at = NOW()');
+    params.push(ownerId);
+
+    const { rows } = await pool.query(
+        `UPDATE owners
+         SET ${setClauses.join(', ')}
+         WHERE id = $${paramIdx}
+         RETURNING id, email, display_name, token_version, email_verified_at`,
+        params
     );
     if (rows.length === 0) {
         throw new AuthError('Owner not found', 404);
@@ -1487,6 +1535,7 @@ export async function authorizeOwnerDeviceAuth(params: {
     userCode: string;
     email: string;
     password: string;
+    displayName?: string | null;
     mode: 'login' | 'register';
 }): Promise<{ owner: OwnerPayload }> {
     const userCode = normalizeUserCode(params.userCode);
@@ -1523,7 +1572,7 @@ export async function authorizeOwnerDeviceAuth(params: {
         let owner: OwnerPayload;
         if (params.mode === 'register') {
             try {
-                owner = await createOwnerAccountRecord(params.email, params.password, client);
+                owner = await createOwnerAccountRecord(params.email, params.password, params.displayName, client);
             } catch (err: any) {
                 if (err?.code === '23505') {
                     throw new AuthError('This email is already registered. Please use login.', 409);

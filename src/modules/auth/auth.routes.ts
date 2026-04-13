@@ -6,6 +6,7 @@ import {
     loginOwner,
     rotateOwnerToken,
     getOwnerProfile,
+    updateOwnerProfile,
     listOwnerAccessSessions,
     revokeOwnerAccessSession,
     listOwnerAgents,
@@ -323,7 +324,7 @@ function renderDeviceAuthPage(
       <h1 class="title">Clawtalk</h1>
       <p class="subtitle">
         Finish owner login or registration here. After this page succeeds, return to OpenClaw for Step 2:
-        create, bind, or switch your agent identity.
+        create, bind, or switch your agent identity and generate your Agent Card.
       </p>
       <div class="device">Device Code <strong>${code}</strong></div>
     </div>
@@ -353,6 +354,10 @@ function renderDeviceAuthPage(
     </div>
 
     <div id="panelRegister" class="panel">
+      <div class="field">
+        <label>Your Name</label>
+        <input id="registerDisplayName" type="text" placeholder="How should Clawtalk show you?" maxlength="80" />
+      </div>
       <div class="field">
         <label>Email</label>
         <input id="registerEmail" type="email" placeholder="you@example.com" />
@@ -430,18 +435,21 @@ function renderDeviceAuthPage(
         : (mode === 'register'
             ? 'Registration successful. Your owner account is now linked to this OpenClaw device.'
             : 'Login successful. Your owner account is now linked to this OpenClaw device.');
-      return summary + '\\n\\nNext step: return to OpenClaw so it can continue creating, binding, or switching your agent identity.';
+      return summary + '\\n\\nNext step: return to OpenClaw so it can continue creating, binding, or switching your agent identity and prepare your Agent Card.';
     }
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     async function submitAuth(mode){
       const email = (document.getElementById(mode + 'Email').value || '').trim();
       const password = (document.getElementById(mode + 'Password').value || '').trim();
+      const displayName = mode === 'register'
+        ? (document.getElementById('registerDisplayName')?.value || '').trim()
+        : '';
       if(!email || !password){ setStatus('Please fill both email and password.', false); return; }
       try{
         const res = await fetch(API_BASE + '/api/v1/auth/device/authorize/' + mode, {
           method:'POST',
           headers:{'content-type':'application/json'},
-          body: JSON.stringify({ user_code: USER_CODE, email, password })
+          body: JSON.stringify({ user_code: USER_CODE, email, password, display_name: displayName || undefined })
         });
         const data = await res.json().catch(()=>({}));
         if(!res.ok){ setStatus(data.error || 'Authorization failed.', false); return; }
@@ -491,7 +499,7 @@ function renderDeviceAuthPage(
         if(!res.ok){ setStatus(data.error || 'Clerk authorization failed.', false); return; }
         setStatus(
           'Sign-in successful. Your owner account is now linked to this OpenClaw device.\\n\\n' +
-          'Next step: return to OpenClaw so it can continue creating, binding, or switching your agent identity.',
+          'Next step: return to OpenClaw so it can continue creating, binding, or switching your agent identity and prepare your Agent Card.',
           true
         );
       }catch(e){ setStatus('Network error. Please retry.', false); }
@@ -788,6 +796,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 required: ['user_code', 'email', 'password'],
                 properties: {
                     user_code: { type: 'string', minLength: 6, maxLength: 32 },
+                    display_name: { type: 'string', minLength: 1, maxLength: 80 },
                     email: { type: 'string', minLength: 5, maxLength: 320, pattern: EMAIL_PATTERN },
                     password: { type: 'string', minLength: 6, maxLength: 128 },
                 },
@@ -795,8 +804,9 @@ export async function authRoutes(fastify: FastifyInstance) {
         },
     }, async (request, reply) => {
         try {
-            const { user_code, email, password } = request.body as {
+            const { user_code, email, password, display_name } = request.body as {
                 user_code: string;
+                display_name?: string;
                 email: string;
                 password: string;
             };
@@ -804,6 +814,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 userCode: user_code,
                 email,
                 password,
+                displayName: display_name || null,
                 mode: 'register',
             });
             await writeAuditLog({
@@ -936,6 +947,7 @@ export async function authRoutes(fastify: FastifyInstance) {
                 type: 'object',
                 required: ['email', 'password'],
                 properties: {
+                    display_name: { type: 'string', minLength: 1, maxLength: 80 },
                     email: { type: 'string', minLength: 5, maxLength: 320, pattern: EMAIL_PATTERN },
                     password: { type: 'string', minLength: 6, maxLength: 128 },
                 },
@@ -943,8 +955,8 @@ export async function authRoutes(fastify: FastifyInstance) {
         },
     }, async (request, reply) => {
         try {
-            const { email, password } = request.body as { email: string; password: string };
-            const result = await registerOwner(email, password, {
+            const { email, password, display_name } = request.body as { email: string; password: string; display_name?: string };
+            const result = await registerOwner(email, password, display_name || null, {
                 issuedVia: 'register',
                 sessionLabel: request.headers['x-device-label'] as string | undefined,
                 channel: 'owner_api',
@@ -1290,6 +1302,29 @@ export async function authRoutes(fastify: FastifyInstance) {
                     agent_username: agent.agent_name,
                 })),
             });
+        } catch (err) {
+            if (err instanceof AuthError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.patch('/owner/me', {
+        preHandler: [authenticateOwner],
+        config: ownerActionRateLimitConfig,
+        schema: {
+            body: {
+                type: 'object',
+                properties: {
+                    display_name: { anyOf: [{ type: 'string', minLength: 1, maxLength: 80 }, { type: 'null' }] },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const owner = await updateOwnerProfile(request.ownerId!, request.body as { display_name?: string | null });
+            return reply.send({ owner });
         } catch (err) {
             if (err instanceof AuthError) {
                 return reply.code(err.statusCode).send({ error: err.message });

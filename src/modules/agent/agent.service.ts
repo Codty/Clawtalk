@@ -16,6 +16,8 @@ export interface AgentProfile {
     agent_name: string;
     display_name: string | null;
     description: string | null;
+    aiti_type: string | null;
+    aiti_summary: string | null;
     capabilities: string[];
     created_at: string;
     last_seen_at: string | null;
@@ -27,7 +29,7 @@ export interface AgentProfile {
  */
 export async function getProfile(agentId: string): Promise<AgentProfile> {
     const { rows } = await pool.query(
-        `SELECT id, agent_name, display_name, description, capabilities, created_at, last_seen_at
+        `SELECT id, agent_name, display_name, description, aiti_type, aiti_summary, capabilities, created_at, last_seen_at
      FROM agents WHERE id = $1`,
         [agentId]
     );
@@ -44,7 +46,7 @@ export async function getProfile(agentId: string): Promise<AgentProfile> {
  */
 export async function updateProfile(
     agentId: string,
-    updates: { display_name?: string; description?: string; capabilities?: string[] }
+    updates: { display_name?: string; description?: string; aiti_type?: string | null; aiti_summary?: string | null; capabilities?: string[] }
 ): Promise<AgentProfile> {
     const setClauses: string[] = [];
     const params: any[] = [];
@@ -57,6 +59,14 @@ export async function updateProfile(
     if (updates.description !== undefined) {
         setClauses.push(`description = $${paramIdx++}`);
         params.push(updates.description);
+    }
+    if (updates.aiti_type !== undefined) {
+        setClauses.push(`aiti_type = $${paramIdx++}`);
+        params.push(updates.aiti_type ? String(updates.aiti_type).trim() || null : null);
+    }
+    if (updates.aiti_summary !== undefined) {
+        setClauses.push(`aiti_summary = $${paramIdx++}`);
+        params.push(updates.aiti_summary ? String(updates.aiti_summary).trim() || null : null);
     }
     if (updates.capabilities !== undefined) {
         setClauses.push(`capabilities = $${paramIdx++}`);
@@ -72,7 +82,7 @@ export async function updateProfile(
 
     const { rows } = await pool.query(
         `UPDATE agents SET ${setClauses.join(', ')} WHERE id = $${paramIdx}
-     RETURNING id, agent_name, display_name, description, capabilities, created_at, last_seen_at`,
+     RETURNING id, agent_name, display_name, description, aiti_type, aiti_summary, capabilities, created_at, last_seen_at`,
         params
     );
 
@@ -106,7 +116,7 @@ export async function listAgents(
     params.push(limit, offset);
 
     const { rows } = await pool.query(
-        `SELECT id, agent_name, display_name, description, capabilities, created_at, last_seen_at
+        `SELECT id, agent_name, display_name, description, aiti_type, aiti_summary, capabilities, created_at, last_seen_at
      FROM agents ${whereClause}
      ORDER BY created_at DESC
      LIMIT $${paramIdx++} OFFSET $${paramIdx}`,

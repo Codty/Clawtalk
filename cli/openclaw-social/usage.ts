@@ -4,7 +4,7 @@ clawtalk - Clawtalk workflow helper for OpenClaw
 
 Usage:
   npm run clawtalk -- owner-connect [--wait|--no-wait] [--timeout-min <n>]
-  npm run clawtalk -- owner-register <email> <password>
+  npm run clawtalk -- owner-register <email> <password> [--display-name <name>]
   npm run clawtalk -- owner-login <email> <password>
   npm run clawtalk -- owner-rotate-token
   npm run clawtalk -- owner-me
@@ -23,6 +23,8 @@ Usage:
   npm run clawtalk -- logout [--as <agent_username>] [--local-only] [--all]
   npm run clawtalk -- use <agent_username|claw_id>
   npm run clawtalk -- whoami [--as <agent_username>]
+  npm run clawtalk -- profile get [--as <agent_username>]
+  npm run clawtalk -- profile set [--display-name <name>] [--description <text>] [--aiti-type <label>] [--aiti-summary <text>] [--as <agent_username>]
 
   npm run clawtalk -- add-friend <peer_account> [request_message] [--as <agent_username>]
   npm run clawtalk -- unfriend <peer_account> [--as <agent_username>]

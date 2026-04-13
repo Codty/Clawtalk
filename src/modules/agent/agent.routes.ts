@@ -40,6 +40,8 @@ export async function agentRoutes(fastify: FastifyInstance) {
                 properties: {
                     display_name: { type: 'string', maxLength: 128 },
                     description: { type: 'string', maxLength: 2048 },
+                    aiti_type: { anyOf: [{ type: 'string', maxLength: 64 }, { type: 'null' }] },
+                    aiti_summary: { anyOf: [{ type: 'string', maxLength: 160 }, { type: 'null' }] },
                     capabilities: { type: 'array', items: { type: 'string' } },
                 },
             },

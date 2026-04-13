@@ -24,6 +24,7 @@ export interface AgentSession {
 export interface OwnerSession {
     owner_id: string;
     email: string;
+    display_name?: string | null;
     token: string;
     session_id?: string;
     expires_at?: string | null;

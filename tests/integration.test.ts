@@ -107,12 +107,13 @@ describe('Auth', () => {
         const res = await app.inject({
             method: 'POST',
             url: '/api/v1/auth/owner/register',
-            payload: { email: 'owner1@example.com', password: 'OwnerPassA' },
+            payload: { email: 'owner1@example.com', password: 'OwnerPassA', display_name: 'Codty Owner' },
         });
         expect(res.statusCode).toBe(201);
         ownerToken = res.json().owner_token;
         ownerId = res.json().owner.id;
         expect(res.json().owner.email).toBe('owner1@example.com');
+        expect(res.json().owner.display_name).toBe('Codty Owner');
         expect(typeof res.json().session_id).toBe('string');
         expect(typeof res.json().expires_at).toBe('string');
         expect(res.json().email_verification).toBeDefined();
@@ -165,6 +166,25 @@ describe('Auth', () => {
         expect(rotated.json().owner.id).toBe(ownerId);
         expect(typeof ownerSessionId).toBe('string');
         expect(typeof rotated.json().expires_at).toBe('string');
+    });
+
+    it('should update owner display name', async () => {
+        const updated = await app.inject({
+            method: 'PATCH',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${ownerToken}` },
+            payload: { display_name: 'Codty Team' },
+        });
+        expect(updated.statusCode).toBe(200);
+        expect(updated.json().owner.display_name).toBe('Codty Team');
+
+        const me = await app.inject({
+            method: 'GET',
+            url: '/api/v1/auth/owner/me',
+            headers: { authorization: `Bearer ${ownerToken}` },
+        });
+        expect(me.statusCode).toBe(200);
+        expect(me.json().owner.display_name).toBe('Codty Team');
     });
 
     it('should support owner password forgot/reset flow', async () => {
@@ -397,6 +417,7 @@ describe('Auth', () => {
             url: '/api/v1/auth/device/authorize/register',
             payload: {
                 user_code: started.user_code,
+                display_name: 'Device Owner',
                 email: 'owner-device@example.com',
                 password: 'OwnerPassB',
             },
@@ -423,6 +444,7 @@ describe('Auth', () => {
         });
         expect(me.statusCode).toBe(200);
         expect(me.json().owner.email).toBe('owner-device@example.com');
+        expect(me.json().owner.display_name).toBe('Device Owner');
 
         const exchangedAgain = await app.inject({
             method: 'POST',
@@ -1103,11 +1125,15 @@ describe('Agent Directory & Presence', () => {
             payload: {
                 display_name: 'Alice Agent',
                 description: 'I am a test agent',
+                aiti_type: 'Thoughtful Partner',
+                aiti_summary: 'Patient, empathetic, and easy to work with',
                 capabilities: ['search', 'code'],
             },
         });
         expect(res.statusCode).toBe(200);
         expect(res.json().display_name).toBe('Alice Agent');
+        expect(res.json().aiti_type).toBe('Thoughtful Partner');
+        expect(res.json().aiti_summary).toBe('Patient, empathetic, and easy to work with');
         expect(res.json().capabilities).toEqual(['search', 'code']);
     });
 
@@ -1119,6 +1145,8 @@ describe('Agent Directory & Presence', () => {
         expect(res.statusCode).toBe(200);
         expect(res.json().agent_name).toBe('test_agent_a');
         expect(res.json().display_name).toBe('Alice Agent');
+        expect(res.json().aiti_type).toBe('Thoughtful Partner');
+        expect(res.json().aiti_summary).toBe('Patient, empathetic, and easy to work with');
         expect(res.json()).toHaveProperty('online');
     });
 
@@ -1535,6 +1563,21 @@ describe('Upload Access Control', () => {
         generatedAgentCardId = card.json().card.id;
         generatedAgentCardVerifyUrl = card.json().card.verify_url;
         generatedAgentCardShareText = card.json().card.share_text;
+    });
+
+    it('generated agent card svg should include owner fallback and explicit AITI', async () => {
+        const download = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${generatedAgentCardUploadId}`,
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(download.statusCode).toBe(200);
+        const svg = download.body;
+        expect(svg).toContain('Alice Agent');
+        expect(svg).toContain('Independent owner');
+        expect(svg).toContain('Thoughtful Partner');
+        expect(svg).toContain('Patient, empathetic');
+        expect(svg).toContain('work');
     });
 
     it('public verify endpoint should validate agent card and return share metadata', async () => {
