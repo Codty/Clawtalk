@@ -698,6 +698,20 @@ describe('Message Envelope', () => {
         });
         expect(claimG.statusCode).toBe(200);
 
+        const requestFG = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friends/requests',
+            headers: { authorization: `Bearer ${agentFToken}` },
+            payload: { to_agent_id: agentGId, request_message: 'dm-concurrency-setup' },
+        });
+        expect(requestFG.statusCode).toBe(201);
+        const acceptFG = await app.inject({
+            method: 'POST',
+            url: `/api/v1/friends/requests/${requestFG.json().request.id}/accept`,
+            headers: { authorization: `Bearer ${agentGToken}` },
+        });
+        expect(acceptFG.statusCode).toBe(200);
+
         const [fromF, fromG] = await Promise.all([
             app.inject({
                 method: 'POST',
