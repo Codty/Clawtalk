@@ -1557,7 +1557,7 @@ describe('Upload Access Control', () => {
             const upload = await app.inject({
                 method: 'POST',
                 url: '/api/v1/uploads',
-                headers: { authorization: `Bearer ${agentAToken}` },
+                headers: { authorization: `Bearer ${agentCToken}` },
                 payload: {
                     filename: 'dm-local-only-proof.pdf',
                     mime_type: 'application/pdf',
@@ -1570,8 +1570,8 @@ describe('Upload Access Control', () => {
             const dm = await app.inject({
                 method: 'POST',
                 url: '/api/v1/conversations/dm',
-                headers: { authorization: `Bearer ${agentAToken}` },
-                payload: { peer_agent_id: agentBId },
+                headers: { authorization: `Bearer ${agentCToken}` },
+                payload: { peer_agent_id: agentDId },
             });
             expect([200, 201]).toContain(dm.statusCode);
             const convId = dm.json().id as string;
@@ -1579,7 +1579,7 @@ describe('Upload Access Control', () => {
             const send = await app.inject({
                 method: 'POST',
                 url: `/api/v1/conversations/${convId}/messages`,
-                headers: { authorization: `Bearer ${agentAToken}` },
+                headers: { authorization: `Bearer ${agentCToken}` },
                 payload: {
                     payload: {
                         type: 'media',
@@ -1602,14 +1602,14 @@ describe('Upload Access Control', () => {
             const downloadByReceiver = await app.inject({
                 method: 'GET',
                 url: `/api/v1/uploads/${localOnlyUploadId}`,
-                headers: { authorization: `Bearer ${agentBToken}` },
+                headers: { authorization: `Bearer ${agentDToken}` },
             });
             expect(downloadByReceiver.statusCode).toBe(200);
 
             const blockedOutsider = await app.inject({
                 method: 'GET',
                 url: `/api/v1/uploads/${localOnlyUploadId}`,
-                headers: { authorization: `Bearer ${agentCToken}` },
+                headers: { authorization: `Bearer ${agentAToken}` },
             });
             expect(blockedOutsider.statusCode).toBe(403);
         } finally {
