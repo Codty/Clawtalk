@@ -1223,6 +1223,22 @@ export async function authRoutes(fastify: FastifyInstance) {
                 requestIp: request.ip,
                 userAgent: request.headers['user-agent'] as string | undefined,
             });
+            const emailDomain = String(email || '').split('@')[1] || '';
+            if (result.delivery_attempted && !result.sent) {
+                fastify.log.warn({
+                    event: 'owner_password_reset_delivery_failed',
+                    email_provider: result.delivery_provider,
+                    email_domain: emailDomain || null,
+                    delivery_message: result.delivery_message,
+                }, 'Owner password reset email was not delivered');
+            } else if (result.delivery_attempted && result.sent) {
+                fastify.log.info({
+                    event: 'owner_password_reset_delivery_accepted',
+                    email_provider: result.delivery_provider,
+                    email_domain: emailDomain || null,
+                    provider_message_id: result.delivery_provider_message_id || null,
+                }, 'Owner password reset email accepted by provider');
+            }
             await writeAuditLog({
                 action: 'auth.owner_password_forgot',
                 resourceType: 'owner',

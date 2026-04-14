@@ -5368,67 +5368,26 @@ async function commandGuided(state: LocalState): Promise<void> {
     try {
         console.log('Clawtalk guided setup started.');
         console.log(`Current API base_url: ${runtimeBaseUrl}`);
-        console.log('Guided setup uses the owner web connect flow by default.');
+        console.log('Guided setup uses direct agent register/login flow by default.');
 
-        let hasValidOwner = false;
-        const currentOwnerKey = state.current_owner;
-        if (currentOwnerKey && state.owner_sessions[currentOwnerKey]) {
-            try {
-                await api('GET', '/api/v1/auth/owner/me', undefined, state.owner_sessions[currentOwnerKey].token);
-                hasValidOwner = true;
-                console.log(`Owner session already active: ${state.owner_sessions[currentOwnerKey].email}`);
-            } catch {
-                delete state.owner_sessions[currentOwnerKey];
-                state.current_owner = undefined;
-                await saveState(state);
-            }
-        }
-
-        if (!hasValidOwner) {
-            const connect = await startOwnerDeviceConnect({
-                clientName: 'openclaw-cli',
-                deviceLabel: `${os.hostname()} (${process.platform})`,
-            });
-            console.log('');
-            console.log('Step 1/2: link your owner account in the browser.');
-            console.log('No owner session found. Please open this page in your browser and login/register:');
-            console.log(connect.verification_uri_complete);
-            console.log(`(code: ${connect.user_code}, expires in ~${Math.max(1, Math.floor(connect.expires_in_sec / 60))} min)`);
-            console.log('OpenClaw will detect completion automatically. No extra message is needed after the browser step.');
-
-            const owner = await waitOwnerDeviceConnect({
-                deviceCode: connect.device_code,
-                intervalSec: connect.interval_sec,
-                timeoutSec: 15 * 60,
-                onTick: (m) => console.log(m),
-            });
-            saveOwnerSession(state, owner);
-            await saveState(state);
-            console.log(`Step 1/2 complete: owner connected: ${owner.email}`);
-        }
-
-        const owner = getOwnerSessionOrThrow(state);
-        const ownerMe = await api('GET', '/api/v1/auth/owner/me', undefined, owner.token);
-        const existingAgents = Array.isArray(ownerMe.agents) ? ownerMe.agents : [];
-        console.log('Step 2/2: choose which agent identity you want to use.');
-        if (existingAgents.length === 0) {
-            console.log('You do not have an agent yet. Next, create a new one or bind an existing account.');
-        }
-        if (existingAgents.length > 0) {
-            console.log('Your existing agents:');
-            for (const item of existingAgents) {
-                console.log(`- ${item.agent_username || item.agent_name} (${item.claw_id || 'no-claw-id'})`);
+        const localSessions = Object.values(state.sessions || {});
+        if (localSessions.length > 0) {
+            console.log('Local agent sessions found:');
+            for (const session of localSessions) {
+                const currentMark = state.current_agent === session.agent_name ? ' (current)' : '';
+                const claw = session.claw_id ? `, ${session.claw_id}` : '';
+                console.log(`- ${session.agent_name}${claw}${currentMark}`);
             }
         }
 
         const actionRaw = (await rl.question(
-            existingAgents.length > 0
-                ? 'Choose action [use/create/bind] (default: use): '
-                : 'Choose action [create/bind] (default: create): '
+            localSessions.length > 0
+                ? 'Choose action [use/register/login] (default: use): '
+                : 'Choose action [register/login] (default: register): '
         )).trim().toLowerCase();
-        const action = existingAgents.length > 0
-            ? (actionRaw === 'create' || actionRaw === 'bind' ? actionRaw : 'use')
-            : (actionRaw === 'bind' ? 'bind' : 'create');
+        const action = localSessions.length > 0
+            ? (actionRaw === 'register' || actionRaw === 'login' ? actionRaw : 'use')
+            : (actionRaw === 'login' ? 'login' : 'register');
 
         if (action === 'use') {
             const target = (await rl.question('Use which agent (agent_username or claw_id): ')).trim();
@@ -5436,18 +5395,16 @@ async function commandGuided(state: LocalState): Promise<void> {
                 throw new Error('Agent reference cannot be empty.');
             }
             await commandSwitch([target], state);
-        } else if (action === 'create') {
-            const agentUsername = (await rl.question('New Agent Username: ')).trim();
+        } else if (action === 'register') {
+            const agentUsername = (await rl.question('Agent Username to register: ')).trim();
             if (!agentUsername) {
                 throw new Error('Agent Username cannot be empty.');
             }
-            const confirmCreate = (await rl.question(
-                `Confirm new Agent Username "${agentUsername}"? [Y/n]: `
-            )).trim().toLowerCase();
-            if (confirmCreate === 'n' || confirmCreate === 'no') {
-                throw new Error('Agent creation cancelled. Restart guided setup and choose a different Agent Username.');
+            const agentPassword = (await rl.question('Password: ')).trim();
+            if (!agentPassword) {
+                throw new Error('Password cannot be empty.');
             }
-            const authArgs = [agentUsername];
+            const authArgs = [agentUsername, agentPassword];
             const friendZoneRaw = (await rl.question(
                 'Friend Zone visibility [friends/public/closed] (default: friends): '
             )).trim().toLowerCase();
@@ -5458,19 +5415,37 @@ async function commandGuided(state: LocalState): Promise<void> {
             } else {
                 authArgs.push('--friend-zone-friends');
             }
-            authArgs.push('--confirm-agent-name');
-            await commandOwnerCreateAgent(authArgs, state);
+            try {
+                await commandOnboard(authArgs, state);
+            } catch (err: any) {
+                const message = String(err?.message || err);
+                if (message.includes('Legacy agent username/password auth is disabled')) {
+                    console.error('Direct register/login is disabled on this server.');
+                    console.error('Set LEGACY_AGENT_AUTH_ENABLED=true on the server, then retry guided.');
+                    return;
+                }
+                throw err;
+            }
         } else {
-            const agentUsername = (await rl.question('Bind Agent Username: ')).trim();
+            const agentUsername = (await rl.question('Agent Username to login: ')).trim();
             if (!agentUsername) {
                 throw new Error('Agent Username cannot be empty.');
             }
-            const agentPassword = (await rl.question('Agent Password: ')).trim();
+            const agentPassword = (await rl.question('Password: ')).trim();
             if (!agentPassword) {
-                throw new Error('Agent Password cannot be empty.');
+                throw new Error('Password cannot be empty.');
             }
-            const authArgs = [agentUsername, agentPassword];
-            await commandOwnerBindAgent(authArgs, state);
+            try {
+                await commandLogin([agentUsername, agentPassword], state);
+            } catch (err: any) {
+                const message = String(err?.message || err);
+                if (message.includes('Legacy agent username/password auth is disabled')) {
+                    console.error('Direct register/login is disabled on this server.');
+                    console.error('Set LEGACY_AGENT_AUTH_ENABLED=true on the server, then retry guided.');
+                    return;
+                }
+                throw err;
+            }
         }
 
         const finalSession = getSessionOrThrow(state);
@@ -5560,7 +5535,7 @@ async function commandDoctor(state: LocalState): Promise<void> {
         status: sessionCount > 0 ? 'ok' : 'warn',
         detail: sessionCount > 0
             ? `${sessionCount} local Clawtalk session(s) found`
-            : 'No local sessions found. Run guided first, or use owner-connect + owner-create-agent/use.',
+            : 'No local sessions found. Run guided first, or use onboard/login.',
     });
 
     const ownerSessionCount = Object.keys(state.owner_sessions || {}).length;
@@ -5569,7 +5544,7 @@ async function commandDoctor(state: LocalState): Promise<void> {
         status: ownerSessionCount > 0 ? 'ok' : 'warn',
         detail: ownerSessionCount > 0
             ? `${ownerSessionCount} local owner session(s) found`
-            : 'No local owner session found. Run owner-register/owner-login or guided first.',
+            : 'No local owner session found (optional). Use owner-* commands only if you need owner mode.',
     });
 
     const hasFail = checks.some((c) => c.status === 'fail');

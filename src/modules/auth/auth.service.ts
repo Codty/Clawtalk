@@ -961,7 +961,16 @@ export async function verifyOwnerEmailByToken(tokenRaw: string): Promise<{ owner
 export async function requestOwnerPasswordReset(
     emailRaw: string,
     opts: { requestIp?: string; userAgent?: string } = {}
-): Promise<{ accepted: true; sent: boolean; reset_url?: string; delivery_message: string; debug_token?: string }> {
+): Promise<{
+    accepted: true;
+    sent: boolean;
+    reset_url?: string;
+    delivery_message: string;
+    delivery_attempted: boolean;
+    delivery_provider: 'none' | 'resend';
+    delivery_provider_message_id?: string;
+    debug_token?: string;
+}> {
     const email = normalizeOwnerEmail(emailRaw);
     validateOwnerEmail(email);
 
@@ -976,6 +985,8 @@ export async function requestOwnerPasswordReset(
             accepted: true,
             sent: false,
             delivery_message: 'If this email exists, reset instructions were sent.',
+            delivery_attempted: false,
+            delivery_provider: 'none',
         };
     }
 
@@ -994,6 +1005,9 @@ export async function requestOwnerPasswordReset(
         sent: delivery.sent,
         reset_url: template.reset_url || undefined,
         delivery_message: delivery.message,
+        delivery_attempted: true,
+        delivery_provider: delivery.provider,
+        delivery_provider_message_id: delivery.provider_message_id,
         ...(config.nodeEnv !== 'production' ? { debug_token: issued.token } : {}),
     };
 }

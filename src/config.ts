@@ -64,6 +64,7 @@ const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me-in-production!
 const fanoutMode = parseFanoutMode(process.env.FANOUT_MODE);
 const messageStorageMode = parseMessageStorageMode(process.env.MESSAGE_STORAGE_MODE);
 const emailProvider = parseEmailProvider(process.env.EMAIL_PROVIDER);
+const ownerPasswordRecoveryRequired = parseBool(process.env.OWNER_PASSWORD_RECOVERY_REQUIRED, isProduction);
 
 if (isProduction) {
     if (!isStrongJwtSecret(jwtSecret)) {
@@ -74,6 +75,22 @@ if (isProduction) {
     }
     if (corsAllowedOrigins.length === 0) {
         throw new Error('CORS_ALLOWED_ORIGINS must be set in production.');
+    }
+    if (ownerPasswordRecoveryRequired) {
+        if (emailProvider !== 'resend') {
+            throw new Error('OWNER_PASSWORD_RECOVERY_REQUIRED=true requires EMAIL_PROVIDER=resend in production.');
+        }
+        if (!process.env.RESEND_API_KEY) {
+            throw new Error('OWNER_PASSWORD_RECOVERY_REQUIRED=true requires RESEND_API_KEY in production.');
+        }
+        if (!process.env.EMAIL_FROM) {
+            throw new Error('OWNER_PASSWORD_RECOVERY_REQUIRED=true requires EMAIL_FROM in production.');
+        }
+        if (!process.env.PUBLIC_WEB_BASE_URL && !process.env.PUBLIC_BASE_URL) {
+            throw new Error(
+                'OWNER_PASSWORD_RECOVERY_REQUIRED=true requires PUBLIC_WEB_BASE_URL or PUBLIC_BASE_URL in production.'
+            );
+        }
     }
 }
 
@@ -92,7 +109,7 @@ export const config = {
     ownerSessionSidRequired: parseBool(process.env.OWNER_SESSION_SID_REQUIRED, false),
     ownerPasswordlessAgentEnabled: parseBool(process.env.OWNER_PASSWORDLESS_AGENT_ENABLED, true),
     ownerRequireEmailVerified: parseBool(process.env.OWNER_REQUIRE_EMAIL_VERIFIED, false),
-    legacyAgentAuthEnabled: parseBool(process.env.LEGACY_AGENT_AUTH_ENABLED, !isProduction),
+    legacyAgentAuthEnabled: parseBool(process.env.LEGACY_AGENT_AUTH_ENABLED, true),
     ownerEmailVerifyTtlSec: parsePositiveInt(process.env.OWNER_EMAIL_VERIFY_TTL_SEC, 24 * 3600),
     ownerPasswordResetTtlSec: parsePositiveInt(process.env.OWNER_PASSWORD_RESET_TTL_SEC, 30 * 60),
     clerkEnabled: parseBool(process.env.CLERK_ENABLED, false),
@@ -101,6 +118,7 @@ export const config = {
     clerkAudience: process.env.CLERK_AUDIENCE || '',
     clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY || '',
     emailProvider,
+    ownerPasswordRecoveryRequired,
     emailFrom: process.env.EMAIL_FROM || '',
     resendApiKey: process.env.RESEND_API_KEY || '',
     wsTokenTtlSec: parseInt(process.env.WS_TOKEN_TTL_SEC || '120', 10),

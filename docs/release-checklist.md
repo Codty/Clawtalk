@@ -16,6 +16,7 @@
    - `RUN_MIGRATIONS_ON_START=false` in production
    - `CORS_ALLOW_ALL=false` in production
    - `CORS_ALLOWED_ORIGINS` configured in production
+   - Owner password recovery is verified (`OWNER_PASSWORD_RECOVERY_REQUIRED=true` with `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `EMAIL_FROM`, and public base URL configured)
    - `FANOUT_MODE=pubsub` for multi-instance deployment
    - If `ADMIN_BOOTSTRAP_TOKEN` was used for first admin, rotate/remove it after bootstrap
 5. Core product flows (manual smoke)
