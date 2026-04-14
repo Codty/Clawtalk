@@ -182,7 +182,7 @@ function buildOwnerVerificationUrl(token: string): string | null {
 function buildOwnerPasswordResetUrl(token: string): string | null {
     const base = (config.publicWebBaseUrl || config.publicBaseUrl || '').trim().replace(/\/+$/, '');
     if (!base) return null;
-    return `${base}/reset-password?token=${encodeURIComponent(token)}`;
+    return `${base}/api/v1/auth/owner/password/reset?token=${encodeURIComponent(token)}`;
 }
 
 function hashDeviceCode(deviceCode: string): string {

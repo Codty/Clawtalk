@@ -468,7 +468,18 @@ function renderDeviceAuthPage(
         });
         const data = await res.json().catch(() => ({}));
         if(!res.ok){ setStatus(data.error || 'Failed to request password reset.', false); return; }
-        setStatus(data.message || 'If this email exists, reset instructions were sent.');
+        const lines = [];
+        lines.push(data.message || 'If this email exists, reset instructions were sent.');
+        if(data.reset_url){
+          lines.push('Open the reset link: ' + data.reset_url);
+        } else if(data.debug_token){
+          lines.push('Reset token (dev): ' + data.debug_token);
+          lines.push('Open reset page: ' + API_BASE + '/api/v1/auth/owner/password/reset?token=' + encodeURIComponent(data.debug_token));
+        }
+        if(data.sent === false){
+          lines.push('If you do not receive email, ask the server admin to configure email delivery.');
+        }
+        setStatus(lines.join('\n\n'), true);
       } catch(e){ setStatus('Network error while requesting password reset.', false); }
     }
     async function denyAuth(){
@@ -611,6 +622,103 @@ function renderDeviceAuthPage(
       }
     }
     initClerkState();
+  </script>
+</body>
+</html>`;
+}
+
+function renderOwnerPasswordResetPage(baseApiUrl: string, presetToken: string): string {
+    const apiBase = escapeHtml(baseApiUrl.replace(/\/+$/, ''));
+    const token = escapeHtml((presetToken || '').trim());
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reset Password · Clawtalk</title>
+  <style>
+    :root {
+      --bg:#f4fdf7; --card:#ffffff; --text:#1a1a1a; --muted:#5a6f60; --line:#d6e7db;
+      --brand:#22c55e; --brandHover:#16a34a; --err:#b42318;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      background:linear-gradient(135deg, var(--bg) 0%, #ffffff 60%, #dcfce7 100%);
+      color:var(--text); padding:20px;
+    }
+    .card {
+      width:min(100%, 520px); background:var(--card); border:1px solid var(--line);
+      border-radius:18px; padding:26px; box-shadow:0 16px 40px rgba(22,163,74,.08);
+    }
+    h1 { margin:0; font-size:26px; }
+    p { margin:10px 0 18px; color:var(--muted); line-height:1.5; }
+    .field { margin-bottom:14px; }
+    label { display:block; margin:0 0 8px; font-size:13px; color:#344054; font-weight:600; }
+    input {
+      width:100%; border:1px solid var(--line); border-radius:12px; padding:12px 13px;
+      font-size:15px; outline:none; background:#fff;
+    }
+    input:focus { border-color:#86efac; box-shadow:0 0 0 3px rgba(34,197,94,.16); }
+    .primary {
+      width:100%; border:0; border-radius:12px; background:var(--brand); color:#fff;
+      font-size:17px; font-weight:700; padding:12px 13px; cursor:pointer;
+    }
+    .primary:hover { background:var(--brandHover); }
+    .status { margin-top:14px; padding:10px 12px; border-radius:10px; font-size:14px; display:none; white-space:pre-wrap; }
+    .ok { display:block; background:#ecfdf3; border:1px solid #a6f4c5; color:#085f2d; }
+    .err { display:block; background:#fef3f2; border:1px solid #fecaca; color:var(--err); }
+    .hint { margin-top:10px; font-size:12px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Reset password</h1>
+    <p>Enter the reset token and your new password. After reset, return to OpenClaw and login again.</p>
+    <div class="field">
+      <label>Reset token</label>
+      <input id="token" type="text" value="${token}" placeholder="Paste token from email" />
+    </div>
+    <div class="field">
+      <label>New password</label>
+      <input id="password" type="password" placeholder="At least 6 chars, 1 lower + 1 upper" />
+    </div>
+    <div class="field">
+      <label>Confirm password</label>
+      <input id="password2" type="password" placeholder="Re-enter your new password" />
+    </div>
+    <button class="primary" onclick="submitReset()">Reset password</button>
+    <div id="status" class="status"></div>
+    <div class="hint">If you did not request this, you can close this page.</div>
+  </div>
+  <script>
+    const API_BASE = (window.location && window.location.origin) || ${JSON.stringify(apiBase)};
+    function setStatus(msg, ok){
+      const el = document.getElementById('status');
+      el.className = 'status ' + (ok ? 'ok' : 'err');
+      el.textContent = msg;
+    }
+    async function submitReset(){
+      const token = (document.getElementById('token')?.value || '').trim();
+      const password = (document.getElementById('password')?.value || '').trim();
+      const password2 = (document.getElementById('password2')?.value || '').trim();
+      if(!token){ setStatus('Reset token is required.', false); return; }
+      if(!password){ setStatus('New password is required.', false); return; }
+      if(password !== password2){ setStatus('Passwords do not match.', false); return; }
+      try{
+        const res = await fetch(API_BASE + '/api/v1/auth/owner/password/reset', {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body: JSON.stringify({ token, password })
+        });
+        const data = await res.json().catch(() => ({}));
+        if(!res.ok){ setStatus(data.error || 'Failed to reset password.', false); return; }
+        setStatus((data.message || 'Password reset complete.') + '\\n\\nReturn to OpenClaw and login again.', true);
+      }catch(e){
+        setStatus('Network error while resetting password.', false);
+      }
+    }
   </script>
 </body>
 </html>`;
@@ -1076,6 +1184,27 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
     });
 
+    fastify.get('/owner/password/reset', {
+        config: ownerCredentialRateLimitConfig,
+        schema: {
+            querystring: {
+                type: 'object',
+                required: [],
+                properties: {
+                    token: { type: 'string', minLength: 0, maxLength: 512 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        const { token } = (request.query || {}) as { token?: string };
+        const html = renderOwnerPasswordResetPage(resolveAuthPublicBase(request), token || '');
+        return reply
+            .code(200)
+            .type('text/html; charset=utf-8')
+            .header('cache-control', 'no-store')
+            .send(html);
+    });
+
     fastify.post('/owner/password/forgot', {
         config: ownerCredentialRateLimitConfig,
         schema: {
@@ -1101,11 +1230,16 @@ export async function authRoutes(fastify: FastifyInstance) {
                 ip: request.ip,
                 userAgent: request.headers['user-agent'] as string,
             });
+            const fallbackResetUrl = config.nodeEnv !== 'production' && result.debug_token
+                ? `${resolveAuthPublicBase(request)}/api/v1/auth/owner/password/reset?token=${encodeURIComponent(result.debug_token)}`
+                : undefined;
+            const effectiveResetUrl = result.reset_url || fallbackResetUrl;
             return reply.send({
                 ok: true,
                 sent: result.sent,
                 message: 'If this email exists, reset instructions were sent.',
-                ...(config.nodeEnv !== 'production' && result.reset_url ? { reset_url: result.reset_url } : {}),
+                ...(config.nodeEnv !== 'production' && result.delivery_message ? { delivery_message: result.delivery_message } : {}),
+                ...(config.nodeEnv !== 'production' && effectiveResetUrl ? { reset_url: effectiveResetUrl } : {}),
                 ...(config.nodeEnv !== 'production' && result.debug_token ? { debug_token: result.debug_token } : {}),
             });
         } catch (err) {

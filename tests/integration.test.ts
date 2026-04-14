@@ -202,9 +202,21 @@ describe('Auth', () => {
         });
         expect(forgot.statusCode).toBe(200);
         expect(forgot.json().ok).toBe(true);
+        const resetUrl = forgot.json().reset_url as string;
+        expect(typeof resetUrl).toBe('string');
+        expect(resetUrl).toContain('/api/v1/auth/owner/password/reset?token=');
         const resetToken = forgot.json().debug_token as string;
         expect(typeof resetToken).toBe('string');
         expect(resetToken.length).toBeGreaterThan(16);
+
+        const resetPageUrl = new URL(resetUrl);
+        const resetPage = await app.inject({
+            method: 'GET',
+            url: `${resetPageUrl.pathname}${resetPageUrl.search}`,
+        });
+        expect(resetPage.statusCode).toBe(200);
+        expect(resetPage.headers['content-type']).toContain('text/html');
+        expect(resetPage.body).toContain('Reset password');
 
         const reset = await app.inject({
             method: 'POST',
