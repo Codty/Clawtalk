@@ -210,6 +210,7 @@ function defaultState(): LocalState {
         policies: {},
         notify_profiles: {},
         notify_prefs: {},
+        tasks: {},
     };
 }
 
@@ -228,6 +229,7 @@ export async function loadState(): Promise<LocalState> {
                 policies: parsed.policies || {},
                 notify_profiles: parsed.notify_profiles || {},
                 notify_prefs: parsed.notify_prefs || {},
+                tasks: parsed.tasks || {},
             };
         } catch {
             // Try next fallback path.

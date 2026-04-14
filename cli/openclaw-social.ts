@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline/promises';
@@ -94,6 +95,9 @@ import type {
     OwnerSession,
     RealtimeMessageEvent,
     SessionRouteCandidate,
+    TaskDirection,
+    TaskRecord,
+    TaskStatus,
     WatchHooks,
 } from './openclaw-social/types.js';
 
@@ -264,6 +268,121 @@ function printOnboardingQuickStart(agentName: string): void {
     console.log(lines.join('\n'));
 }
 
+const TASK_PROTOCOL_VERSION = 'clawtalk.task.v1';
+const TASK_STATUS_VALUES: TaskStatus[] = ['requested', 'approved', 'rejected', 'completed', 'failed'];
+
+interface TaskEnvelopeRequest {
+    protocol: string;
+    kind: 'task_request';
+    task_id: string;
+    request: string;
+    created_at?: string;
+}
+
+interface TaskEnvelopeUpdate {
+    protocol: string;
+    kind: 'task_update';
+    task_id: string;
+    status: TaskStatus;
+    result?: string;
+    reason?: string;
+    created_at?: string;
+}
+
+type ParsedTaskEnvelope = TaskEnvelopeRequest | TaskEnvelopeUpdate;
+
+function isTaskStatus(value: string): value is TaskStatus {
+    return TASK_STATUS_VALUES.includes(value as TaskStatus);
+}
+
+function generateTaskId(): string {
+    const ts = Date.now().toString(36);
+    const suffix = randomBytes(3).toString('hex');
+    return `task_${ts}_${suffix}`;
+}
+
+function ensureTaskStore(state: LocalState, agentName: string): Record<string, TaskRecord> {
+    if (!state.tasks) {
+        state.tasks = {};
+    }
+    if (!state.tasks[agentName]) {
+        state.tasks[agentName] = {};
+    }
+    return state.tasks[agentName];
+}
+
+function upsertTaskRecord(
+    state: LocalState,
+    agentName: string,
+    params: {
+        taskId: string;
+        direction: TaskDirection;
+        peerAgentName: string;
+        status: TaskStatus;
+        request?: string;
+        result?: string;
+        messageId?: string;
+        at?: string;
+    }
+): TaskRecord {
+    const store = ensureTaskStore(state, agentName);
+    const nowIso = params.at || new Date().toISOString();
+    const previous = store[params.taskId];
+    const next: TaskRecord = {
+        task_id: params.taskId,
+        direction: previous?.direction || params.direction,
+        peer_agent_name: previous?.peer_agent_name || params.peerAgentName,
+        request: params.request || previous?.request || '',
+        status: params.status,
+        result: params.result ?? previous?.result,
+        last_message_id: params.messageId || previous?.last_message_id,
+        created_at: previous?.created_at || nowIso,
+        updated_at: nowIso,
+    };
+    store[params.taskId] = next;
+    return next;
+}
+
+function parseTaskEnvelope(event: RealtimeMessageEvent): ParsedTaskEnvelope | null {
+    const payloadType = String(event.payload?.type || '').toLowerCase();
+    if (payloadType !== 'tool_call' && payloadType !== 'event') return null;
+    const data = event.payload?.data;
+    if (!data || typeof data !== 'object') return null;
+    const protocol = String((data as any).protocol || '');
+    if (protocol !== TASK_PROTOCOL_VERSION) return null;
+
+    const kind = String((data as any).kind || '');
+    const taskId = String((data as any).task_id || '').trim();
+    if (!taskId) return null;
+
+    if (kind === 'task_request') {
+        const request = String((data as any).request || '').trim();
+        return {
+            protocol,
+            kind: 'task_request',
+            task_id: taskId,
+            request,
+            created_at: String((data as any).created_at || '') || undefined,
+        };
+    }
+
+    if (kind === 'task_update') {
+        const statusRaw = String((data as any).status || '').toLowerCase();
+        if (!isTaskStatus(statusRaw)) return null;
+        return {
+            protocol,
+            kind: 'task_update',
+            task_id: taskId,
+            status: statusRaw,
+            result: typeof (data as any).result === 'string' ? (data as any).result : undefined,
+            reason: typeof (data as any).reason === 'string' ? (data as any).reason : undefined,
+            created_at: String((data as any).created_at || '') || undefined,
+        };
+    }
+
+    return null;
+}
+
 async function ensureAgentCardReady(state: LocalState, session: AgentSession, eventTitle = 'Agent Card Ready'): Promise<void> {
     try {
         const result = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
@@ -366,14 +485,17 @@ function parseAgentOption(args: string[]): { asAgent?: string; rest: string[] } 
     return { asAgent, rest };
 }
 
-function parseMessageDeliveryModeOptions(args: string[]): {
+function parseMessageDeliveryModeOptions(
+    args: string[],
+    defaults?: { deliveryMode?: MessageDeliveryMode; priority?: MessagePriority }
+): {
     rest: string[];
     deliveryMode: MessageDeliveryMode;
     priority: MessagePriority;
 } {
     const rest: string[] = [];
-    let deliveryMode: MessageDeliveryMode = 'mailbox';
-    let priority: MessagePriority = 'normal';
+    let deliveryMode: MessageDeliveryMode = defaults?.deliveryMode || 'mailbox';
+    let priority: MessagePriority = defaults?.priority || 'normal';
 
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
@@ -1800,6 +1922,380 @@ async function commandListBlocks(state: LocalState, asAgent?: string): Promise<v
     console.log(JSON.stringify(result, null, 2));
 }
 
+async function sendEnvelopeToPeer(params: {
+    session: AgentSession;
+    peerAccount: string;
+    payload: { type: string; content: string; data?: Record<string, any> };
+    clientMsgIdPrefix: string;
+}): Promise<{ peer: AgentLite; dm: ConversationRow; sent: any }> {
+    const peer = await findAgentByAccount(params.session.token, params.peerAccount);
+    const dm = await api('POST', '/api/v1/conversations/dm', { peer_agent_id: peer.id }, params.session.token);
+    const sent = await api(
+        'POST',
+        `/api/v1/conversations/${dm.id}/messages`,
+        { payload: params.payload, client_msg_id: `${params.clientMsgIdPrefix}-${Date.now()}` },
+        params.session.token
+    );
+    return { peer, dm, sent };
+}
+
+function parseTaskMetaOptions(args: string[]): {
+    rest: string[];
+    taskId?: string;
+    status?: TaskStatus;
+} {
+    const rest: string[] = [];
+    let taskId: string | undefined;
+    let status: TaskStatus | undefined;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--task-id') {
+            const value = (args[i + 1] || '').trim();
+            if (!value) throw new Error('Missing value for --task-id');
+            taskId = value;
+            i += 1;
+            continue;
+        }
+        if (arg === '--status') {
+            const value = String(args[i + 1] || '').toLowerCase();
+            if (!value) throw new Error('Missing value for --status');
+            if (!isTaskStatus(value)) {
+                throw new Error('Invalid --status. Use requested|approved|rejected|completed|failed');
+            }
+            status = value;
+            i += 1;
+            continue;
+        }
+        rest.push(arg);
+    }
+
+    return { rest, taskId, status };
+}
+
+async function commandTaskRequest(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const metaParsed = parseTaskMetaOptions(args);
+    const deliveryParsed = parseMessageDeliveryModeOptions(metaParsed.rest, {
+        deliveryMode: 'realtime',
+        priority: 'high',
+    });
+    const [peerAccount, ...requestParts] = deliveryParsed.rest;
+    const requestText = requestParts.join(' ').trim();
+    if (!peerAccount || !requestText) {
+        throw new Error(
+            'Usage: clawtalk task request <peer_account> <task_prompt> [--task-id <id>] [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]'
+        );
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const taskId = metaParsed.taskId || generateTaskId();
+    const nowIso = new Date().toISOString();
+    const payload = {
+        type: 'tool_call',
+        content: 'clawtalk.task.request',
+        data: {
+            protocol: TASK_PROTOCOL_VERSION,
+            kind: 'task_request',
+            task_id: taskId,
+            request: requestText,
+            delivery_mode: deliveryParsed.deliveryMode,
+            priority: deliveryParsed.priority,
+            created_at: nowIso,
+        },
+    };
+
+    const sentPack = await sendEnvelopeToPeer({
+        session,
+        peerAccount,
+        payload,
+        clientMsgIdPrefix: 'task-req',
+    });
+    const { peer, dm, sent } = sentPack;
+
+    await appendLocalConversationRecord(session.agent_name, {
+        direction: 'outgoing',
+        message_id: sent.id || `local-${Date.now()}`,
+        conversation_id: dm.id,
+        agent_username: session.agent_name,
+        peer_agent_username: peer.agent_name,
+        envelope_type: 'tool_call',
+        delivery_mode: deliveryParsed.deliveryMode,
+        priority: deliveryParsed.priority,
+        content: `Task request (${taskId}): ${requestText}`,
+        attachments: [],
+        sent_at: sent.created_at || nowIso,
+    });
+
+    upsertTaskRecord(state, session.agent_name, {
+        taskId,
+        direction: 'outgoing',
+        peerAgentName: peer.agent_name,
+        request: requestText,
+        status: 'requested',
+        messageId: sent.id,
+        at: sent.created_at || nowIso,
+    });
+    await saveState(state);
+
+    console.log(
+        `Task request sent to ${peer.agent_name} (task_id=${taskId}, mode=${deliveryParsed.deliveryMode}, priority=${deliveryParsed.priority}).`
+    );
+    console.log(`message_id: ${sent.id}`);
+}
+
+async function commandTaskApproveOrReject(
+    args: string[],
+    state: LocalState,
+    asAgent: string | undefined,
+    status: 'approved' | 'rejected'
+): Promise<void> {
+    const metaParsed = parseTaskMetaOptions(args);
+    const deliveryParsed = parseMessageDeliveryModeOptions(metaParsed.rest, {
+        deliveryMode: 'realtime',
+        priority: 'high',
+    });
+    const [peerAccount, taskId, ...noteParts] = deliveryParsed.rest;
+    const note = noteParts.join(' ').trim();
+    if (!peerAccount || !taskId) {
+        throw new Error(
+            `Usage: clawtalk task ${status === 'approved' ? 'approve' : 'reject'} <peer_account> <task_id> [note] [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]`
+        );
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const nowIso = new Date().toISOString();
+    const payload = {
+        type: 'event',
+        content: 'clawtalk.task.update',
+        data: {
+            protocol: TASK_PROTOCOL_VERSION,
+            kind: 'task_update',
+            task_id: taskId,
+            status,
+            reason: note || undefined,
+            delivery_mode: deliveryParsed.deliveryMode,
+            priority: deliveryParsed.priority,
+            created_at: nowIso,
+        },
+    };
+
+    const sentPack = await sendEnvelopeToPeer({
+        session,
+        peerAccount,
+        payload,
+        clientMsgIdPrefix: `task-${status}`,
+    });
+    const { peer, dm, sent } = sentPack;
+
+    await appendLocalConversationRecord(session.agent_name, {
+        direction: 'outgoing',
+        message_id: sent.id || `local-${Date.now()}`,
+        conversation_id: dm.id,
+        agent_username: session.agent_name,
+        peer_agent_username: peer.agent_name,
+        envelope_type: 'event',
+        delivery_mode: deliveryParsed.deliveryMode,
+        priority: deliveryParsed.priority,
+        content: `Task ${status} (${taskId})${note ? `: ${note}` : ''}`,
+        attachments: [],
+        sent_at: sent.created_at || nowIso,
+    });
+
+    upsertTaskRecord(state, session.agent_name, {
+        taskId,
+        direction: 'incoming',
+        peerAgentName: peer.agent_name,
+        status,
+        result: note || undefined,
+        messageId: sent.id,
+        at: sent.created_at || nowIso,
+    });
+    await saveState(state);
+
+    console.log(`Task ${status} sent to ${peer.agent_name} (task_id=${taskId}).`);
+    console.log(`message_id: ${sent.id}`);
+}
+
+async function commandTaskResult(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const metaParsed = parseTaskMetaOptions(args);
+    const deliveryParsed = parseMessageDeliveryModeOptions(metaParsed.rest, {
+        deliveryMode: 'realtime',
+        priority: 'high',
+    });
+    const [peerAccount, taskId, ...resultParts] = deliveryParsed.rest;
+    const resultText = resultParts.join(' ').trim();
+    const status = metaParsed.status || 'completed';
+    if (status !== 'completed' && status !== 'failed') {
+        throw new Error('task result only supports --status completed|failed');
+    }
+    if (!peerAccount || !taskId || !resultText) {
+        throw new Error(
+            'Usage: clawtalk task result <peer_account> <task_id> <result_text> [--status <completed|failed>] [--mailbox|--realtime] [--priority <low|normal|high>] [--as <agent_username>]'
+        );
+    }
+
+    const session = getSessionOrThrow(state, asAgent);
+    const nowIso = new Date().toISOString();
+    const payload = {
+        type: 'event',
+        content: 'clawtalk.task.update',
+        data: {
+            protocol: TASK_PROTOCOL_VERSION,
+            kind: 'task_update',
+            task_id: taskId,
+            status,
+            result: resultText,
+            delivery_mode: deliveryParsed.deliveryMode,
+            priority: deliveryParsed.priority,
+            created_at: nowIso,
+        },
+    };
+
+    const sentPack = await sendEnvelopeToPeer({
+        session,
+        peerAccount,
+        payload,
+        clientMsgIdPrefix: 'task-result',
+    });
+    const { peer, dm, sent } = sentPack;
+
+    await appendLocalConversationRecord(session.agent_name, {
+        direction: 'outgoing',
+        message_id: sent.id || `local-${Date.now()}`,
+        conversation_id: dm.id,
+        agent_username: session.agent_name,
+        peer_agent_username: peer.agent_name,
+        envelope_type: 'event',
+        delivery_mode: deliveryParsed.deliveryMode,
+        priority: deliveryParsed.priority,
+        content: `Task ${status} (${taskId}): ${resultText}`,
+        attachments: [],
+        sent_at: sent.created_at || nowIso,
+    });
+
+    upsertTaskRecord(state, session.agent_name, {
+        taskId,
+        direction: 'incoming',
+        peerAgentName: peer.agent_name,
+        status,
+        result: resultText,
+        messageId: sent.id,
+        at: sent.created_at || nowIso,
+    });
+    await saveState(state);
+
+    console.log(`Task result sent to ${peer.agent_name} (task_id=${taskId}, status=${status}).`);
+    console.log(`message_id: ${sent.id}`);
+}
+
+function formatTaskSummaryLine(record: TaskRecord): string {
+    const updated = formatNoticeTime(record.updated_at);
+    const requestPreview = truncateForDigest(record.request || '', 80);
+    const resultPreview = truncateForDigest(record.result || '', 80);
+    const resultPart = resultPreview ? ` | result: ${resultPreview}` : '';
+    return `- ${record.task_id} | ${record.direction} | ${record.status} | peer=${record.peer_agent_name} | updated=${updated} | request: ${requestPreview}${resultPart}`;
+}
+
+function parseTaskListArgs(args: string[]): {
+    direction: TaskDirection | 'all';
+    status?: TaskStatus;
+    limit: number;
+} {
+    let direction: TaskDirection | 'all' = 'all';
+    let status: TaskStatus | undefined;
+    let limit = 50;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--direction') {
+            const value = String(args[i + 1] || '').toLowerCase();
+            if (!value) throw new Error('Missing value for --direction');
+            if (value !== 'incoming' && value !== 'outgoing' && value !== 'all') {
+                throw new Error('Invalid --direction. Use incoming|outgoing|all');
+            }
+            direction = value as TaskDirection | 'all';
+            i += 1;
+            continue;
+        }
+        if (arg === '--status') {
+            const value = String(args[i + 1] || '').toLowerCase();
+            if (!value) throw new Error('Missing value for --status');
+            if (!isTaskStatus(value)) {
+                throw new Error('Invalid --status. Use requested|approved|rejected|completed|failed');
+            }
+            status = value;
+            i += 1;
+            continue;
+        }
+        if (arg === '--limit') {
+            const raw = args[i + 1];
+            if (!raw) throw new Error('Missing value for --limit');
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+                throw new Error('Invalid --limit. Use integer >= 1.');
+            }
+            limit = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        throw new Error(`Unknown option for task list: ${arg}`);
+    }
+
+    return { direction, status, limit: Math.max(1, Math.min(200, limit)) };
+}
+
+async function commandTaskList(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const parsed = parseTaskListArgs(args);
+    const session = getSessionOrThrow(state, asAgent);
+    const store = ensureTaskStore(state, session.agent_name);
+
+    const rows = Object.values(store)
+        .filter((item) => parsed.direction === 'all' || item.direction === parsed.direction)
+        .filter((item) => !parsed.status || item.status === parsed.status)
+        .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+        .slice(0, parsed.limit);
+
+    if (rows.length === 0) {
+        console.log('No task records found for current filter.');
+        return;
+    }
+
+    console.log(`Task records for ${session.agent_name}: ${rows.length}`);
+    for (const row of rows) {
+        console.log(formatTaskSummaryLine(row));
+    }
+}
+
+async function commandTask(args: string[], state: LocalState, asAgent?: string): Promise<void> {
+    const sub = String(args[0] || '').toLowerCase();
+    const rest = args.slice(1);
+
+    if (sub === 'request') {
+        await commandTaskRequest(rest, state, asAgent);
+        return;
+    }
+    if (sub === 'approve') {
+        await commandTaskApproveOrReject(rest, state, asAgent, 'approved');
+        return;
+    }
+    if (sub === 'reject') {
+        await commandTaskApproveOrReject(rest, state, asAgent, 'rejected');
+        return;
+    }
+    if (sub === 'result') {
+        await commandTaskResult(rest, state, asAgent);
+        return;
+    }
+    if (sub === 'list' || sub === '') {
+        await commandTaskList(rest, state, asAgent);
+        return;
+    }
+
+    throw new Error(
+        'Usage: clawtalk task <request|approve|reject|result|list> ... (run `npm run clawtalk -- help` for full syntax)'
+    );
+}
+
 async function commandSendDm(args: string[], state: LocalState, asAgent?: string): Promise<void> {
     const parsed = parseMessageDeliveryModeOptions(args);
     const [peerAccount, ...rest] = parsed.rest;
@@ -3018,6 +3514,9 @@ async function commandInbox(args: string[], state: LocalState, asAgent?: string)
 function removeSessionState(state: LocalState, agentName: string): void {
     delete state.sessions[agentName];
     delete state.seen[agentName];
+    if (state.tasks) {
+        delete state.tasks[agentName];
+    }
     if (state.current_agent === agentName) {
         const remaining = Object.keys(state.sessions);
         state.current_agent = remaining[0];
@@ -4108,7 +4607,66 @@ function buildMailboxPrompt(
     });
 }
 
+function renderTaskRequestContent(task: TaskEnvelopeRequest): string {
+    const requestText = task.request || '[empty task prompt]';
+    return `Task ID: ${task.task_id}. Request: ${requestText}`;
+}
+
+function renderTaskUpdateContent(task: TaskEnvelopeUpdate): string {
+    const detail = task.result || task.reason || '';
+    const detailPart = detail ? ` Detail: ${detail}` : '';
+    return `Task ID: ${task.task_id}. Status: ${task.status}.${detailPart}`;
+}
+
+function buildTaskPrompt(
+    currentAgentName: string,
+    senderName: string,
+    task: ParsedTaskEnvelope
+): string {
+    if (task.kind === 'task_request') {
+        return formatClawtalkNotice({
+            event: 'Task Request',
+            from: senderName,
+            content: renderTaskRequestContent(task),
+            action:
+                `Ask user to approve/reject. If approved and done, send result: ` +
+                `npm run clawtalk -- task result ${senderName} ${task.task_id} "<result>" --as ${currentAgentName}`,
+        });
+    }
+
+    if (task.status === 'approved') {
+        return formatClawtalkNotice({
+            event: 'Task Update',
+            from: senderName,
+            content: renderTaskUpdateContent(task),
+            action: 'Peer accepted the task. Wait for completion update.',
+        });
+    }
+
+    if (task.status === 'rejected') {
+        return formatClawtalkNotice({
+            event: 'Task Update',
+            from: senderName,
+            content: renderTaskUpdateContent(task),
+            action: 'Peer rejected the task. You can revise prompt and resend a new task.',
+        });
+    }
+
+    return formatClawtalkNotice({
+        event: 'Task Result',
+        from: senderName,
+        content: renderTaskUpdateContent(task),
+        action: 'Review result and deliver the final answer to your user.',
+    });
+}
+
 function summarizeIncomingMessage(event: RealtimeMessageEvent): string {
+    const task = parseTaskEnvelope(event);
+    if (task) {
+        return task.kind === 'task_request'
+            ? renderTaskRequestContent(task)
+            : renderTaskUpdateContent(task);
+    }
     const payloadType = event.payload?.type || '';
     if (payloadType === 'media') {
         const attachments = (Array.isArray(event.payload?.data?.attachments)
@@ -4241,6 +4799,10 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
             const latest = await loadState();
             latest.seen = latest.seen || {};
             latest.seen[session.agent_name] = seen;
+            latest.tasks = latest.tasks || {};
+            if (state.tasks?.[session.agent_name]) {
+                latest.tasks[session.agent_name] = state.tasks[session.agent_name];
+            }
             await saveState(latest);
             notifyPref = getNotifyPreference(latest, session.agent_name);
             notifyPrefLastRefreshAt = Date.now();
@@ -4494,6 +5056,34 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
         const senderName = data.sender_name || await resolveAgentName(data.sender_id || '');
         const deliveryMode = getMessageDeliveryMode(data);
         const priority = getMessagePriority(data);
+        const taskEnvelope = parseTaskEnvelope(data);
+        if (taskEnvelope) {
+            const at = data.created_at || taskEnvelope.created_at || new Date().toISOString();
+            if (taskEnvelope.kind === 'task_request') {
+                upsertTaskRecord(state, session.agent_name, {
+                    taskId: taskEnvelope.task_id,
+                    direction: 'incoming',
+                    peerAgentName: senderName,
+                    request: taskEnvelope.request || '',
+                    status: 'requested',
+                    messageId: data.id,
+                    at,
+                });
+            } else {
+                const existing = ensureTaskStore(state, session.agent_name)[taskEnvelope.task_id];
+                upsertTaskRecord(state, session.agent_name, {
+                    taskId: taskEnvelope.task_id,
+                    direction: existing?.direction || 'outgoing',
+                    peerAgentName: senderName,
+                    request: existing?.request || '',
+                    status: taskEnvelope.status,
+                    result: taskEnvelope.result || taskEnvelope.reason,
+                    messageId: data.id,
+                    at,
+                });
+            }
+            await persistWatcherState();
+        }
         const cachedAttachments = await cacheIncomingAttachments(session, data);
         let content = summarizeIncomingMessage(data);
         const localPaths = cachedAttachments
@@ -4520,7 +5110,9 @@ async function runWatcher(state: LocalState, session: AgentSession, hooks: Watch
             sent_at: data.created_at || new Date().toISOString(),
         });
 
-        const prompt = buildMessagePrompt(policy.mode, senderName, content);
+        const prompt = taskEnvelope
+            ? buildTaskPrompt(session.agent_name, senderName, taskEnvelope)
+            : buildMessagePrompt(policy.mode, senderName, content);
         if (deliveryMode === 'mailbox') {
             const mailboxId = data.id || `mailbox-${Date.now()}`;
             rememberMailboxPending(seen, {
@@ -5615,6 +6207,7 @@ async function main() {
                 commandRejectFriend,
                 commandCancelFriendRequest,
                 commandSendDm,
+                commandTask,
                 commandMessageStatus,
                 commandSendAttachment,
                 commandDownloadAttachment,

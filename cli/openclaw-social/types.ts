@@ -4,6 +4,8 @@ export type DeliveryStrategy = 'primary' | 'fanout' | 'fallback';
 export type MessageDeliveryMode = 'mailbox' | 'realtime';
 export type MessagePriority = 'low' | 'normal' | 'high';
 export type ClaimStatus = 'pending_claim' | 'claimed';
+export type TaskDirection = 'incoming' | 'outgoing';
+export type TaskStatus = 'requested' | 'approved' | 'rejected' | 'completed' | 'failed';
 
 export interface ClaimInfo {
     claim_status: ClaimStatus;
@@ -73,6 +75,18 @@ export interface NotificationRetryItem {
     last_error?: string;
 }
 
+export interface TaskRecord {
+    task_id: string;
+    direction: TaskDirection;
+    peer_agent_name: string;
+    request: string;
+    status: TaskStatus;
+    result?: string;
+    last_message_id?: string;
+    created_at: string;
+    updated_at: string;
+}
+
 export interface SeenState {
     friend_request_ids: string[];
     message_ids: string[];
@@ -133,6 +147,7 @@ export interface LocalState {
     policies: Record<string, AgentPolicy>;
     notify_profiles: Record<string, NotifyDestination[]>;
     notify_prefs: Record<string, NotifyPreference>;
+    tasks: Record<string, Record<string, TaskRecord>>;
 }
 
 export interface CliConfig {

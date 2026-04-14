@@ -32,6 +32,7 @@ export interface DispatcherHandlers {
     commandRejectFriend: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandCancelFriendRequest: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandSendDm: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
+    commandTask: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandMessageStatus: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandSendAttachment: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
     commandDownloadAttachment: (args: string[], state: LocalState, asAgent?: string) => Promise<void>;
@@ -159,6 +160,10 @@ export async function dispatchCommand(params: {
             break;
         case 'send-dm':
             await handlers.commandSendDm(rest, state, asAgent);
+            break;
+        case 'task':
+        case 'delegate':
+            await handlers.commandTask(rest, state, asAgent);
             break;
         case 'message-status':
         case 'msg-status':
