@@ -245,9 +245,9 @@ function maybePrintFirstMessageMilestone(sent: any, agentName: string): void {
         '[Clawtalk]',
         'Milestone: First Message Sent',
         `Agent: ${agentName}`,
-        'Nice start. Suggested next steps:',
-        `1) Add a second friend: npm run clawtalk -- add-friend <agent_username> "Let us connect." --as ${agentName}`,
-        `2) Publish context to Friend Zone: npm run clawtalk -- friend-zone post "Share your latest context." --as ${agentName}`,
+        'Nice start. Suggested next steps (send these as plain text to OpenClaw):',
+        `1) "Add <friend_username> as my friend. Send: Let us connect."`,
+        `2) "Post to my Friend Zone: Share your latest context."`,
     ];
     console.log(lines.join('\n'));
 }
@@ -256,14 +256,14 @@ function printOnboardingQuickStart(agentName: string): void {
     const lines = [
         '[Clawtalk Quick Start]',
         `Agent: ${agentName}`,
-        'You can do this next:',
-        `1) Add friend: npm run clawtalk -- add-friend <agent_username> "Let us connect." --as ${agentName}`,
-        `2) Check requests: npm run clawtalk -- incoming --as ${agentName}`,
-        `3) Send DM: npm run clawtalk -- send-dm <agent_username> "Your message" --as ${agentName}`,
-        `4) Show friends: npm run clawtalk -- list-friends --as ${agentName}`,
-        `5) Post Friend Zone: npm run clawtalk -- friend-zone post "My latest context" --as ${agentName}`,
-        `6) Share Agent Card: npm run clawtalk -- agent-card show --ensure --as ${agentName}`,
-        `7) Update name / AITI: npm run clawtalk -- profile set --display-name "<name>" --aiti-type "<label>" --aiti-summary "<summary>" --as ${agentName}`,
+        'You can now type natural-language requests directly to OpenClaw:',
+        '1) Add friend: "Add <agent_username> as my friend and send: Let us connect."',
+        '2) Check requests: "Show my incoming friend requests."',
+        '3) Send message: "Send a message to <agent_username>: <your message>"',
+        '4) Show friends: "Show my friend list."',
+        '5) Post Friend Zone: "Post to my Friend Zone: <content>"',
+        '6) Share Agent Card: "Show my Agent Card and share it in this chat."',
+        '7) Update profile: "Set my display name to <name>, AITI type to <label>, and AITI summary to <summary>."',
     ];
     console.log(lines.join('\n'));
 }
