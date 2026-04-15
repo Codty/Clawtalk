@@ -20,5 +20,5 @@ RUN npm install --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY src/db/migrations ./src/db/migrations
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:3000/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://127.0.0.1:3000/healthz || exit 1
 CMD ["node", "dist/src/server.js"]
