@@ -1549,6 +1549,7 @@ describe('Upload Access Control', () => {
     let generatedAgentCardUploadId: string;
     let generatedAgentCardId: string;
     let generatedAgentCardVerifyUrl: string;
+    let generatedAgentCardPublicImageUrl: string;
     let generatedAgentCardShareText: string;
     let agentEToken: string;
     let agentEId: string;
@@ -1747,6 +1748,7 @@ describe('Upload Access Control', () => {
         expect(card.json().card.upload_id).toBe(generatedAgentCardUploadId);
         expect(card.json().card.upload.mime_type).toBe('image/svg+xml');
         expect(typeof card.json().card.verify_url).toBe('string');
+        expect(typeof card.json().card.public_image_url).toBe('string');
         expect(typeof card.json().card.share_text).toBe('string');
         expect(card.json().card.share_text).toContain('Read');
         expect(card.json().card.share_text).toContain('Target Agent Username:');
@@ -1754,6 +1756,7 @@ describe('Upload Access Control', () => {
 
         generatedAgentCardId = card.json().card.id;
         generatedAgentCardVerifyUrl = card.json().card.verify_url;
+        generatedAgentCardPublicImageUrl = card.json().card.public_image_url;
         generatedAgentCardShareText = card.json().card.share_text;
     });
 
@@ -1784,6 +1787,18 @@ describe('Upload Access Control', () => {
         expect(typeof verify.json().card.claw_id).toBe('string');
         expect(typeof verify.json().card.share_text).toBe('string');
         expect(verify.json().card.verify_url).toBe(generatedAgentCardVerifyUrl);
+        expect(verify.json().card.public_image_url).toBe(generatedAgentCardPublicImageUrl);
+    });
+
+    it('public image endpoint should return card svg without authorization', async () => {
+        const image = await app.inject({
+            method: 'GET',
+            url: `/api/v1/agent-card/public/${generatedAgentCardId}/image`,
+        });
+        expect(image.statusCode).toBe(200);
+        expect(image.headers['content-type']).toContain('image/svg+xml');
+        expect(image.headers['content-disposition']).toContain('inline');
+        expect(image.body).toContain('<svg');
     });
 
     it('agent E should connect with agent A by card share text', async () => {

@@ -394,6 +394,32 @@ export function buildAgentCardVerifyUrl(baseUrl: string, cardId: string): string
     return `${normalized}/api/v1/agent-card/verify/${encodeURIComponent(cardId)}`;
 }
 
+export function buildAgentCardPublicImageUrl(baseUrl: string, cardId: string): string {
+    const normalized = baseUrl.replace(/\/+$/, '');
+    return `${normalized}/api/v1/agent-card/public/${encodeURIComponent(cardId)}/image`;
+}
+
+export async function getAgentCardImageById(cardId: string): Promise<{
+    cardId: string;
+    filename: string;
+    mimeType: string;
+    storageKey: string;
+    sizeBytes: number;
+}> {
+    const row = await fetchCardRowByCardId(cardId);
+    if (!row) {
+        throw new AgentCardError('Agent card not found', 404);
+    }
+
+    return {
+        cardId: row.id,
+        filename: row.filename || `${row.agent_name}-agent-card.svg`,
+        mimeType: row.mime_type || 'application/octet-stream',
+        storageKey: row.storage_key,
+        sizeBytes: Number(row.size_bytes || 0),
+    };
+}
+
 export function buildAgentCardShareText(params: {
     baseUrl: string;
     agentUsername: string;

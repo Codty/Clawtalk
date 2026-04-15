@@ -387,7 +387,7 @@ async function ensureAgentCardReady(state: LocalState, session: AgentSession, ev
     try {
         const result = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
         const card = result?.card;
-        const cardUrl = String(card?.upload?.url || '').trim();
+        const cardUrl = resolveAgentCardImageUrl(card);
         const shareText = String(card?.share_text || '').trim();
         console.log('[Clawtalk]');
         console.log(`Event: ${eventTitle}`);
@@ -410,6 +410,12 @@ async function ensureAgentCardReady(state: LocalState, session: AgentSession, ev
     } catch (err: any) {
         console.warn(`[agent-card] Failed to ensure agent card automatically: ${String(err?.message || err)}`);
     }
+}
+
+function resolveAgentCardImageUrl(card: any): string {
+    const publicUrl = String(card?.public_image_url || '').trim();
+    if (publicUrl) return publicUrl;
+    return String(card?.upload?.url || '').trim();
 }
 
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
@@ -2638,8 +2644,9 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
     if (sub === 'show') {
         const parsed = parseAgentCardCommonArgs(subArgs);
         const card = await fetchAgentCard(session.token, parsed.ensure);
-        if (card?.upload?.url) {
-            console.log(`![Clawtalk Agent Card](${card.upload.url})`);
+        const cardImageUrl = resolveAgentCardImageUrl(card);
+        if (cardImageUrl) {
+            console.log(`![Clawtalk Agent Card](${cardImageUrl})`);
             console.log('');
         }
         const lines = [
@@ -2648,7 +2655,7 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
             formatAgentCardField('Agent Username', card?.agent_username || session.agent_name),
             formatAgentCardField('Owner', card?.owner_name),
             formatAgentCardField('Verify', card?.verify_url),
-            formatAgentCardField('Image', card?.upload?.url),
+            formatAgentCardField('Image', cardImageUrl),
         ].filter(Boolean);
         console.log(lines.join('\n'));
         return;
@@ -3025,18 +3032,20 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         const count = Array.isArray(result.post?.post_json?.attachments) ? result.post.post_json.attachments.length : 0;
         console.log(`Friend Zone post created: ${result.post.id}`);
         console.log(`attachments: ${count}`);
-        if (result.agent_card_created && result.agent_card?.upload?.url) {
-            const cardUrl = String(result.agent_card.upload.url);
-            console.log('[Clawtalk]');
-            console.log('Event: Agent Card Created');
-            console.log('Content: Your first Friend Zone post created your Agent Card.');
-            console.log(`Card image: ${cardUrl}`);
-            console.log(`![Clawtalk Agent Card](${cardUrl})`);
-            await pushAgentCardImageToChat(state, session, {
-                mediaUrl: cardUrl,
-                eventTitle: 'Agent Card Created',
-                contentLine: 'Your first Friend Zone post created your Agent Card. I attached the image.',
-            });
+        if (result.agent_card_created) {
+            const cardUrl = resolveAgentCardImageUrl(result.agent_card);
+            if (cardUrl) {
+                console.log('[Clawtalk]');
+                console.log('Event: Agent Card Created');
+                console.log('Content: Your first Friend Zone post created your Agent Card.');
+                console.log(`Card image: ${cardUrl}`);
+                console.log(`![Clawtalk Agent Card](${cardUrl})`);
+                await pushAgentCardImageToChat(state, session, {
+                    mediaUrl: cardUrl,
+                    eventTitle: 'Agent Card Created',
+                    contentLine: 'Your first Friend Zone post created your Agent Card. I attached the image.',
+                });
+            }
         }
         return;
     }

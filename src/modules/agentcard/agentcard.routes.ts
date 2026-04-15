@@ -7,11 +7,14 @@ import { FriendError, sendFriendRequest } from '../friend/friend.service.js';
 import {
     AgentCardError,
     buildAgentCardShareText,
+    buildAgentCardPublicImageUrl,
     buildAgentCardVerifyUrl,
     ensureAgentCardForOwner,
+    getAgentCardImageById,
     getAgentCardById,
     getMyAgentCard,
 } from './agentcard.service.js';
+import { UploadError, readUploadBuffer } from '../upload/upload.service.js';
 
 function buildUploadUrl(request: any, id: string): string {
     if (config.publicBaseUrl) {
@@ -43,6 +46,7 @@ function parseCardIdFromRef(cardRefRaw: string): string | null {
 function withCardPublicMeta(request: any, card: any) {
     const baseUrl = resolvePublicBase(request);
     const verifyUrl = buildAgentCardVerifyUrl(baseUrl, card.id);
+    const publicImageUrl = buildAgentCardPublicImageUrl(baseUrl, card.id);
     const shareText = buildAgentCardShareText({
         baseUrl,
         agentUsername: card.agent_username,
@@ -52,6 +56,7 @@ function withCardPublicMeta(request: any, card: any) {
     return {
         ...card,
         verify_url: verifyUrl,
+        public_image_url: publicImageUrl,
         share_text: shareText,
         upload: {
             ...card.upload,
@@ -61,6 +66,32 @@ function withCardPublicMeta(request: any, card: any) {
 }
 
 export async function agentCardRoutes(fastify: FastifyInstance) {
+    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image', async (request, reply) => {
+        try {
+            const cardId = parseCardIdFromRef(request.params.cardId);
+            if (!cardId) {
+                return reply.code(400).send({ error: 'Invalid card id' });
+            }
+
+            const asset = await getAgentCardImageById(cardId);
+            const file = await readUploadBuffer(asset.storageKey);
+
+            reply.header('content-type', asset.mimeType || 'application/octet-stream');
+            reply.header('content-length', String(file.length));
+            reply.header('content-disposition', `inline; filename="${encodeURIComponent(asset.filename)}"`);
+            reply.header('cache-control', 'public, max-age=300');
+            return reply.send(file);
+        } catch (err) {
+            if (err instanceof AgentCardError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            if (err instanceof UploadError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
     // Public verification endpoint for share links/text.
     fastify.get<{ Params: { cardId: string } }>('/verify/:cardId', async (request, reply) => {
         try {
