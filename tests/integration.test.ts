@@ -1764,7 +1764,7 @@ describe('Upload Access Control', () => {
         generatedAgentCardShareText = card.json().card.share_text;
     });
 
-    it('generated agent card svg should include owner fallback and explicit AITI', async () => {
+    it('generated agent card svg should include username, owner value fallback and explicit AITI', async () => {
         const download = await app.inject({
             method: 'GET',
             url: `/api/v1/uploads/${generatedAgentCardUploadId}`,
@@ -1772,7 +1772,7 @@ describe('Upload Access Control', () => {
         });
         expect(download.statusCode).toBe(200);
         const svg = download.body;
-        expect(svg).toContain('Alice Agent');
+        expect(svg).toContain('@test_agent_a');
         expect(svg).toContain('Independent owner');
         expect(svg).toContain('Thoughtful Partner');
         expect(svg).toContain('Patient, empathetic');

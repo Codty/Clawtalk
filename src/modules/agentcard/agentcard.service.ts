@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pool } from '../../db/pool.js';
 import { createUpload, readUploadBuffer, toUploadPublicView, UploadError } from '../upload/upload.service.js';
 
-const CARD_STYLE_VERSION = 3;
+const CARD_STYLE_VERSION = 4;
 const AGENT_CARD_LOGO_RELATIVE_PATH = path.join('src', 'modules', 'agentcard', 'assets', 'logopic.jpg');
 let cachedLogoDataUri: string | null | undefined;
 
@@ -110,13 +110,64 @@ function formatJoinedLabel(createdAt: string): string {
     return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
-function buildMonogram(profile: AgentProfileForCard): string {
-    const source = trimText(profile.display_name || profile.agent_name, 40);
-    const parts = source.split(/[^A-Za-z0-9]+/).filter(Boolean);
-    if (parts.length >= 2) {
-        return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase().slice(0, 2) || 'AG';
+function hashSeed(input: string): number {
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
     }
-    return source.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || 'AG';
+    return hash >>> 0;
+}
+
+function buildCartoonAvatar(seedSource: string): string {
+    const seed = hashSeed(seedSource || 'agent');
+    const palettes = [
+        { bg: '#d9fff0', face: '#fff6da', ear: '#ffd9b8', eye: '#2b4235', blush: '#ffb5c8', deco: '#97eac6' },
+        { bg: '#dff4ff', face: '#ffe9d6', ear: '#ffd0d0', eye: '#30465e', blush: '#ffb1d9', deco: '#b7d8ff' },
+        { bg: '#f0e6ff', face: '#ffe8c7', ear: '#ffd5a8', eye: '#3d3354', blush: '#ffb6d2', deco: '#d6c0ff' },
+        { bg: '#fff2d8', face: '#fff7e7', ear: '#ffdcb8', eye: '#4e402f', blush: '#ffc2cd', deco: '#ffe39d' },
+        { bg: '#e4ffe5', face: '#fff1da', ear: '#ffd7c2', eye: '#2f4b34', blush: '#ffbccf', deco: '#bff2b2' },
+    ] as const;
+    const palette = palettes[seed % palettes.length];
+    const eyeY = 176 + (seed % 5) - 2;
+    const eyeShift = 1 + (seed % 3);
+    const smileType = seed % 3;
+    const earType = seed % 3;
+    const sparkleX = 850 + (seed % 36);
+    const sparkleY = 108 + ((seed >> 3) % 28);
+    const mouth =
+        smileType === 0
+            ? `<path d="M900 212 Q930 236 960 212" stroke="${palette.eye}" stroke-width="6" stroke-linecap="round" fill="none" />`
+            : smileType === 1
+                ? `<path d="M902 220 Q930 226 958 220" stroke="${palette.eye}" stroke-width="6" stroke-linecap="round" fill="none" />`
+                : `<path d="M902 224 Q930 205 958 224" stroke="${palette.eye}" stroke-width="6" stroke-linecap="round" fill="none" />`;
+    const ears =
+        earType === 0
+            ? `<ellipse cx="886" cy="142" rx="20" ry="26" fill="${palette.ear}" />
+               <ellipse cx="974" cy="142" rx="20" ry="26" fill="${palette.ear}" />`
+            : earType === 1
+                ? `<path d="M866 154 C868 126 888 116 906 136 C896 146 886 162 884 176 Z" fill="${palette.ear}" />
+                   <path d="M994 154 C992 126 972 116 954 136 C964 146 974 162 976 176 Z" fill="${palette.ear}" />`
+                : `<circle cx="884" cy="154" r="20" fill="${palette.ear}" />
+                   <circle cx="976" cy="154" r="20" fill="${palette.ear}" />`;
+
+    return `
+  <g aria-label="Cartoon avatar">
+    <circle cx="930" cy="178" r="104" fill="#f3fff8" fill-opacity="0.85" />
+    <circle cx="930" cy="178" r="95" fill="${palette.bg}" />
+    <circle cx="${sparkleX}" cy="${sparkleY}" r="11" fill="${palette.deco}" opacity="0.85" />
+    <circle cx="${sparkleX + 24}" cy="${sparkleY + 20}" r="6" fill="${palette.deco}" opacity="0.75" />
+    ${ears}
+    <ellipse cx="930" cy="190" rx="62" ry="56" fill="${palette.face}" />
+    <circle cx="${906 - eyeShift}" cy="${eyeY}" r="6.4" fill="${palette.eye}" />
+    <circle cx="${954 + eyeShift}" cy="${eyeY}" r="6.4" fill="${palette.eye}" />
+    <circle cx="${906 - eyeShift - 2}" cy="${eyeY - 2}" r="1.6" fill="#ffffff" />
+    <circle cx="${954 + eyeShift - 2}" cy="${eyeY - 2}" r="1.6" fill="#ffffff" />
+    <ellipse cx="892" cy="204" rx="9" ry="5.5" fill="${palette.blush}" opacity="0.8" />
+    <ellipse cx="968" cy="204" rx="9" ry="5.5" fill="${palette.blush}" opacity="0.8" />
+    <circle cx="930" cy="198" r="5" fill="${palette.eye}" />
+    ${mouth}
+  </g>`;
 }
 
 function inferAiti(profile: AgentProfileForCard): { label: string; summary: string } {
@@ -184,21 +235,17 @@ function loadAgentCardLogoDataUri(): string | null {
 
 function renderAgentCardSvg(profile: AgentProfileForCard): string {
     const logoDataUri = loadAgentCardLogoDataUri();
-    const title = trimText(profile.display_name || profile.agent_name, 30);
     const username = profile.agent_name;
     const aiti = inferAiti(profile);
     const aitiSummaryLines = wrapLines(aiti.summary, 32, 2);
-    const monogram = buildMonogram(profile);
+    const cartoonAvatar = buildCartoonAvatar(profile.agent_name);
     const ownerName = formatOwnerName(profile.owner_name);
-    const titleFontSize = pickFontSize(title, [
-        { maxLength: 14, size: 68 },
-        { maxLength: 20, size: 60 },
-        { maxLength: 26, size: 52 },
-    ], 46);
     const usernameFontSize = pickFontSize(username, [
-        { maxLength: 18, size: 29 },
-        { maxLength: 24, size: 26 },
-    ], 23);
+        { maxLength: 10, size: 72 },
+        { maxLength: 15, size: 66 },
+        { maxLength: 20, size: 58 },
+        { maxLength: 26, size: 52 },
+    ], 48);
     const ownerFontSize = pickFontSize(ownerName, [
         { maxLength: 12, size: 28 },
         { maxLength: 18, size: 25 },
@@ -207,7 +254,7 @@ function renderAgentCardSvg(profile: AgentProfileForCard): string {
         ? `<image href="${logoDataUri}" x="86" y="80" width="30" height="30" preserveAspectRatio="xMidYMid slice" opacity="0.98" />`
         : `<circle cx="101" cy="95" r="14" fill="#f5fff9" opacity="0.92" />`;
     const aitiSummarySvg = aitiSummaryLines
-        .map((line, idx) => `<text x="92" y="${468 + idx * 24}" fill="#ebfff4" font-size="20" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`)
+        .map((line, idx) => `<text x="92" y="${410 + idx * 24}" fill="#ebfff4" font-size="20" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`)
         .join('');
     const connectHintLines = wrapLines('Use OpenClaw to open the verify link and send a friend request', 30, 3)
         .map(
@@ -244,17 +291,14 @@ function renderAgentCardSvg(profile: AgentProfileForCard): string {
 
   ${brandMark}
   <text x="128" y="100" fill="#effff8" font-size="24" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.4">CLAWTALK</text>
-  <text x="92" y="186" fill="#ffffff" font-size="${titleFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(title)}</text>
-  <text x="92" y="232" fill="#f1fff7" font-size="${usernameFontSize}" font-family="'Helvetica Neue', Arial, sans-serif">@${escapeXml(username)}</text>
-  <text x="92" y="308" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">OWNER</text>
-  <text x="92" y="344" fill="#ffffff" font-size="${ownerFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(ownerName)}</text>
+  <text x="92" y="208" fill="#f1fff7" font-size="${usernameFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">@${escapeXml(username)}</text>
+  <text x="92" y="280" fill="#ffffff" font-size="${ownerFontSize}" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(ownerName)}</text>
 
-  <text x="92" y="398" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">AITI</text>
-  <text x="92" y="430" fill="#ffffff" font-size="34" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(aiti.label)}</text>
+  <text x="92" y="340" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">AITI</text>
+  <text x="92" y="372" fill="#ffffff" font-size="34" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(aiti.label)}</text>
   ${aitiSummarySvg}
 
-  <circle cx="930" cy="178" r="104" fill="#f3fff8" fill-opacity="0.82" />
-  <text x="930" y="199" text-anchor="middle" fill="#14966c" font-size="72" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">${escapeXml(monogram)}</text>
+  ${cartoonAvatar}
 
   <text x="724" y="300" fill="#daf9ea" font-size="16" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700" letter-spacing="1.2">ADD FRIEND</text>
   <text x="724" y="340" fill="#ffffff" font-size="34" font-family="'Helvetica Neue', Arial, sans-serif" font-weight="700">Via OpenClaw</text>

@@ -385,6 +385,7 @@ function parseTaskEnvelope(event: RealtimeMessageEvent): ParsedTaskEnvelope | nu
 
 async function ensureAgentCardReady(state: LocalState, session: AgentSession, eventTitle = 'Agent Card Ready'): Promise<void> {
     try {
+        await syncProfileHintsFromIdentity(state, session);
         const result = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
         const card = result?.card;
         const cardUrl = resolveAgentCardImageUrl(card);
@@ -416,6 +417,243 @@ function resolveAgentCardImageUrl(card: any): string {
     const publicUrl = String(card?.public_image_url || '').trim();
     if (publicUrl) return publicUrl;
     return String(card?.upload?.url || '').trim();
+}
+
+function clipText(input: string, maxLen: number): string {
+    return String(input || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, Math.max(1, maxLen))
+        .trim();
+}
+
+const DEFAULT_AITI_PROFILE = {
+    aiti_type: 'Quiet Executor',
+    aiti_summary: 'Talks less, delivers strongly',
+} as const;
+
+const IDENTITY_PROMPT_CHAR_LIMIT = 12_000;
+
+function truncateText(input: string, maxLen: number): string {
+    const text = String(input || '');
+    if (text.length <= maxLen) return text;
+    return `${text.slice(0, maxLen)}\n\n[truncated]`;
+}
+
+function collectIdentityPathCandidates(state: LocalState, session: AgentSession): string[] {
+    const candidates = new Set<string>();
+    const envPath = String(process.env.CLAWTALK_IDENTITY_PATH || '').trim();
+    if (envPath) candidates.add(path.resolve(envPath));
+
+    const boundAgentId = state.bindings?.[session.agent_name]?.openclaw_agent_id;
+    if (boundAgentId) {
+        candidates.add(path.join(OPENCLAW_HOME, 'agents', boundAgentId, 'IDENTITY.md'));
+        candidates.add(path.join(OPENCLAW_HOME, 'agents', boundAgentId, 'identity.md'));
+    }
+
+    candidates.add(path.join(OPENCLAW_HOME, 'IDENTITY.md'));
+    candidates.add(path.join(OPENCLAW_HOME, 'identity.md'));
+    return [...candidates];
+}
+
+async function loadIdentityMarkdown(state: LocalState, session: AgentSession): Promise<{ path: string; content: string } | null> {
+    const candidates = collectIdentityPathCandidates(state, session);
+    for (const candidate of candidates) {
+        if (!(await pathExists(candidate))) continue;
+        try {
+            const content = (await fs.readFile(candidate, 'utf-8')).trim();
+            if (!content) continue;
+            return { path: candidate, content };
+        } catch {
+            // Continue trying next candidate.
+        }
+    }
+    return null;
+}
+
+function resolveAitiInferenceAgentId(state: LocalState, session: AgentSession): string | null {
+    const explicit = String(process.env.CLAWTALK_AITI_OPENCLAW_AGENT_ID || '').trim();
+    if (explicit) return explicit;
+
+    const bindingId = String(state.bindings?.[session.agent_name]?.openclaw_agent_id || '').trim();
+    if (bindingId) return bindingId;
+
+    return null;
+}
+
+function buildAitiInferencePrompt(identityMarkdown: string): string {
+    const identity = truncateText(identityMarkdown, IDENTITY_PROMPT_CHAR_LIMIT);
+    return [
+        'You are generating AITI metadata for a Clawtalk Agent Card.',
+        'Read the agent\'s IDENTITY.md content and infer the best AITI.',
+        '',
+        'Return STRICT JSON only (no markdown, no code fence, no extra text):',
+        '{"aiti_type":"<2-4 words>","aiti_summary":"<one short sentence>"}',
+        '',
+        'Rules:',
+        '- Use only information from IDENTITY.md.',
+        '- aiti_type: 2-4 words, title case, max 64 chars.',
+        '- aiti_summary: max 160 chars.',
+        '- If uncertain, return:',
+        `{"aiti_type":"${DEFAULT_AITI_PROFILE.aiti_type}","aiti_summary":"${DEFAULT_AITI_PROFILE.aiti_summary}"}`,
+        '',
+        'IDENTITY.md content:',
+        '<<<IDENTITY_MD',
+        identity,
+        'IDENTITY_MD',
+    ].join('\n');
+}
+
+function tryParseJsonObject(raw: string): any | null {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+
+    try {
+        return JSON.parse(text);
+    } catch {
+        // Continue with looser parsing below.
+    }
+
+    const jsonLineCandidates = text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    for (let i = jsonLineCandidates.length - 1; i >= 0; i -= 1) {
+        try {
+            return JSON.parse(jsonLineCandidates[i]);
+        } catch {
+            // Keep trying.
+        }
+    }
+
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+        try {
+            return JSON.parse(text.slice(firstBrace, lastBrace + 1));
+        } catch {
+            // Give up.
+        }
+    }
+
+    return null;
+}
+
+function extractOpenClawAgentText(payload: any): string {
+    const texts: string[] = [];
+    const push = (value: any): void => {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) texts.push(trimmed);
+        }
+    };
+
+    const payloadSets = [
+        payload?.payloads,
+        payload?.result?.payloads,
+        payload?.response?.payloads,
+    ];
+    for (const set of payloadSets) {
+        if (!Array.isArray(set)) continue;
+        for (const item of set) {
+            push(item?.text);
+            push(item?.content);
+            push(item?.value);
+        }
+    }
+    push(payload?.text);
+    push(payload?.output_text);
+    push(payload?.message);
+    push(payload?.result?.text);
+    push(payload?.result?.output_text);
+
+    return texts.join('\n').trim();
+}
+
+function parseAitiFromText(rawText: string): {
+    aiti_type: string | null;
+    aiti_summary: string | null;
+} {
+    const parsed = tryParseJsonObject(rawText) || {};
+    const aitiType = clipText(parsed?.aiti_type || parsed?.aitiType || '', 64) || null;
+    const aitiSummary = clipText(parsed?.aiti_summary || parsed?.aitiSummary || '', 160) || null;
+
+    return {
+        aiti_type: aitiType,
+        aiti_summary: aitiSummary,
+    };
+}
+
+async function inferAitiWithOpenClawModel(
+    state: LocalState,
+    session: AgentSession,
+    identityMarkdown: string
+): Promise<{ aiti_type: string | null; aiti_summary: string | null }> {
+    const openclawAgentId = resolveAitiInferenceAgentId(state, session);
+    if (!openclawAgentId) {
+        return {
+            aiti_type: DEFAULT_AITI_PROFILE.aiti_type,
+            aiti_summary: DEFAULT_AITI_PROFILE.aiti_summary,
+        };
+    }
+
+    const prompt = buildAitiInferencePrompt(identityMarkdown);
+    const args = ['agent', '--agent', openclawAgentId, '--message', prompt, '--json'];
+
+    try {
+        const { stdout } = await execFileAsync('openclaw', args, {
+            maxBuffer: 8 * 1024 * 1024,
+            timeout: 60_000,
+        });
+        const parsedEnvelope = tryParseJsonObject(stdout);
+        const modelText = extractOpenClawAgentText(parsedEnvelope) || String(stdout || '').trim();
+        const inferred = parseAitiFromText(modelText);
+        if (!inferred.aiti_type || !inferred.aiti_summary) {
+            return {
+                aiti_type: DEFAULT_AITI_PROFILE.aiti_type,
+                aiti_summary: DEFAULT_AITI_PROFILE.aiti_summary,
+            };
+        }
+        return inferred;
+    } catch (err: any) {
+        const reason = String(err?.stderr || err?.message || err).trim();
+        console.warn(`[profile] openclaw AITI inference failed: ${reason}`);
+        return {
+            aiti_type: DEFAULT_AITI_PROFILE.aiti_type,
+            aiti_summary: DEFAULT_AITI_PROFILE.aiti_summary,
+        };
+    }
+}
+
+async function syncProfileHintsFromIdentity(state: LocalState, session: AgentSession): Promise<void> {
+    try {
+        const identity = await loadIdentityMarkdown(state, session);
+        if (!identity) return;
+
+        const profile = await api('GET', `/api/v1/agents/${session.agent_id}`, undefined, session.token);
+        const hasAitiType = !!String(profile?.aiti_type || '').trim();
+        const hasAitiSummary = !!String(profile?.aiti_summary || '').trim();
+        if (hasAitiType && hasAitiSummary) return;
+
+        const inferred = await inferAitiWithOpenClawModel(state, session, identity.content);
+        const updates: Record<string, string | null> = {};
+        if (!hasAitiType && inferred.aiti_type) {
+            updates.aiti_type = inferred.aiti_type;
+        }
+        if (!hasAitiSummary && inferred.aiti_summary) {
+            updates.aiti_summary = inferred.aiti_summary;
+        }
+        if (Object.keys(updates).length === 0) return;
+
+        await api('PUT', '/api/v1/agents/me', updates, session.token);
+        const homeDir = os.homedir();
+        const printablePath = identity.path.startsWith(homeDir)
+            ? `~${identity.path.slice(homeDir.length)}`
+            : identity.path;
+        console.log(`[profile] Synced AITI from ${printablePath}`);
+    } catch (err: any) {
+        console.warn(`[profile] Failed to sync IDENTITY.md hints: ${String(err?.message || err)}`);
+    }
 }
 
 function sortDeliveryTargets(targets: DeliveryTarget[]): DeliveryTarget[] {
@@ -2619,17 +2857,19 @@ function formatAgentCardField(label: string, value: string | null | undefined): 
     return `${label}: ${text}`;
 }
 
-async function fetchAgentCard(token: string, ensure: boolean): Promise<any> {
+async function fetchAgentCard(state: LocalState, session: AgentSession, ensure: boolean): Promise<any> {
     if (ensure) {
-        const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, token);
+        await syncProfileHintsFromIdentity(state, session);
+        const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
         return ensured.card;
     }
     try {
-        const current = await api('GET', '/api/v1/agent-card/me', undefined, token);
+        const current = await api('GET', '/api/v1/agent-card/me', undefined, session.token);
         return current.card;
     } catch (err: any) {
         if (err?.status === 404) {
-            const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, token);
+            await syncProfileHintsFromIdentity(state, session);
+            const ensured = await api('POST', '/api/v1/agent-card/me/ensure', undefined, session.token);
             return ensured.card;
         }
         throw err;
@@ -2643,7 +2883,7 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
 
     if (sub === 'show') {
         const parsed = parseAgentCardCommonArgs(subArgs);
-        const card = await fetchAgentCard(session.token, parsed.ensure);
+        const card = await fetchAgentCard(state, session, parsed.ensure);
         const cardImageUrl = resolveAgentCardImageUrl(card);
         if (cardImageUrl) {
             // Plain URL on its own line helps channels (e.g. Discord) generate native image preview/embed.
@@ -2672,7 +2912,7 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
 
     if (sub === 'share-text' || sub === 'share') {
         const parsed = parseAgentCardCommonArgs(subArgs);
-        const card = await fetchAgentCard(session.token, parsed.ensure);
+        const card = await fetchAgentCard(state, session, parsed.ensure);
         if (!card?.share_text) {
             throw new Error('share_text is missing in card response. Upgrade server and retry.');
         }
