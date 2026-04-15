@@ -207,7 +207,7 @@ function renderAgentCardSvg(profile: AgentProfileForCard): string {
         ? `<image href="${logoDataUri}" x="86" y="80" width="30" height="30" preserveAspectRatio="xMidYMid slice" opacity="0.98" />`
         : `<circle cx="101" cy="95" r="14" fill="#f5fff9" opacity="0.92" />`;
     const aitiSummarySvg = aitiSummaryLines
-        .map((line, idx) => `<text x="92" y="${430 + idx * 24}" fill="#ebfff4" font-size="20" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`)
+        .map((line, idx) => `<text x="92" y="${468 + idx * 24}" fill="#ebfff4" font-size="20" font-family="'Helvetica Neue', Arial, sans-serif">${escapeXml(line)}</text>`)
         .join('');
     const connectHintLines = wrapLines('Use OpenClaw to open the verify link and send a friend request', 30, 3)
         .map(
