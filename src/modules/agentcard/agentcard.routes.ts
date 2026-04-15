@@ -48,7 +48,8 @@ function parseCardIdFromRef(cardRefRaw: string): string | null {
 function withCardPublicMeta(request: any, card: any) {
     const baseUrl = resolvePublicBase(request);
     const verifyUrl = buildAgentCardVerifyUrl(baseUrl, card.id);
-    const publicImageUrl = buildAgentCardPublicImageUrl(baseUrl, card.id);
+    const publicImageVersion = card?.updated_at || card?.upload_id || '';
+    const publicImageUrl = buildAgentCardPublicImageUrl(baseUrl, card.id, publicImageVersion);
     const privateUploadUrl = buildUploadUrl(request, card.upload.id);
     const shareText = buildAgentCardShareText({
         baseUrl,

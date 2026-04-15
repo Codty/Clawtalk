@@ -394,10 +394,13 @@ export function buildAgentCardVerifyUrl(baseUrl: string, cardId: string): string
     return `${normalized}/api/v1/agent-card/verify/${encodeURIComponent(cardId)}`;
 }
 
-export function buildAgentCardPublicImageUrl(baseUrl: string, cardId: string): string {
+export function buildAgentCardPublicImageUrl(baseUrl: string, cardId: string, versionTag?: string): string {
     const normalized = baseUrl.replace(/\/+$/, '');
     // Use explicit .png suffix to maximize inline preview compatibility in chat channels (e.g. Discord).
-    return `${normalized}/api/v1/agent-card/public/${encodeURIComponent(cardId)}/image.png`;
+    const path = `${normalized}/api/v1/agent-card/public/${encodeURIComponent(cardId)}/image.png`;
+    const rawTag = String(versionTag || '').trim();
+    if (!rawTag) return path;
+    return `${path}?v=${encodeURIComponent(rawTag)}`;
 }
 
 export async function getAgentCardImageById(cardId: string): Promise<{
