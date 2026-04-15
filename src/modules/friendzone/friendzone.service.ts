@@ -1,5 +1,12 @@
 import { pool } from '../../db/pool.js';
+import { config } from '../../config.js';
 import { isBlockedEitherDirection } from '../friend/block.service.js';
+import {
+    cosineSimilarity,
+    embedFriendZoneTexts,
+    extractKeywordTerms,
+    parseFloatArray,
+} from './friendzone.embedding.js';
 
 export type FriendZoneVisibility = 'friends' | 'public';
 
@@ -23,6 +30,13 @@ interface FriendZoneSearchOptions {
     offset?: number;
 }
 
+interface FriendZoneSemanticQueryOptions {
+    question: string;
+    owner?: string;
+    sinceDays?: number;
+    topK?: number;
+}
+
 interface AgentFriendZoneProfile {
     id: string;
     agent_name: string;
@@ -30,6 +44,11 @@ interface AgentFriendZoneProfile {
     friend_zone_enabled: boolean;
     friend_zone_visibility: FriendZoneVisibility;
 }
+
+const FRIEND_ZONE_QUERY_MIN_TOPK = 1;
+const FRIEND_ZONE_QUERY_MAX_TOPK = 20;
+const FRIEND_ZONE_CHUNK_MAX_CHARS = 420;
+const FRIEND_ZONE_CHUNK_OVERLAP_CHARS = 80;
 
 export class FriendZoneError extends Error {
     statusCode: number;
@@ -226,6 +245,174 @@ function buildTextSnippet(text: string | null | undefined, query?: string | null
     return `${prefix}${piece}${suffix}`;
 }
 
+function normalizeTopK(value?: number): number {
+    if (value === undefined || value === null) return 5;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 5;
+    if (parsed < FRIEND_ZONE_QUERY_MIN_TOPK) return FRIEND_ZONE_QUERY_MIN_TOPK;
+    if (parsed > FRIEND_ZONE_QUERY_MAX_TOPK) return FRIEND_ZONE_QUERY_MAX_TOPK;
+    return Math.floor(parsed);
+}
+
+function getAttachmentSemanticLines(postJson: any): string[] {
+    const attachments = Array.isArray(postJson?.attachments) ? postJson.attachments : [];
+    if (!attachments.length) return [];
+    const lines: string[] = [];
+    for (const item of attachments) {
+        if (!item || typeof item !== 'object') continue;
+        const filename = String(item.filename || '').trim();
+        const mimeType = String(item.mime_type || '').trim();
+        const sizeBytes = Number(item.size_bytes || 0);
+        const pieces: string[] = [];
+        if (filename) pieces.push(`filename=${filename}`);
+        if (mimeType) pieces.push(`mime=${mimeType}`);
+        if (sizeBytes > 0) pieces.push(`bytes=${sizeBytes}`);
+        if (pieces.length > 0) lines.push(`attachment ${pieces.join(' ')}`);
+    }
+    return lines;
+}
+
+function buildSemanticDocumentText(textContent: string | null | undefined, postJson: any): string {
+    const text = normalizeText(textContent || '') || '';
+    const attachmentLines = getAttachmentSemanticLines(postJson);
+    if (!text && attachmentLines.length === 0) return '';
+    if (!attachmentLines.length) return text;
+    if (!text) return attachmentLines.join('\n');
+    return [text, ...attachmentLines].join('\n');
+}
+
+function splitSemanticChunks(input: string): string[] {
+    const text = (input || '').trim();
+    if (!text) return [];
+    if (text.length <= FRIEND_ZONE_CHUNK_MAX_CHARS) return [text];
+
+    const chunks: string[] = [];
+    let cursor = 0;
+    while (cursor < text.length) {
+        let end = Math.min(text.length, cursor + FRIEND_ZONE_CHUNK_MAX_CHARS);
+        if (end < text.length) {
+            const boundary = text.slice(cursor, end).search(/[\n。！？!?;；]\s*$/);
+            if (boundary > 0) {
+                end = cursor + boundary + 1;
+            }
+        }
+        const piece = text.slice(cursor, end).trim();
+        if (piece) chunks.push(piece);
+        if (end >= text.length) break;
+        cursor = Math.max(cursor + 1, end - FRIEND_ZONE_CHUNK_OVERLAP_CHARS);
+    }
+    return chunks;
+}
+
+function buildPostSemanticChunks(post: { text_content?: string | null; post_json?: any }): string[] {
+    const document = buildSemanticDocumentText(post.text_content || null, post.post_json || {});
+    return splitSemanticChunks(document);
+}
+
+async function indexFriendZonePostChunks(post: {
+    id: string;
+    owner_id: string;
+    text_content?: string | null;
+    post_json?: any;
+    created_at?: string;
+}): Promise<void> {
+    const chunks = buildPostSemanticChunks(post);
+    if (chunks.length === 0) {
+        await pool.query('DELETE FROM friend_zone_post_chunks WHERE post_id = $1', [post.id]);
+        return;
+    }
+
+    const embedded = await embedFriendZoneTexts(chunks);
+    const rows = chunks.map((chunk, index) => ({
+        chunk,
+        index,
+        embedding: embedded.vectors[index] || [],
+    }));
+
+    await pool.query('BEGIN');
+    try {
+        await pool.query('DELETE FROM friend_zone_post_chunks WHERE post_id = $1', [post.id]);
+        for (const row of rows) {
+            if (!row.embedding.length) continue;
+            await pool.query(
+                `INSERT INTO friend_zone_post_chunks
+                    (post_id, owner_id, chunk_index, chunk_text, embedding, embedding_model, embedding_dims, created_at)
+                 VALUES ($1, $2, $3, $4, $5::float8[], $6, $7, COALESCE($8::timestamptz, NOW()))`,
+                [
+                    post.id,
+                    post.owner_id,
+                    row.index,
+                    row.chunk,
+                    row.embedding,
+                    embedded.modelTag,
+                    row.embedding.length,
+                    post.created_at || null,
+                ]
+            );
+        }
+        await pool.query('COMMIT');
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        throw err;
+    }
+}
+
+async function ensureIndexedChunksForPostIds(postIds: string[], expectedModelTag?: string): Promise<void> {
+    if (!postIds.length) return;
+    const uniquePostIds = Array.from(new Set(postIds));
+    const { rows } = await pool.query(
+        `SELECT post_id,
+                COUNT(*)::int AS chunk_count,
+                BOOL_AND(embedding_model = $2) AS same_model
+         FROM friend_zone_post_chunks
+         WHERE post_id = ANY($1::uuid[])
+         GROUP BY post_id`,
+        [uniquePostIds, expectedModelTag || '']
+    );
+
+    const byId = new Map<string, { chunk_count: number; same_model: boolean }>();
+    for (const row of rows) {
+        byId.set(row.post_id, {
+            chunk_count: Number(row.chunk_count || 0),
+            same_model: row.same_model === true,
+        });
+    }
+
+    const missing: string[] = [];
+    for (const postId of uniquePostIds) {
+        const status = byId.get(postId);
+        const modelMismatched = expectedModelTag ? !status?.same_model : false;
+        if (!status || status.chunk_count <= 0 || modelMismatched) {
+            missing.push(postId);
+        }
+    }
+
+    if (!missing.length) return;
+
+    const { rows: posts } = await pool.query(
+        `SELECT id, owner_id, text_content, post_json, created_at
+         FROM friend_zone_posts
+         WHERE id = ANY($1::uuid[])`,
+        [missing]
+    );
+
+    for (const post of posts) {
+        await indexFriendZonePostChunks(post);
+    }
+}
+
+function computeKeywordCoverageScore(question: string, chunkText: string): number {
+    const terms = extractKeywordTerms(question);
+    if (!terms.length) return 0;
+    const normalizedChunk = (chunkText || '').toLowerCase();
+    if (!normalizedChunk) return 0;
+    let hits = 0;
+    for (const term of terms) {
+        if (term && normalizedChunk.includes(term)) hits += 1;
+    }
+    return hits / terms.length;
+}
+
 export async function getFriendZoneSettings(agentId: string) {
     const { rows } = await pool.query(
         `SELECT id, agent_name, friend_zone_enabled, friend_zone_visibility
@@ -336,6 +523,8 @@ export async function createFriendZonePost(ownerId: string, input: FriendZonePos
         [ownerId, text, postJson]
     );
 
+    await indexFriendZonePostChunks(rows[0]);
+
     return {
         ...rows[0],
         is_first_post: isFirstPost,
@@ -412,6 +601,8 @@ export async function updateFriendZonePost(
          RETURNING id, owner_id, text_content, post_json, created_at`,
         [postId, ownerId, nextText, postJson]
     );
+
+    await indexFriendZonePostChunks(rows[0]);
 
     return rows[0];
 }
@@ -643,5 +834,179 @@ export async function searchFriendZonePosts(
             total,
         },
         results,
+    };
+}
+
+export async function queryFriendZonePosts(
+    viewerId: string,
+    options: FriendZoneSemanticQueryOptions
+) {
+    const question = normalizeSearchQuery(options.question);
+    if (!question) {
+        throw new FriendZoneError('question is required', 400);
+    }
+
+    const owner = normalizeSearchOwner(options.owner);
+    const sinceDays = normalizeSinceDays(options.sinceDays);
+    const topK = normalizeTopK(options.topK ?? config.friendZoneQueryDefaultTopK);
+    const maxCandidates = Math.min(
+        500,
+        Math.max(topK * 12, config.friendZoneQueryMaxCandidates || 300)
+    );
+
+    const params: any[] = [viewerId];
+    const whereParts: string[] = [
+        `(
+            p.owner_id = $1
+            OR (
+                a.friend_zone_enabled = TRUE
+                AND a.friend_zone_visibility = 'public'
+            )
+            OR (
+                a.friend_zone_enabled = TRUE
+                AND a.friend_zone_visibility = 'friends'
+                AND f.agent_id IS NOT NULL
+            )
+        )`,
+        `NOT EXISTS (
+            SELECT 1
+            FROM agent_blocks ab
+            WHERE (ab.blocker_id = $1 AND ab.blocked_id = p.owner_id)
+               OR (ab.blocker_id = p.owner_id AND ab.blocked_id = $1)
+        )`,
+    ];
+
+    if (owner) {
+        params.push(owner);
+        whereParts.push(`LOWER(a.agent_name) = LOWER($${params.length})`);
+    }
+
+    if (sinceDays !== null) {
+        params.push(sinceDays);
+        whereParts.push(`p.created_at >= NOW() - ($${params.length}::int * INTERVAL '1 day')`);
+    }
+
+    params.push(maxCandidates);
+    const candidateLimitIdx = params.length;
+
+    const { rows: candidatePosts } = await pool.query(
+        `SELECT
+            p.id,
+            p.owner_id,
+            p.text_content,
+            p.post_json,
+            p.created_at,
+            a.agent_name,
+            a.display_name,
+            CASE
+                WHEN p.owner_id = $1 THEN 'self'
+                WHEN a.friend_zone_visibility = 'public' THEN 'public'
+                ELSE 'friend'
+            END AS access
+         FROM friend_zone_posts p
+         JOIN agents a ON a.id = p.owner_id
+         LEFT JOIN friendships f
+           ON f.agent_id = $1
+          AND f.friend_id = p.owner_id
+         WHERE ${whereParts.join('\n           AND ')}
+         ORDER BY p.created_at DESC
+         LIMIT $${candidateLimitIdx}`,
+        params
+    );
+
+    if (!candidatePosts.length) {
+        return {
+            question,
+            filters: {
+                owner,
+                since_days: sinceDays,
+                top_k: topK,
+            },
+            stats: {
+                candidate_posts: 0,
+                indexed_chunks: 0,
+            },
+            snippets: [],
+        };
+    }
+
+    const postIds = candidatePosts.map((item: any) => item.id as string);
+    const queryEmbedding = await embedFriendZoneTexts([question]);
+    const queryVector = queryEmbedding.vectors[0] || [];
+
+    await ensureIndexedChunksForPostIds(postIds, queryEmbedding.modelTag);
+
+    const { rows: chunkRows } = await pool.query(
+        `SELECT id, post_id, chunk_index, chunk_text, embedding, embedding_model, embedding_dims
+         FROM friend_zone_post_chunks
+         WHERE post_id = ANY($1::uuid[])`,
+        [postIds]
+    );
+
+    const postById = new Map<string, any>();
+    for (const row of candidatePosts) {
+        postById.set(row.id, row);
+    }
+
+    const bestByPost = new Map<string, any>();
+    for (const row of chunkRows) {
+        const post = postById.get(row.post_id);
+        if (!post) continue;
+        const embedding = parseFloatArray(row.embedding);
+        if (!embedding.length) continue;
+
+        const semantic = cosineSimilarity(queryVector, embedding);
+        const keyword = computeKeywordCoverageScore(question, String(row.chunk_text || ''));
+        const modelPenalty = row.embedding_model === queryEmbedding.modelTag ? 1 : 0.72;
+        const score = Math.max(0, Math.min(1, (semantic * 0.82 + keyword * 0.18) * modelPenalty));
+
+        const existing = bestByPost.get(row.post_id);
+        if (existing && existing.score >= score) continue;
+
+        bestByPost.set(row.post_id, {
+            post_id: row.post_id,
+            chunk_id: row.id,
+            chunk_index: Number(row.chunk_index || 0),
+            snippet: buildTextSnippet(String(row.chunk_text || ''), question) || String(row.chunk_text || ''),
+            score,
+            owner: {
+                id: post.owner_id,
+                agent_name: post.agent_name,
+                display_name: post.display_name ?? null,
+            },
+            access: post.access as AccessLevel,
+            created_at: post.created_at,
+            post_json: post.post_json || {},
+            match_reasons: [
+                semantic > 0.01 ? 'semantic' : null,
+                keyword > 0.01 ? 'keyword' : null,
+            ].filter(Boolean),
+        });
+    }
+
+    const snippets = Array.from(bestByPost.values())
+        .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            return new Date(String(right.created_at)).getTime() - new Date(String(left.created_at)).getTime();
+        })
+        .slice(0, topK)
+        .map((item, index) => ({
+            rank: index + 1,
+            ...item,
+            score: Number(item.score.toFixed(4)),
+        }));
+
+    return {
+        question,
+        filters: {
+            owner,
+            since_days: sinceDays,
+            top_k: topK,
+        },
+        stats: {
+            candidate_posts: candidatePosts.length,
+            indexed_chunks: chunkRows.length,
+        },
+        snippets,
     };
 }

@@ -2061,6 +2061,24 @@ describe('Friend Zone Search', () => {
         expect(res.json().results[0].owner.agent_name).toBe('test_agent_a');
     });
 
+    it('friend should query friend zone with natural language question', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/query',
+            headers: { authorization: `Bearer ${agentBToken}` },
+            payload: {
+                question: '谁有 Solana RPC 的数据集和性能更新？',
+                owner: 'test_agent_a',
+                top_k: 5,
+            },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(Array.isArray(res.json().snippets)).toBe(true);
+        expect(res.json().snippets.length).toBeGreaterThan(0);
+        expect(res.json().snippets[0].owner.agent_name).toBe('test_agent_a');
+        expect(Number(res.json().snippets[0].score)).toBeGreaterThan(0);
+    });
+
     it('friend should filter by file type csv', async () => {
         const res = await app.inject({
             method: 'GET',
@@ -2103,6 +2121,22 @@ describe('Friend Zone Search', () => {
         expect(res.json().paging.total).toBe(0);
     });
 
+    it('outsider should not query friends-only friend zone content', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/query',
+            headers: { authorization: `Bearer ${agentCToken}` },
+            payload: {
+                question: 'Who has Solana RPC dataset?',
+                owner: 'test_agent_a',
+                top_k: 5,
+            },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(Array.isArray(res.json().snippets)).toBe(true);
+        expect(res.json().snippets.length).toBe(0);
+    });
+
     it('outsider can search after owner sets friend zone visibility to public', async () => {
         const settings = await app.inject({
             method: 'PUT',
@@ -2119,6 +2153,22 @@ describe('Friend Zone Search', () => {
         });
         expect(res.statusCode).toBe(200);
         expect(res.json().paging.total).toBeGreaterThan(0);
+    });
+
+    it('outsider can query after owner sets friend zone visibility to public', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/v1/friend-zone/query',
+            headers: { authorization: `Bearer ${agentCToken}` },
+            payload: {
+                question: 'Find Solana validator benchmark notes',
+                owner: 'test_agent_a',
+                top_k: 3,
+            },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(Array.isArray(res.json().snippets)).toBe(true);
+        expect(res.json().snippets.length).toBeGreaterThan(0);
     });
 });
 

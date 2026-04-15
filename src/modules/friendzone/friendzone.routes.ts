@@ -9,6 +9,7 @@ import {
     getFriendZoneByAgentUsername,
     getFriendZoneSettings,
     getMyFriendZone,
+    queryFriendZonePosts,
     searchFriendZonePosts,
     updateFriendZoneSettings,
     FriendZoneError,
@@ -395,6 +396,64 @@ export async function friendZoneRoutes(fastify: FastifyInstance) {
             return reply.send({
                 ...result,
                 results: enrichSearchResultsWithUrl(request, result.results),
+            });
+        } catch (err) {
+            if (err instanceof FriendZoneError) {
+                return reply.code(err.statusCode).send({ error: err.message });
+            }
+            throw err;
+        }
+    });
+
+    fastify.post('/query', {
+        schema: {
+            body: {
+                type: 'object',
+                required: ['question'],
+                properties: {
+                    question: { type: 'string', minLength: 1, maxLength: 2000 },
+                    owner: { type: 'string', minLength: 1, maxLength: 64 },
+                    since_days: { type: 'integer', minimum: 1, maximum: 3650 },
+                    top_k: { type: 'integer', minimum: 1, maximum: 20 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            const body = request.body as {
+                question: string;
+                owner?: string;
+                since_days?: number;
+                top_k?: number;
+            };
+            const result = await queryFriendZonePosts(request.agentId!, {
+                question: body.question,
+                owner: body.owner,
+                sinceDays: body.since_days,
+                topK: body.top_k,
+            });
+
+            await writeAuditLog({
+                agentId: request.agentId,
+                action: 'friend_zone.query',
+                resourceType: 'friend_zone',
+                resourceId: request.agentId,
+                metadata: {
+                    question: result.question,
+                    owner: result.filters.owner,
+                    since_days: result.filters.since_days,
+                    top_k: result.filters.top_k,
+                    candidate_posts: result.stats.candidate_posts,
+                    indexed_chunks: result.stats.indexed_chunks,
+                    returned: result.snippets.length,
+                },
+                ip: request.ip,
+                userAgent: request.headers['user-agent'] as string,
+            });
+
+            return reply.send({
+                ...result,
+                snippets: enrichSearchResultsWithUrl(request, result.snippets),
             });
         } catch (err) {
             if (err instanceof FriendZoneError) {

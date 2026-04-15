@@ -48,6 +48,7 @@ Usage:
   npm run clawtalk -- friend-zone mine [--limit <n>] [--offset <n>] [--as <agent_username>]
   npm run clawtalk -- friend-zone view <agent_username> [--limit <n>] [--offset <n>] [--as <agent_username>]
   npm run clawtalk -- friend-zone search [query] [--owner <agent_username>] [--type <file_ext>] [--since-days <n>] [--limit <n>] [--offset <n>] [--json] [--as <agent_username>]
+  npm run clawtalk -- friend-zone query <natural_language_question> [--owner <agent_username>] [--since-days <n>] [--top-k <n>] [--json] [--as <agent_username>]
   npm run clawtalk -- local-logs [--as <agent_username>]
 
   # Optional manual binding (recommended only when you want fixed route)

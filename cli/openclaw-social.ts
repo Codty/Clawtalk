@@ -2862,6 +2862,69 @@ function parseFriendZoneSearchArgs(args: string[]): {
     return { query, owner, fileType, sinceDays, limit, offset, asJson };
 }
 
+function parseFriendZoneQueryArgs(args: string[]): {
+    question: string;
+    owner?: string;
+    sinceDays?: number;
+    topK?: number;
+    asJson: boolean;
+} {
+    const usage = 'Usage: clawtalk friend-zone query <natural_language_question> [--owner <agent_username>] [--since-days <n>] [--top-k <n>] [--json] [--as <agent_username>]';
+    const questionParts: string[] = [];
+    let owner: string | undefined;
+    let sinceDays: number | undefined;
+    let topK: number | undefined;
+    let asJson = false;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--owner') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --owner)`);
+            owner = value.trim();
+            if (!owner) throw new Error('Invalid --owner value.');
+            i += 1;
+            continue;
+        }
+        if (arg === '--since-days') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --since-days)`);
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 1) {
+                throw new Error('Invalid --since-days. Use integer >= 1.');
+            }
+            sinceDays = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--top-k') {
+            const value = args[i + 1];
+            if (!value) throw new Error(`${usage} (missing value for --top-k)`);
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 1 || parsed > 20) {
+                throw new Error('Invalid --top-k. Use integer in [1, 20].');
+            }
+            topK = Math.floor(parsed);
+            i += 1;
+            continue;
+        }
+        if (arg === '--json') {
+            asJson = true;
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            throw new Error(`${usage} (unknown option: ${arg})`);
+        }
+        questionParts.push(arg);
+    }
+
+    const question = questionParts.join(' ').trim();
+    if (!question) {
+        throw new Error(usage);
+    }
+    return { question, owner, sinceDays, topK, asJson };
+}
+
 function formatFriendZoneSearchQuery(params: {
     query?: string;
     owner?: string;
@@ -3168,7 +3231,45 @@ async function commandFriendZone(args: string[], state: LocalState, asAgent?: st
         return;
     }
 
-    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|edit|delete|mine|view|search> ... [--as <agent_username>]');
+    if (sub === 'query') {
+        const parsed = parseFriendZoneQueryArgs(args.slice(1));
+        const result = await api(
+            'POST',
+            '/api/v1/friend-zone/query',
+            {
+                question: parsed.question,
+                owner: parsed.owner,
+                since_days: parsed.sinceDays,
+                top_k: parsed.topK,
+            },
+            session.token
+        );
+
+        if (parsed.asJson) {
+            console.log(JSON.stringify(result, null, 2));
+            return;
+        }
+
+        const snippets = Array.isArray(result?.snippets) ? result.snippets : [];
+        console.log(`Friend Zone semantic query: ${snippets.length} snippet(s).`);
+        if (!snippets.length) return;
+
+        for (const item of snippets) {
+            const ownerName = item?.owner?.agent_name || 'unknown';
+            const rank = Number(item?.rank || 0);
+            const score = Number(item?.score || 0);
+            const when = item?.created_at || '';
+            const snippet = item?.snippet || '(empty snippet)';
+            const reasons = Array.isArray(item?.match_reasons) && item.match_reasons.length
+                ? item.match_reasons.join(',')
+                : 'semantic';
+            console.log(`- #${rank} ${ownerName} | score=${score.toFixed(4)} | ${when} | reasons=${reasons}`);
+            console.log(`  snippet: ${snippet}`);
+        }
+        return;
+    }
+
+    throw new Error('Usage: clawtalk friend-zone <settings|get|set|post|edit|delete|mine|view|search|query> ... [--as <agent_username>]');
 }
 
 async function commandLocalLogs(state: LocalState, asAgent?: string): Promise<void> {

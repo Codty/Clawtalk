@@ -49,6 +49,14 @@ function parseFriendZoneVisibility(value: string | undefined): 'friends' | 'publ
     throw new Error(`Invalid FRIEND_ZONE_DEFAULT_VISIBILITY="${value}". Use "friends" or "public".`);
 }
 
+function parseFriendZoneEmbeddingProvider(value: string | undefined): 'simple' | 'openai' {
+    const provider = (value || 'simple').trim().toLowerCase();
+    if (provider === 'simple' || provider === 'openai') {
+        return provider;
+    }
+    throw new Error(`Invalid FRIEND_ZONE_EMBEDDING_PROVIDER="${value}". Use "simple" or "openai".`);
+}
+
 function isStrongJwtSecret(secret: string): boolean {
     if (secret.length < 32) return false;
     const weakMarkers = ['change-me', 'dev-secret', 'secret123', 'default', 'example'];
@@ -64,6 +72,7 @@ const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me-in-production!
 const fanoutMode = parseFanoutMode(process.env.FANOUT_MODE);
 const messageStorageMode = parseMessageStorageMode(process.env.MESSAGE_STORAGE_MODE);
 const emailProvider = parseEmailProvider(process.env.EMAIL_PROVIDER);
+const friendZoneEmbeddingProvider = parseFriendZoneEmbeddingProvider(process.env.FRIEND_ZONE_EMBEDDING_PROVIDER);
 const ownerAuthEnabled = parseBool(process.env.OWNER_AUTH_ENABLED, false);
 const ownerPasswordRecoveryRequired = parseBool(process.env.OWNER_PASSWORD_RECOVERY_REQUIRED, false);
 
@@ -93,6 +102,9 @@ if (isProduction) {
             );
         }
     }
+    if (friendZoneEmbeddingProvider === 'openai' && !process.env.OPENAI_API_KEY) {
+        throw new Error('FRIEND_ZONE_EMBEDDING_PROVIDER=openai requires OPENAI_API_KEY in production.');
+    }
 }
 
 export const config = {
@@ -120,6 +132,13 @@ export const config = {
     clerkAudience: process.env.CLERK_AUDIENCE || '',
     clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY || '',
     emailProvider,
+    friendZoneEmbeddingProvider,
+    friendZoneEmbeddingModel: process.env.FRIEND_ZONE_EMBEDDING_MODEL || 'text-embedding-3-small',
+    friendZoneEmbeddingApiBaseUrl: process.env.FRIEND_ZONE_EMBEDDING_API_BASE_URL || 'https://api.openai.com',
+    friendZoneEmbeddingApiKey: process.env.OPENAI_API_KEY || '',
+    friendZoneSimpleEmbeddingDims: parsePositiveInt(process.env.FRIEND_ZONE_SIMPLE_EMBEDDING_DIMS, 384),
+    friendZoneQueryDefaultTopK: parsePositiveInt(process.env.FRIEND_ZONE_QUERY_DEFAULT_TOPK, 5),
+    friendZoneQueryMaxCandidates: parsePositiveInt(process.env.FRIEND_ZONE_QUERY_MAX_CANDIDATES, 300),
     ownerPasswordRecoveryRequired,
     emailFrom: process.env.EMAIL_FROM || '',
     resendApiKey: process.env.RESEND_API_KEY || '',
