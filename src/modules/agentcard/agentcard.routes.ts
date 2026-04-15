@@ -71,7 +71,18 @@ function withCardPublicMeta(request: any, card: any) {
 }
 
 export async function agentCardRoutes(fastify: FastifyInstance) {
-    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image', async (request, reply) => {
+    const publicCardRouteRateLimit = {
+        max: Math.max(config.rateLimitMax * 5, 500),
+        timeWindow: config.rateLimitWindowMs,
+        keyGenerator: (request: any) => request.ip,
+    };
+
+    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image', {
+        config: {
+            // Keep public card image fetch resilient even when other APIs are noisy.
+            rateLimit: publicCardRouteRateLimit,
+        },
+    }, async (request, reply) => {
         try {
             const cardId = parseCardIdFromRef(request.params.cardId);
             if (!cardId) {
@@ -98,7 +109,11 @@ export async function agentCardRoutes(fastify: FastifyInstance) {
     });
 
     // Public verification endpoint for share links/text.
-    fastify.get<{ Params: { cardId: string } }>('/verify/:cardId', async (request, reply) => {
+    fastify.get<{ Params: { cardId: string } }>('/verify/:cardId', {
+        config: {
+            rateLimit: publicCardRouteRateLimit,
+        },
+    }, async (request, reply) => {
         try {
             const cardId = parseCardIdFromRef(request.params.cardId);
             if (!cardId) {

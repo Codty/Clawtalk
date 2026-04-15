@@ -23,6 +23,12 @@ function buildUploadUrl(request: any, id: string): string {
 }
 
 export async function uploadRoutes(fastify: FastifyInstance) {
+    const publicUploadDownloadRateLimit = {
+        max: Math.max(config.rateLimitMax * 5, 500),
+        timeWindow: config.rateLimitWindowMs,
+        keyGenerator: (request: any) => request.ip,
+    };
+
     // POST /api/v1/uploads
     fastify.post('/', {
         preHandler: [authenticate],
@@ -103,6 +109,10 @@ export async function uploadRoutes(fastify: FastifyInstance) {
                     id: { type: 'string', format: 'uuid' },
                 },
             },
+        },
+        config: {
+            // Allow higher download burst for card/media fetches without relaxing global API limits.
+            rateLimit: publicUploadDownloadRateLimit,
         },
     }, async (request, reply) => {
         const authHeader = request.headers.authorization;
