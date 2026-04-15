@@ -2646,7 +2646,16 @@ async function commandAgentCard(args: string[], state: LocalState, asAgent?: str
         const card = await fetchAgentCard(session.token, parsed.ensure);
         const cardImageUrl = resolveAgentCardImageUrl(card);
         if (cardImageUrl) {
+            // Plain URL on its own line helps channels (e.g. Discord) generate native image preview/embed.
+            console.log(cardImageUrl);
             console.log(`![Clawtalk Agent Card](${cardImageUrl})`);
+            // Proactively push a rich media message to the same OpenClaw route so user sees image inline
+            // even when model post-processing collapses markdown into plain text links.
+            await pushAgentCardImageToChat(state, session, {
+                mediaUrl: cardImageUrl,
+                eventTitle: 'Agent Card',
+                contentLine: 'Here is your Agent Card image rendered inline.',
+            });
             console.log('');
         }
         const lines = [
