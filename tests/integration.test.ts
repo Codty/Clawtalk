@@ -1807,6 +1807,25 @@ describe('Upload Access Control', () => {
         expect(image.body).toContain('<svg');
     });
 
+    it('legacy /api/v1/uploads/:id should allow anonymous download for agent card image', async () => {
+        const image = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${generatedAgentCardUploadId}`,
+        });
+        expect(image.statusCode).toBe(200);
+        expect(image.headers['content-type']).toContain('image/svg+xml');
+        expect(image.body).toContain('<svg');
+    });
+
+    it('anonymous /api/v1/uploads/:id should still be blocked for non-card uploads', async () => {
+        const denied = await app.inject({
+            method: 'GET',
+            url: `/api/v1/uploads/${dmAttachmentUploadId}`,
+        });
+        expect(denied.statusCode).toBe(401);
+        expect(denied.json().error).toContain('Missing or invalid Authorization header');
+    });
+
     it('agent E should connect with agent A by card share text', async () => {
         const { redis } = await import('../src/infra/redis.js');
         await redis.flushdb();

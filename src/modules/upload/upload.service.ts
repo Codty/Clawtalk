@@ -454,6 +454,45 @@ export async function getUploadForDownload(uploadId: string, viewerId: string) {
     }
 }
 
+export async function getPublicAgentCardUploadForDownload(uploadId: string) {
+    if (!isUuid(uploadId)) {
+        throw new UploadError('Invalid upload id', 400);
+    }
+
+    const { rows } = await pool.query(
+        `SELECT u.id,
+                u.uploader_id,
+                u.filename,
+                u.mime_type,
+                u.size_bytes,
+                u.storage_key,
+                u.sha256,
+                u.storage_mode,
+                u.expires_at,
+                u.max_downloads,
+                u.download_count,
+                u.last_downloaded_at,
+                u.created_at
+         FROM uploads u
+         JOIN agent_cards ac ON ac.upload_id = u.id
+         WHERE u.id = $1
+         LIMIT 1`,
+        [uploadId]
+    );
+
+    if (rows.length === 0) {
+        throw new UploadError('Upload not found', 404);
+    }
+
+    const row = rows[0];
+    const relayState = isRelayUnavailable(row);
+    if (relayState.unavailable) {
+        throw new UploadError(relayState.reason || 'Upload is unavailable', 410);
+    }
+
+    return row;
+}
+
 export async function readUploadBuffer(storageKey: string): Promise<Buffer> {
     const dir = toAbsoluteUploadDir();
     const filePath = path.join(dir, storageKey);

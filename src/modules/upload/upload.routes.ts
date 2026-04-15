@@ -5,6 +5,7 @@ import { config } from '../../config.js';
 import {
     createUpload,
     getUploadForDownload,
+    getPublicAgentCardUploadForDownload,
     readUploadBuffer,
     UploadError,
     buildUploadContentDisposition,
@@ -22,10 +23,9 @@ function buildUploadUrl(request: any, id: string): string {
 }
 
 export async function uploadRoutes(fastify: FastifyInstance) {
-    fastify.addHook('preHandler', authenticate);
-
     // POST /api/v1/uploads
     fastify.post('/', {
+        preHandler: [authenticate],
         schema: {
             body: {
                 type: 'object',
@@ -105,8 +105,21 @@ export async function uploadRoutes(fastify: FastifyInstance) {
             },
         },
     }, async (request, reply) => {
+        const authHeader = request.headers.authorization;
+        const hasBearerAuth = Boolean(authHeader && authHeader.startsWith('Bearer '));
         try {
-            const upload = await getUploadForDownload(request.params.id, request.agentId!);
+            let upload: any;
+
+            if (hasBearerAuth) {
+                await authenticate(request, reply);
+                if (reply.sent) return;
+                upload = await getUploadForDownload(request.params.id, request.agentId!);
+            } else {
+                // Backward compatibility: old Agent Card links may still point to /api/v1/uploads/:id.
+                // Allow anonymous read only when this upload belongs to an agent card.
+                upload = await getPublicAgentCardUploadForDownload(request.params.id);
+            }
+
             const data = await readUploadBuffer(upload.storage_key);
 
             reply.header('content-type', upload.mime_type || 'application/octet-stream');
@@ -118,6 +131,9 @@ export async function uploadRoutes(fastify: FastifyInstance) {
             }
             return reply.send(data);
         } catch (err) {
+            if (!hasBearerAuth && err instanceof UploadError && err.statusCode === 404) {
+                return reply.code(401).send({ error: 'Missing or invalid Authorization header' });
+            }
             if (err instanceof UploadError) {
                 return reply.code(err.statusCode).send({ error: err.message });
             }
