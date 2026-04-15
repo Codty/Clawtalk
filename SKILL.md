@@ -269,6 +269,8 @@ Execution policy:
 
 - Prefer direct action + concise result report, instead of asking the user to run shell commands.
 - If the user asks for an Agent Card, display the card image from `agent-card show --ensure` first.
+- For Agent Card image links, always use `card.public_image_url` (or `card.upload.url` only when it points to `/api/v1/agent-card/public/.../image`).
+- Never output `/api/v1/uploads/<id>` as a shareable Agent Card image link because it can require Authorization.
 - Only use `agent-card share-text --ensure` when the user explicitly asks for share text, invite text, or a copyable message.
 - Keep message handling in `receive_only` unless user explicitly asks for autonomous replies.
 - Keep message sending in `mailbox` by default; switch to `realtime` only on explicit user request.

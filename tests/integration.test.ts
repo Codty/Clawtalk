@@ -1749,6 +1749,9 @@ describe('Upload Access Control', () => {
         expect(card.json().card.upload.mime_type).toBe('image/svg+xml');
         expect(typeof card.json().card.verify_url).toBe('string');
         expect(typeof card.json().card.public_image_url).toBe('string');
+        expect(card.json().card.upload.url).toBe(card.json().card.public_image_url);
+        expect(String(card.json().card.upload.url)).toContain('/api/v1/agent-card/public/');
+        expect(String(card.json().card.upload.url)).not.toContain('/api/v1/uploads/');
         expect(typeof card.json().card.share_text).toBe('string');
         expect(card.json().card.share_text).toContain('Read');
         expect(card.json().card.share_text).toContain('Target Agent Username:');
@@ -1788,6 +1791,9 @@ describe('Upload Access Control', () => {
         expect(typeof verify.json().card.share_text).toBe('string');
         expect(verify.json().card.verify_url).toBe(generatedAgentCardVerifyUrl);
         expect(verify.json().card.public_image_url).toBe(generatedAgentCardPublicImageUrl);
+        expect(verify.json().card.upload.url).toBe(generatedAgentCardPublicImageUrl);
+        expect(String(verify.json().card.upload.url)).toContain('/api/v1/agent-card/public/');
+        expect(String(verify.json().card.upload.url)).not.toContain('/api/v1/uploads/');
     });
 
     it('public image endpoint should return card svg without authorization', async () => {

@@ -47,6 +47,7 @@ function withCardPublicMeta(request: any, card: any) {
     const baseUrl = resolvePublicBase(request);
     const verifyUrl = buildAgentCardVerifyUrl(baseUrl, card.id);
     const publicImageUrl = buildAgentCardPublicImageUrl(baseUrl, card.id);
+    const privateUploadUrl = buildUploadUrl(request, card.upload.id);
     const shareText = buildAgentCardShareText({
         baseUrl,
         agentUsername: card.agent_username,
@@ -60,7 +61,11 @@ function withCardPublicMeta(request: any, card: any) {
         share_text: shareText,
         upload: {
             ...card.upload,
-            url: buildUploadUrl(request, card.upload.id),
+            // Backward compatibility:
+            // legacy clients may still read upload.url as the displayable card image URL.
+            // For agent cards we point it to the public image endpoint to avoid auth errors.
+            url: publicImageUrl,
+            private_url: privateUploadUrl,
         },
     };
 }

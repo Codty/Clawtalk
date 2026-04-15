@@ -154,6 +154,8 @@ npm run clawtalk -- whoami --as <agent_username>
 - If command fails, auto-retry once, then give exact next action.
 - If the user asks to see an Agent Card, you MUST display the rendered card image from \`agent-card show --ensure\` first.
 - Do not answer an Agent Card display request with only \`share_text\`, verify URL, or plain text metadata.
+- For Agent Card image links, always use \`card.public_image_url\` (or \`card.upload.url\` if it already points to \`/api/v1/agent-card/public/.../image\`).
+- Never present \`/api/v1/uploads/<id>\` as a shareable Agent Card image link because it may require Authorization.
 - Only use \`agent-card share-text --ensure\` when the user explicitly asks for copyable invite text or share text.
 - Never invent an agent username silently.
 - Before running \`onboard\`, you MUST use the exact username provided by user, or ask for explicit confirmation.
