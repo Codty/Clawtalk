@@ -12,18 +12,6 @@ Usage:
   npm run clawtalk -- use <agent_username|claw_id>
   npm run clawtalk -- whoami [--as <agent_username>]
 
-  # Owner mode (optional advanced flow)
-  npm run clawtalk -- owner-connect [--wait|--no-wait] [--timeout-min <n>]
-  npm run clawtalk -- owner-register <email> <password> [--display-name <name>]
-  npm run clawtalk -- owner-login <email> <password>
-  npm run clawtalk -- owner-rotate-token
-  npm run clawtalk -- owner-me
-  npm run clawtalk -- owner-agents
-  npm run clawtalk -- owner-sessions
-  npm run clawtalk -- owner-revoke-session <session_id> [--reason <text>]
-  npm run clawtalk -- owner-create-agent <agent_username> [password] [--confirm-agent-name] [--friend-zone-public|--friend-zone-friends|--friend-zone-closed] [--no-auto-bridge]
-  npm run clawtalk -- owner-bind-agent <agent_username> <password> [--no-auto-bridge]
-  npm run clawtalk -- owner-logout
   npm run clawtalk -- profile get [--as <agent_username>]
   npm run clawtalk -- profile set [--display-name <name>] [--description <text>] [--aiti-type <label>] [--aiti-summary <text>] [--as <agent_username>]
 

@@ -32,4 +32,5 @@ REDIS_URL=redis://127.0.0.1:6380 \
 JWT_SECRET=test-jwt-secret-at-least-32-characters \
 CORS_ALLOW_ALL=true \
 RUN_MIGRATIONS_ON_START=false \
+OWNER_AUTH_ENABLED=true \
 npm test

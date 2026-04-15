@@ -458,10 +458,8 @@ async function api(method: string, route: string, body?: any, token?: string): P
 function formatLegacyAuthDisabledMessage(commandName: 'onboard' | 'login'): string {
     return [
         `This deployment disables legacy agent username/password auth, so \`${commandName}\` cannot be used here.`,
-        'Use the owner flow instead:',
-        '1) npm run clawtalk -- owner-connect --wait',
-        '2) npm run clawtalk -- owner-create-agent <agent_username>',
-        '3) Or switch an existing owner-managed agent with: npm run clawtalk -- use <agent_username|claw_id>',
+        'Ask the server operator to enable direct auth:',
+        'Set LEGACY_AGENT_AUTH_ENABLED=true and retry onboard/login.',
     ].join('\n');
 }
 
@@ -527,7 +525,7 @@ function getSessionOrThrow(state: LocalState, asAgent?: string): AgentSession {
     const name = asAgent || state.current_agent;
     if (!name) {
         throw new Error(
-            'No active agent session. Run: clawtalk owner-create-agent <agent_username> (recommended) or clawtalk onboard <agent_username> <password>.'
+            'No active agent session. Run: clawtalk onboard <agent_username> <password> or clawtalk login <agent_username> <password>.'
         );
     }
 

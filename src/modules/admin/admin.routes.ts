@@ -49,9 +49,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.addHook('preHandler', requireAdmin);
-
     fastify.get('/audit-logs', {
+        preHandler: [requireAdmin],
         schema: {
             querystring: {
                 type: 'object',
@@ -75,6 +74,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
 
     fastify.get('/funnel', {
+        preHandler: [requireAdmin],
         schema: {
             querystring: {
                 type: 'object',
@@ -90,6 +90,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
 
     fastify.post<{ Params: { id: string } }>('/agents/:id/ban', {
+        preHandler: [requireAdmin],
         schema: {
             body: {
                 type: 'object',
@@ -124,7 +125,9 @@ export async function adminRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.post<{ Params: { id: string } }>('/agents/:id/unban', async (request, reply) => {
+    fastify.post<{ Params: { id: string } }>('/agents/:id/unban', {
+        preHandler: [requireAdmin],
+    }, async (request, reply) => {
         try {
             const unbanned = await unbanAgent(request.params.id);
             await writeAuditLog({
@@ -144,12 +147,15 @@ export async function adminRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.get('/risk-whitelist', async (_request, reply) => {
+    fastify.get('/risk-whitelist', {
+        preHandler: [requireAdmin],
+    }, async (_request, reply) => {
         const entries = await listRiskWhitelist();
         return reply.send({ entries });
     });
 
     fastify.post('/risk-whitelist', {
+        preHandler: [requireAdmin],
         schema: {
             body: {
                 type: 'object',
@@ -182,7 +188,9 @@ export async function adminRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.delete<{ Params: { id: string } }>('/risk-whitelist/:id', async (request, reply) => {
+    fastify.delete<{ Params: { id: string } }>('/risk-whitelist/:id', {
+        preHandler: [requireAdmin],
+    }, async (request, reply) => {
         try {
             await removeRiskWhitelistIp(request.params.id);
             await writeAuditLog({

@@ -727,8 +727,11 @@ function renderOwnerPasswordResetPage(baseApiUrl: string, presetToken: string): 
 export async function authRoutes(fastify: FastifyInstance) {
     const ensureLegacyAgentAuthEnabled = (reply: any): boolean => {
         if (config.legacyAgentAuthEnabled) return true;
+        const fallbackHint = config.ownerAuthEnabled
+            ? 'Use owner auth via /api/v1/auth/device/start or /api/v1/auth/owner/*.'
+            : 'Set LEGACY_AGENT_AUTH_ENABLED=true to enable direct agent username/password auth.';
         reply.code(410).send({
-            error: 'Legacy agent username/password auth is disabled on this deployment. Use owner auth via /api/v1/auth/device/start or /api/v1/auth/owner/*.',
+            error: `Legacy agent username/password auth is disabled on this deployment. ${fallbackHint}`,
         });
         return false;
     };
@@ -1047,8 +1050,9 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // ── Owner account routes (human identity layer) ───────────────────────────
-    fastify.post('/owner/register', {
+    if (config.ownerAuthEnabled) {
+        // ── Owner account routes (human identity layer) ───────────────────────
+        fastify.post('/owner/register', {
         config: ownerCredentialRateLimitConfig,
         schema: {
             body: {
@@ -1676,7 +1680,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.post('/owner/agents/switch', {
+        fastify.post('/owner/agents/switch', {
         preHandler: [authenticateOwner],
         config: ownerActionRateLimitConfig,
         schema: {
@@ -1730,7 +1734,8 @@ export async function authRoutes(fastify: FastifyInstance) {
             }
             throw err;
         }
-    });
+        });
+    }
 
     // POST /api/v1/auth/register
     fastify.post('/register', {

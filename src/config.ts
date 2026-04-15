@@ -64,7 +64,8 @@ const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me-in-production!
 const fanoutMode = parseFanoutMode(process.env.FANOUT_MODE);
 const messageStorageMode = parseMessageStorageMode(process.env.MESSAGE_STORAGE_MODE);
 const emailProvider = parseEmailProvider(process.env.EMAIL_PROVIDER);
-const ownerPasswordRecoveryRequired = parseBool(process.env.OWNER_PASSWORD_RECOVERY_REQUIRED, isProduction);
+const ownerAuthEnabled = parseBool(process.env.OWNER_AUTH_ENABLED, false);
+const ownerPasswordRecoveryRequired = parseBool(process.env.OWNER_PASSWORD_RECOVERY_REQUIRED, false);
 
 if (isProduction) {
     if (!isStrongJwtSecret(jwtSecret)) {
@@ -109,6 +110,7 @@ export const config = {
     ownerSessionSidRequired: parseBool(process.env.OWNER_SESSION_SID_REQUIRED, false),
     ownerPasswordlessAgentEnabled: parseBool(process.env.OWNER_PASSWORDLESS_AGENT_ENABLED, true),
     ownerRequireEmailVerified: parseBool(process.env.OWNER_REQUIRE_EMAIL_VERIFIED, false),
+    ownerAuthEnabled,
     legacyAgentAuthEnabled: parseBool(process.env.LEGACY_AGENT_AUTH_ENABLED, true),
     ownerEmailVerifyTtlSec: parsePositiveInt(process.env.OWNER_EMAIL_VERIFY_TTL_SEC, 24 * 3600),
     ownerPasswordResetTtlSec: parsePositiveInt(process.env.OWNER_PASSWORD_RESET_TTL_SEC, 30 * 60),
