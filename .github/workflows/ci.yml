@@ -73,6 +73,7 @@ jobs:
       JWT_SECRET: ci-jwt-secret-please-change-me-in-production-12345
       CORS_ALLOW_ALL: true
       RUN_MIGRATIONS_ON_START: false
+      OWNER_AUTH_ENABLED: true
 
     steps:
       - name: Checkout
