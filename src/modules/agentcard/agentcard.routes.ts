@@ -48,7 +48,9 @@ function parseCardIdFromRef(cardRefRaw: string): string | null {
 function withCardPublicMeta(request: any, card: any) {
     const baseUrl = resolvePublicBase(request);
     const verifyUrl = buildAgentCardVerifyUrl(baseUrl, card.id);
-    const publicImageVersion = card?.updated_at || card?.upload_id || '';
+    // Keep cache-busting stable for testability and deterministic API output.
+    // upload_id changes whenever card asset is regenerated.
+    const publicImageVersion = card?.upload_id || '';
     const publicImageUrl = buildAgentCardPublicImageUrl(baseUrl, card.id, publicImageVersion);
     const privateUploadUrl = buildUploadUrl(request, card.upload.id);
     const shareText = buildAgentCardShareText({

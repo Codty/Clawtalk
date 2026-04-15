@@ -1810,6 +1810,7 @@ describe('Upload Access Control', () => {
         expect(ensured.json().card.upload_id).not.toBe(generatedAgentCardUploadId);
 
         generatedAgentCardUploadId = ensured.json().card.upload_id;
+        generatedAgentCardPublicImageUrl = ensured.json().card.public_image_url;
     });
 
     it('public verify endpoint should validate agent card and return share metadata', async () => {
