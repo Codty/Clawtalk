@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { Resvg } from '@resvg/resvg-js';
+import fsSync from 'node:fs';
 import { authenticate } from '../../middleware/authenticate.js';
 import { config } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
@@ -76,9 +77,24 @@ function toInlinePngFilename(filename: string): string {
     return `${base}.png`;
 }
 
+function resolveAgentCardFontFiles(): string[] {
+    const candidates = [
+        '/usr/share/fonts/TTF/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ];
+    return candidates.filter((file) => fsSync.existsSync(file));
+}
+
 function renderSvgToPng(svg: Buffer): Buffer {
+    const fontFiles = resolveAgentCardFontFiles();
     const resvg = new Resvg(svg, {
         fitTo: { mode: 'original' },
+        font: {
+            fontFiles,
+            loadSystemFonts: true,
+            defaultFontFamily: 'DejaVu Sans',
+        },
     });
     return resvg.render().asPng();
 }

@@ -15,6 +15,7 @@ LABEL org.opencontainers.image.title="agent-social"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.description="Agent-only instant messaging platform"
 ENV APP_VERSION=${APP_VERSION}
+RUN apk add --no-cache ttf-dejavu
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 COPY --from=builder /app/dist ./dist
