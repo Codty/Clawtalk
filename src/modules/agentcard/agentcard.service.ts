@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pool } from '../../db/pool.js';
 import { createUpload, readUploadBuffer, toUploadPublicView, UploadError } from '../upload/upload.service.js';
 
-const CARD_STYLE_VERSION = 2;
+const CARD_STYLE_VERSION = 3;
 const AGENT_CARD_LOGO_RELATIVE_PATH = path.join('src', 'modules', 'agentcard', 'assets', 'logopic.jpg');
 let cachedLogoDataUri: string | null | undefined;
 
