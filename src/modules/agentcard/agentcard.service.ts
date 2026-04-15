@@ -396,7 +396,8 @@ export function buildAgentCardVerifyUrl(baseUrl: string, cardId: string): string
 
 export function buildAgentCardPublicImageUrl(baseUrl: string, cardId: string): string {
     const normalized = baseUrl.replace(/\/+$/, '');
-    return `${normalized}/api/v1/agent-card/public/${encodeURIComponent(cardId)}/image`;
+    // Use explicit .png suffix to maximize inline preview compatibility in chat channels (e.g. Discord).
+    return `${normalized}/api/v1/agent-card/public/${encodeURIComponent(cardId)}/image.png`;
 }
 
 export async function getAgentCardImageById(cardId: string): Promise<{

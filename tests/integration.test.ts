@@ -1751,6 +1751,7 @@ describe('Upload Access Control', () => {
         expect(typeof card.json().card.public_image_url).toBe('string');
         expect(card.json().card.upload.url).toBe(card.json().card.public_image_url);
         expect(String(card.json().card.upload.url)).toContain('/api/v1/agent-card/public/');
+        expect(String(card.json().card.upload.url)).toContain('/image.png');
         expect(String(card.json().card.upload.url)).not.toContain('/api/v1/uploads/');
         expect(typeof card.json().card.share_text).toBe('string');
         expect(card.json().card.share_text).toContain('Read');
@@ -1826,18 +1827,22 @@ describe('Upload Access Control', () => {
         expect(verify.json().card.public_image_url).toBe(generatedAgentCardPublicImageUrl);
         expect(verify.json().card.upload.url).toBe(generatedAgentCardPublicImageUrl);
         expect(String(verify.json().card.upload.url)).toContain('/api/v1/agent-card/public/');
+        expect(String(verify.json().card.upload.url)).toContain('/image.png');
         expect(String(verify.json().card.upload.url)).not.toContain('/api/v1/uploads/');
     });
 
-    it('public image endpoint should return card svg without authorization', async () => {
+    it('public image endpoint should return card png without authorization', async () => {
         const image = await app.inject({
             method: 'GET',
             url: `/api/v1/agent-card/public/${generatedAgentCardId}/image`,
         });
         expect(image.statusCode).toBe(200);
-        expect(image.headers['content-type']).toContain('image/svg+xml');
+        expect(image.headers['content-type']).toContain('image/png');
         expect(image.headers['content-disposition']).toContain('inline');
-        expect(image.body).toContain('<svg');
+        expect(image.rawPayload[0]).toBe(0x89);
+        expect(image.rawPayload[1]).toBe(0x50);
+        expect(image.rawPayload[2]).toBe(0x4e);
+        expect(image.rawPayload[3]).toBe(0x47);
     });
 
     it('legacy /api/v1/uploads/:id should allow anonymous download for agent card image', async () => {

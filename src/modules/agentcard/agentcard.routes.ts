@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { Resvg } from '@resvg/resvg-js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { config } from '../../config.js';
 import { writeAuditLog } from '../../infra/audit.js';
@@ -70,6 +71,18 @@ function withCardPublicMeta(request: any, card: any) {
     };
 }
 
+function toInlinePngFilename(filename: string): string {
+    const base = String(filename || 'agent-card').replace(/\.[a-z0-9]+$/i, '');
+    return `${base}.png`;
+}
+
+function renderSvgToPng(svg: Buffer): Buffer {
+    const resvg = new Resvg(svg, {
+        fitTo: { mode: 'original' },
+    });
+    return resvg.render().asPng();
+}
+
 export async function agentCardRoutes(fastify: FastifyInstance) {
     const publicCardRouteRateLimit = {
         max: Math.max(config.rateLimitMax * 5, 500),
@@ -77,12 +90,7 @@ export async function agentCardRoutes(fastify: FastifyInstance) {
         keyGenerator: (request: any) => request.ip,
     };
 
-    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image', {
-        config: {
-            // Keep public card image fetch resilient even when other APIs are noisy.
-            rateLimit: publicCardRouteRateLimit,
-        },
-    }, async (request, reply) => {
+    const sendPublicCardImage = async (request: any, reply: any) => {
         try {
             const cardId = parseCardIdFromRef(request.params.cardId);
             if (!cardId) {
@@ -91,6 +99,22 @@ export async function agentCardRoutes(fastify: FastifyInstance) {
 
             const asset = await getAgentCardImageById(cardId);
             const file = await readUploadBuffer(asset.storageKey);
+
+            if ((asset.mimeType || '').toLowerCase() === 'image/svg+xml') {
+                try {
+                    const png = renderSvgToPng(file);
+                    reply.header('content-type', 'image/png');
+                    reply.header('content-length', String(png.length));
+                    reply.header(
+                        'content-disposition',
+                        `inline; filename="${encodeURIComponent(toInlinePngFilename(asset.filename))}"`
+                    );
+                    reply.header('cache-control', 'public, max-age=300');
+                    return reply.send(png);
+                } catch {
+                    // Fail open to original SVG to keep public card links functional.
+                }
+            }
 
             reply.header('content-type', asset.mimeType || 'application/octet-stream');
             reply.header('content-length', String(file.length));
@@ -106,7 +130,20 @@ export async function agentCardRoutes(fastify: FastifyInstance) {
             }
             throw err;
         }
-    });
+    };
+
+    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image', {
+        config: {
+            // Keep public card image fetch resilient even when other APIs are noisy.
+            rateLimit: publicCardRouteRateLimit,
+        },
+    }, sendPublicCardImage);
+
+    fastify.get<{ Params: { cardId: string } }>('/public/:cardId/image.png', {
+        config: {
+            rateLimit: publicCardRouteRateLimit,
+        },
+    }, sendPublicCardImage);
 
     // Public verification endpoint for share links/text.
     fastify.get<{ Params: { cardId: string } }>('/verify/:cardId', {
