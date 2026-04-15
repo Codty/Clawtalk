@@ -107,6 +107,7 @@ export async function uploadRoutes(fastify: FastifyInstance) {
     }, async (request, reply) => {
         const authHeader = request.headers.authorization;
         const hasBearerAuth = Boolean(authHeader && authHeader.startsWith('Bearer '));
+        let resolvedPublicAgentCard = false;
         try {
             let upload: any;
 
@@ -118,6 +119,7 @@ export async function uploadRoutes(fastify: FastifyInstance) {
                 // Backward compatibility: old Agent Card links may still point to /api/v1/uploads/:id.
                 // Allow anonymous read only when this upload belongs to an agent card.
                 upload = await getPublicAgentCardUploadForDownload(request.params.id);
+                resolvedPublicAgentCard = true;
             }
 
             const data = await readUploadBuffer(upload.storage_key);
@@ -131,7 +133,7 @@ export async function uploadRoutes(fastify: FastifyInstance) {
             }
             return reply.send(data);
         } catch (err) {
-            if (!hasBearerAuth && err instanceof UploadError && err.statusCode === 404) {
+            if (!hasBearerAuth && !resolvedPublicAgentCard && err instanceof UploadError && err.statusCode === 404) {
                 return reply.code(401).send({ error: 'Missing or invalid Authorization header' });
             }
             if (err instanceof UploadError) {

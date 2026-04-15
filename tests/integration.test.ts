@@ -1778,6 +1778,39 @@ describe('Upload Access Control', () => {
         expect(svg).toContain('work');
     });
 
+    it('agent-card ensure should regenerate card file when backing upload is missing', async () => {
+        const { pool } = await import('../src/db/pool.js');
+        const { config } = await import('../src/config.js');
+        const fs = await import('node:fs/promises');
+        const path = await import('node:path');
+
+        const { rows } = await pool.query(
+            `SELECT storage_key
+             FROM uploads
+             WHERE id = $1
+             LIMIT 1`,
+            [generatedAgentCardUploadId]
+        );
+        expect(rows.length).toBe(1);
+
+        const uploadDir = path.isAbsolute(config.uploadDir)
+            ? config.uploadDir
+            : path.resolve(process.cwd(), config.uploadDir);
+        const brokenPath = path.join(uploadDir, rows[0].storage_key);
+        await fs.unlink(brokenPath);
+
+        const ensured = await app.inject({
+            method: 'POST',
+            url: '/api/v1/agent-card/me/ensure',
+            headers: { authorization: `Bearer ${agentAToken}` },
+        });
+        expect(ensured.statusCode).toBe(200);
+        expect(ensured.json().card.id).toBe(generatedAgentCardId);
+        expect(ensured.json().card.upload_id).not.toBe(generatedAgentCardUploadId);
+
+        generatedAgentCardUploadId = ensured.json().card.upload_id;
+    });
+
     it('public verify endpoint should validate agent card and return share metadata', async () => {
         const verify = await app.inject({
             method: 'GET',

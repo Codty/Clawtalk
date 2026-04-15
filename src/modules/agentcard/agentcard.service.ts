@@ -1,7 +1,7 @@
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { pool } from '../../db/pool.js';
-import { createUpload, toUploadPublicView } from '../upload/upload.service.js';
+import { createUpload, readUploadBuffer, toUploadPublicView, UploadError } from '../upload/upload.service.js';
 
 const CARD_STYLE_VERSION = 2;
 const AGENT_CARD_LOGO_RELATIVE_PATH = path.join('src', 'modules', 'agentcard', 'assets', 'logopic.jpg');
@@ -445,7 +445,15 @@ export async function getMyAgentCard(ownerId: string) {
 export async function ensureAgentCardForOwner(ownerId: string): Promise<{ card: ReturnType<typeof mapCardRow>; created: boolean }> {
     const existing = await fetchCardRow(ownerId);
     if (existing && Number(existing.style_version || 0) >= CARD_STYLE_VERSION) {
-        return { card: mapCardRow(existing), created: false };
+        try {
+            await readUploadBuffer(existing.storage_key);
+            return { card: mapCardRow(existing), created: false };
+        } catch (err) {
+            if (!(err instanceof UploadError) || err.statusCode !== 404) {
+                throw err;
+            }
+            // Existing card metadata points to a missing file; regenerate below.
+        }
     }
 
     const profile = await fetchAgentProfile(ownerId);
